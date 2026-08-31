@@ -107,12 +107,28 @@ def _discard(awaitable) -> None:
 
 
 async def _reap(*tasks) -> None:
-    for task in tasks:
-        if task is not None and not task.done():
-            task.cancel()
-    pending = [task for task in tasks if task is not None]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    async def cleanup():
+        for task in tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [task for task in tasks if task is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    # Cleanup is work this layer owns. Caller cancellation may arrive after the
+    # stage race is decided, including while a child is in an async finalizer;
+    # retain and re-await the cleanup task until it finishes before surfacing it.
+    cleanup_task = asyncio.create_task(cleanup())
+    cancellation = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as cancelled:
+            if cancellation is None:
+                cancellation = cancelled
+    await cleanup_task
+    if cancellation is not None:
+        raise cancellation
 
 
 async def with_deadline(awaitable, seconds: Optional[float], token: Optional[CancelToken] = None,

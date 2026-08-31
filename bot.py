@@ -314,9 +314,11 @@ bot = CustomBot(command_prefix="!", intents=intents)
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
 channel_reasoning = defaultdict(lambda: "high")
-# One cancel token per in-flight run. `!stop` cancels it, so an interrupt
-# lands while a stage is still running instead of after it finishes.
+# The public token/owner identify the newest live controllable run. The lease
+# list only restores an older live direct run after overlap; it does not gate,
+# queue, or delay admission.
 channel_cancel_token = {}
+channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
@@ -449,21 +451,23 @@ async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
 
 # --- Tool Execution Functions ---
 
-async def _terminate_process_tree(proc) -> None:
-    """Kill the child's whole process group and wait for it to be reaped.
+async def _terminate_process_tree(proc, process_group_id: int) -> None:
+    """Kill the child's captured process group and reap its direct child.
 
-    `proc.kill()` alone signals the shell, leaving grandchildren (the actual
-    curl / python3 the model launched) running after the run has moved on.
+    `proc.pid` is the process-group id because the shell is spawned with
+    `start_new_session=True`. Capture it at spawn time: once the shell exits,
+    looking the group up through that dead leader is no longer reliable.
     """
-    if proc is None or proc.returncode is not None:
+    if proc is None:
         return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(process_group_id, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     try:
         await asyncio.wait_for(proc.wait(), timeout=5.0)
     except Exception:
@@ -471,10 +475,11 @@ async def _terminate_process_tree(proc) -> None:
 
 async def tool_bash_exec(command: str) -> str:
     proc = None
+    process_group_id = None
     try:
         print(f"[Tool: bash_exec] {command}", flush=True)
-        # start_new_session puts the shell in its own process group so a timeout
-        # or cancellation can take the whole tree down, not just the shell.
+        # start_new_session makes the shell PID the stable process-group id for
+        # descendants, even if the shell exits before its inherited pipes close.
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=WORKSPACE_DIR,
@@ -482,15 +487,16 @@ async def tool_bash_exec(command: str) -> str:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        process_group_id = proc.pid
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=CONFIG.bash_timeout
             )
         except asyncio.TimeoutError:
-            await _terminate_process_tree(proc)
+            await _terminate_process_tree(proc, process_group_id)
             return f"[Error: Command timed out after {CONFIG.bash_timeout:g} seconds]"
         except asyncio.CancelledError:
-            await _terminate_process_tree(proc)
+            await _terminate_process_tree(proc, process_group_id)
             raise
 
         out_str = stdout.decode("utf-8", errors="replace")
@@ -979,14 +985,11 @@ async def run_completion_stage(token=None, stage="agent", deadline=None, **kwarg
 
 
 async def create_streaming_completion(token=None, stage="agent", **kwargs):
-    """Collect a streaming response under connect and read-idle deadlines."""
+    """Collect a streaming response under transport connect and read-idle bounds."""
     budget = StageBudget(stage, total=CONFIG.model_stage_timeout, idle=CONFIG.idle_timeout)
-    stream = await with_deadline(
-        client.chat.completions.create(stream=True, **kwargs),
-        CONFIG.connect_timeout,
-        token,
-        stage + ":connect",
-    )
+    # HTTPX's phase-specific connect timeout governs DNS/TCP/TLS. Awaiting the
+    # SDK here also includes response headers, which belong to read/total time.
+    stream = await client.chat.completions.create(stream=True, **kwargs)
     content_parts = []
     reasoning_parts = []
     tool_buffers = {}
@@ -1111,6 +1114,29 @@ def apply_micro_compaction(messages: list, preserve_recent_tool_steps: int = 2) 
             compressed_messages.append(msg)
 
     return compressed_messages
+
+DISCORD_CHUNK_MAX_CHARS = 1900
+LOCAL_FALLBACK_MAX_CHUNKS = 3
+LOCAL_FALLBACK_MAX_CHARS = DISCORD_CHUNK_MAX_CHARS * LOCAL_FALLBACK_MAX_CHUNKS
+LOCAL_FALLBACK_OMISSION_MARKER = (
+    "\n\n[중간 상세 내용 생략 — 전체 원장은 내부 상태에 유지됨]\n\n"
+)
+
+
+def bound_local_fallback_output(text: str) -> str:
+    """Bound user-facing fallback without mutating its authoritative sources."""
+    text = str(text or "")
+    if len(text) <= LOCAL_FALLBACK_MAX_CHARS:
+        return text
+    available = LOCAL_FALLBACK_MAX_CHARS - len(LOCAL_FALLBACK_OMISSION_MARKER)
+    head_chars = available // 2
+    tail_chars = available - head_chars
+    return (
+        text[:head_chars]
+        + LOCAL_FALLBACK_OMISSION_MARKER
+        + text[-tail_chars:]
+    )
+
 
 def build_incomplete_report(outcome, ledger, rolling_summary: str, messages_payload: list) -> str:
     """Render collected state without starting another model stage.
@@ -1384,39 +1410,39 @@ async def on_message(message: discord.Message):
         asyncio.create_task(_auto_delete_notice(notice, delay=6))
         return
 
-    # The token/owner are published before direct work starts, but only the
-    # agent loop can consume steering. Reject input during that pre-active phase
-    # instead of acknowledging work that would be discarded on direct cleanup.
-    if message.channel.id in channel_cancel_token:
-        pending = authorize_caller(
-            authz.CONTROL, caller_id, channel_id=message.channel.id
-        )
-        if not pending:
-            await message.reply(f"⛔ {pending.reason}")
-            return
-        await message.reply(
-            "⏳ **요청 처리 중입니다.** 현재 요청이 끝난 뒤 다시 보내 주세요."
-        )
-        return
-
     start_time = time.time()
     token = CancelToken()
+    lease = {"token": token, "owner": caller_id, "active": False}
+    channel_run_leases[message.channel.id].append(lease)
     channel_cancel_token[message.channel.id] = token
     channel_run_owner[message.channel.id] = caller_id
     channel_user_queue[message.channel.id].clear()
 
     def release_run():
-        # The token is this run's lease. A stale cleanup must never erase state
-        # that belongs to a newer run.
-        if channel_cancel_token.get(message.channel.id) is not token:
+        leases = channel_run_leases[message.channel.id]
+        if not any(candidate is lease for candidate in leases):
             return
-        channel_active_runs[message.channel.id] = False
+        leases[:] = [candidate for candidate in leases if candidate is not lease]
+        channel_active_runs[message.channel.id] = any(
+            candidate["active"] for candidate in leases
+        )
+        if leases:
+            current = leases[-1]
+            channel_cancel_token[message.channel.id] = current["token"]
+            channel_run_owner[message.channel.id] = current["owner"]
+            return
+        channel_run_leases.pop(message.channel.id, None)
         channel_cancel_token.pop(message.channel.id, None)
         channel_run_owner.pop(message.channel.id, None)
         channel_user_queue[message.channel.id].clear()
 
-    async def send_reply_chunks(text):
-        chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
+    async def send_reply_chunks(text, local_fallback=False):
+        if local_fallback:
+            text = bound_local_fallback_output(text)
+        chunks = [
+            text[i:i + DISCORD_CHUNK_MAX_CHARS]
+            for i in range(0, len(text), DISCORD_CHUNK_MAX_CHARS)
+        ]
         await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
@@ -1464,7 +1490,10 @@ async def on_message(message: discord.Message):
                 history,
             )
             try:
-                await send_reply_chunks(f"**{direct_outcome.label}**\n\n{direct_report}")
+                await send_reply_chunks(
+                    f"**{direct_outcome.label}**\n\n{direct_report}",
+                    local_fallback=True,
+                )
                 log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
             finally:
                 release_run()
@@ -1482,7 +1511,10 @@ async def on_message(message: discord.Message):
                 history,
             )
             try:
-                await send_reply_chunks(f"**{direct_outcome.label}**\n\n{direct_report}")
+                await send_reply_chunks(
+                    f"**{direct_outcome.label}**\n\n{direct_report}",
+                    local_fallback=True,
+                )
                 log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
             finally:
                 release_run()
@@ -1521,6 +1553,7 @@ async def on_message(message: discord.Message):
     except BaseException:
         release_run()
         raise
+    lease["active"] = True
     channel_active_runs[message.channel.id] = True
 
     total_tools_executed = 0
@@ -2034,6 +2067,7 @@ async def on_message(message: discord.Message):
         # 취소와 마감 실패는 후속 모델 단계를 시작하지 않는다. 같은 백엔드가
         # 멈춰 있을 수 있으므로 보존된 상태로 결정적 중간 보고서를 만든다.
         no_follow_up_stage = outcome.reason in (outcome_mod.STOPPED, outcome_mod.FAILED)
+        uses_local_fallback = no_follow_up_stage
         if no_follow_up_stage:
             final_raw = build_incomplete_report(outcome, ledger, rolling_summary, messages_payload)
             needs_synthesis = False
@@ -2097,6 +2131,7 @@ async def on_message(message: discord.Message):
                 final_raw = synth_resp.choices[0].message.content or ""
                 log_session_event(session_file, f"📝 [보고서 합성 - {outcome.describe()}]", final_raw)
             except RunCancelled as synthesis_cancelled:
+                uses_local_fallback = True
                 final_raw = build_incomplete_report(
                     outcome, ledger, rolling_summary, messages_payload
                 )
@@ -2107,6 +2142,7 @@ async def on_message(message: discord.Message):
                 )
                 log_session_event(session_file, "🛑 [보고서 합성 취소]", final_raw)
             except StageTimeout as synthesis_timeout:
+                uses_local_fallback = True
                 final_raw = build_incomplete_report(
                     outcome, ledger, rolling_summary, messages_payload
                 )
@@ -2116,6 +2152,20 @@ async def on_message(message: discord.Message):
                     + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
                 )
                 log_session_event(session_file, "⏱️ [보고서 합성 마감 초과]", final_raw)
+            except Exception as synthesis_error:
+                uses_local_fallback = True
+                final_raw = build_incomplete_report(
+                    outcome, ledger, rolling_summary, messages_payload
+                )
+                failure = _clip_summary_text(
+                    f"{type(synthesis_error).__name__}: {synthesis_error}", 500
+                )
+                final_raw += (
+                    "\n\n> 보고서 합성 업스트림 실패: `"
+                    + failure
+                    + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
+                )
+                log_session_event(session_file, "⚠️ [보고서 합성 업스트림 실패]", final_raw)
 
         final_text = format_full_discord_output(final_raw)
         if not final_text:
@@ -2153,17 +2203,24 @@ async def on_message(message: discord.Message):
             header_text = "" if outcome.is_completed else f"**{outcome.label}**\n\n"
             final_text_with_footer = header_text + final_text + footer_text
 
-        chunks = []
-        remaining = final_text_with_footer
-        while remaining:
-            if len(remaining) <= 1900:
-                chunks.append(remaining)
-                break
-            split_idx = remaining.rfind("\n", 0, 1900)
-            if split_idx == -1 or split_idx < 1000:
-                split_idx = 1900
-            chunks.append(remaining[:split_idx])
-            remaining = remaining[split_idx:].lstrip("\n")
+        if uses_local_fallback:
+            final_text_with_footer = bound_local_fallback_output(final_text_with_footer)
+            chunks = [
+                final_text_with_footer[i:i + DISCORD_CHUNK_MAX_CHARS]
+                for i in range(0, len(final_text_with_footer), DISCORD_CHUNK_MAX_CHARS)
+            ]
+        else:
+            chunks = []
+            remaining = final_text_with_footer
+            while remaining:
+                if len(remaining) <= DISCORD_CHUNK_MAX_CHARS:
+                    chunks.append(remaining)
+                    break
+                split_idx = remaining.rfind("\n", 0, DISCORD_CHUNK_MAX_CHARS)
+                if split_idx == -1 or split_idx < 1000:
+                    split_idx = DISCORD_CHUNK_MAX_CHARS
+                chunks.append(remaining[:split_idx])
+                remaining = remaining[split_idx:].lstrip("\n")
 
         try:
             await status_msg.delete()

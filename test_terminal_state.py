@@ -293,38 +293,42 @@ class DirectAnswerTest(TerminalStateTestCase):
         self.assertEqual(self.synthesis_calls, [])
         self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
 
-    # Mutation caught: sending a deterministic direct-route failure report as
-    # one reply exceeds Discord's message limit when preserved state is long.
-    async def test_direct_route_timeout_report_is_split_into_bounded_chunks(self):
+    # Mutation caught: splitting an unbounded local fallback into safe-sized
+    # messages still permits arbitrarily many Discord sends and delays stop.
+    async def test_direct_route_timeout_report_has_total_bound_without_mutating_ledger(self):
         async def timed_out(**kwargs):
             raise StageTimeout("direct", 0.1)
 
-        bot.channel_summary[CHANNEL_ID] = "긴 보존 요약 " * 700
+        ledger = bot.channel_ledger[CHANNEL_ID]
+        ledger.apply_updates({
+            "evidence": [
+                {
+                    "id": f"E_DIRECT_BOUND_{index:03d}",
+                    "summary": "직접 응답 실패 전에 보존된 상세 관측 " * 8,
+                    "source": f"test://direct-bounded/{index}",
+                }
+                for index in range(140)
+            ],
+        })
+        full_ledger = ledger.render()
         message = FakeMessage("간단히 답해줘", CHANNEL_ID)
-        chunk_lengths = []
-        original_reply = message.reply
-        original_send = message.channel.send
 
-        async def reply(content):
-            chunk_lengths.append(len(content))
-            return await original_reply(content)
-
-        async def send(content):
-            chunk_lengths.append(len(content))
-            return await original_send(content)
-
-        message.reply = reply
-        message.channel.send = send
         with tempfile.TemporaryDirectory() as log_dir, \
                 patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
                 patch.object(bot, "create_streaming_completion", timed_out), \
                 self.recorder.install():
             await bot.on_message(message)
 
-        delivered = "\n".join(message.replies + message.channel.sent)
-        self.assertGreater(len(chunk_lengths), 1)
-        self.assertLessEqual(max(chunk_lengths), 1900)
+        chunks = message.replies + message.channel.sent
+        delivered = "".join(chunks)
+        self.assertLessEqual(len(chunks), 3)
+        self.assertLessEqual(sum(len(chunk) for chunk in chunks), 5700)
+        self.assertLessEqual(max(len(chunk) for chunk in chunks), 1900)
+        self.assertIn("[중간 상세 내용 생략 — 전체 원장은 내부 상태에 유지됨]", delivered)
         self.assertIn("마감 초과", delivered)
+        self.assertEqual(ledger.render(), full_ledger)
+        self.assertIn("E_DIRECT_BOUND_000", ledger.state_markers())
+        self.assertIn("E_DIRECT_BOUND_139", ledger.state_markers())
 
     # Mutation caught: a broad direct-route fallback that catches StageTimeout
     # starts a second model request instead of reporting the bounded failure.
