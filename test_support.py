@@ -8,6 +8,7 @@ All identifiers below are synthetic. No production ids or tokens.
 """
 
 import os
+from types import SimpleNamespace
 
 TEST_USER_ID = 111111111111111111
 TEST_ADMIN_ID = 222222222222222222
@@ -34,10 +35,12 @@ class FakeSentMessage:
 
 
 class FakeChannel:
-    def __init__(self, channel_id):
+    def __init__(self, channel_id, manage_messages=False, purge_error=None):
         self.id = channel_id
         self.sent = []
-        self.purged = 0
+        self.purge_calls = 0
+        self.manage_messages = manage_messages
+        self.purge_error = purge_error
 
     async def typing(self):
         pass
@@ -46,8 +49,13 @@ class FakeChannel:
         self.sent.append(content)
         return FakeSentMessage()
 
+    def permissions_for(self, user):
+        return SimpleNamespace(manage_messages=self.manage_messages)
+
     async def purge(self, limit=0):
-        self.purged += 1
+        self.purge_calls += 1
+        if self.purge_error is not None:
+            raise self.purge_error
         return [object()] * min(limit, 5)
 
 
@@ -63,9 +71,11 @@ class FakeAuthor:
 
 
 class FakeMessage:
-    def __init__(self, content, channel_id, author=None):
+    def __init__(self, content, channel_id, author=None, manage_messages=False, purge_error=None):
         self.content = content
-        self.channel = FakeChannel(channel_id)
+        self.channel = FakeChannel(
+            channel_id, manage_messages=manage_messages, purge_error=purge_error
+        )
         self.author = author or FakeAuthor()
         self.mentions = []
         self.replies = []

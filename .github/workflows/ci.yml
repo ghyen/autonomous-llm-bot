@@ -29,10 +29,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Reject in-source credential defaults
-        run: python tools/check_no_credential_defaults.py bot.py config.py ledger.py tools
+        run: python tools/check_no_credential_defaults.py bot.py config.py ledger.py authz.py tools
 
       - name: Compile
-        run: python -m compileall -q bot.py config.py ledger.py tools
+        run: python -m compileall -q bot.py config.py ledger.py authz.py tools
 
       - name: Tests
         run: python -m unittest discover -v

@@ -136,14 +136,36 @@ python bot.py
 
 ---
 
+## 🔐 Access Control
+
+The agent runs shell commands and reads and writes files on the host, so every
+Discord entry point passes a single deny-by-default gate (`authz.py`) *before*
+anything is logged, any state is read or changed, any message is queued or
+deleted, and any model or tool call happens.
+
+**DMs and mentions are routing signals, not identity.** They decide where a
+message came from, never who sent it. Identity is `DISCORD_ALLOWED_USER_IDS`.
+
+| Action | Who |
+| :--- | :--- |
+| Talk to the bot at all | On `DISCORD_ALLOWED_USER_IDS` |
+| `!stop`, `!reset`, mid-flight steering | The owner of the active run, or a `DISCORD_ADMIN_USER_IDS` admin. With no run in flight, any allowed caller. |
+| `!clear` / `/clear` (bulk delete) | An admin **and** the caller's own Discord "Manage Messages" permission. The bot's permission is not the caller's. |
+
+Text commands and slash commands share the same policy path. Deletion is
+attempted before any conversation state is cleared, so a permission failure
+leaves your history intact and is reported as a failure.
+
+---
+
 ## 🎮 Discord Commands & Controls
 
 | Command | Description |
 | :--- | :--- |
-| `!stop` / `/stop` | Immediately interrupts autonomous execution and synthesizes a final report from collected data. |
-| `!reset` / `/reset` | Clears conversation history, context cache, and the channel's research ledger. |
-| `!clear [count]` / `/clear` | Purges recent channel messages and resets context and the research ledger. |
-| `/reasoning [level]` | Changes reasoning effort (`none`, `low`, `medium`, `high`). |
+| `!stop` / `/stop` | Interrupts autonomous execution and synthesizes a final report from collected data. Run owner or admin. |
+| `!reset` / `/reset` | Clears conversation history, context cache, and the channel's research ledger. Run owner or admin. |
+| `!clear [count]` / `/clear` | Purges recent channel messages, then resets context and the research ledger. Admin with Manage Messages. |
+| `/reasoning [level]` | Changes reasoning effort (`none`, `low`, `medium`, `high`). Any allowed caller. |
 
 ---
 
@@ -154,7 +176,7 @@ python3 -m unittest discover
 python3 tools/check_no_credential_defaults.py bot.py config.py ledger.py tools
 ```
 
-`test_config.py` covers configuration loading and its failure modes, `test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing. `test_support.py` holds the shared bootstrap and Discord doubles; every identifier in tests is synthetic.
+`test_config.py` covers configuration loading and its failure modes, `test_authz.py` and `test_authz_handlers.py` cover the authorization policy and its placement ahead of every side effect, `test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing. `test_support.py` holds the shared bootstrap and Discord doubles; every identifier in tests is synthetic.
 
 Both commands also run in CI (`.github/workflows/ci.yml`) on Python 3.10 and 3.12.
 
