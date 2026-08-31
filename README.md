@@ -136,6 +136,32 @@ python bot.py
 
 ---
 
+## 🏁 Run Outcomes
+
+A run settles on exactly one terminal reason, and that single value decides
+everything after it — whether nudges, tool dispatch, checkpoints and rollover
+continue, which synthesis prompt is used, and what label the user sees.
+
+| Reason | Reached by | User-facing |
+| :--- | :--- | :--- |
+| `completed` | `finish_task`, or a tool-free direct answer on the first call | `✅ 조사 완료` + 완료 시간 footer |
+| `stopped` | `!stop` / `/stop` | `🛑 사용자 중단 — 미완료`, no completion footer |
+| `exhausted` | Step budget spent, or too many consecutive tool-free responses | `⚠️ 스텝 소진 — 미완료` |
+| `failed` | Unhandled exception | `❌ 실패 — 미완료` |
+
+**Completion intent is a structured signal only.** Writing "최종 보고서" in the
+response body does not end a run; `finish_task` does. Previously a run counted as
+finished if the text contained 최종/보고서/결론 and exceeded 400 characters, which
+both ignored short correct completions and dressed up interrupted and
+step-exhausted runs with a completion label.
+
+**Companion call policy:** tool calls arriving in the same response as
+`finish_task` are **not executed** — no side effects land after a completion
+decision. The refused tool names are recorded in the session log and listed in
+the final message, so nothing is silently dropped.
+
+---
+
 ## 🔐 Access Control
 
 The agent runs shell commands and reads and writes files on the host, so every
@@ -176,7 +202,7 @@ python3 -m unittest discover
 python3 tools/check_no_credential_defaults.py bot.py config.py ledger.py tools
 ```
 
-`test_config.py` covers configuration loading and its failure modes, `test_authz.py` and `test_authz_handlers.py` cover the authorization policy and its placement ahead of every side effect, `test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing. `test_support.py` holds the shared bootstrap and Discord doubles; every identifier in tests is synthetic.
+`test_config.py` covers configuration loading and its failure modes, `test_authz.py` and `test_authz_handlers.py` cover the authorization policy and its placement ahead of every side effect, `test_outcome.py` and `test_terminal_state.py` cover the terminal state machine and the six end-of-run scenarios, `test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing. `test_support.py` holds the shared bootstrap and Discord doubles; every identifier in tests is synthetic.
 
 Both commands also run in CI (`.github/workflows/ci.yml`) on Python 3.10 and 3.12.
 

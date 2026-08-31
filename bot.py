@@ -26,6 +26,8 @@ from duckduckgo_search import DDGS
 from types import SimpleNamespace
 
 import authz
+import outcome as outcome_mod
+from outcome import RunOutcome
 from ledger import ResearchLedger
 from config import ConfigError, load_config, startup_diagnostics
 
@@ -355,6 +357,8 @@ def clear_channel_state(channel_id) -> None:
 MAX_RECENT_TURNS = 8
 CHECKPOINT_INTERVAL = 10
 MAX_AGENT_LOOPS = 250
+
+MAX_NO_TOOL_RESPONSES = 6
 
 ROLLING_COMPACTION_INTERVAL = 10
 KEEP_RECENT_TOOL_MESSAGES = 8
@@ -1312,10 +1316,13 @@ async def on_message(message: discord.Message):
 
     try:
         final_raw = ""
-        direct_answer = False
+        outcome = RunOutcome()
+        refused_companion_calls = []
+        consecutive_no_tool_responses = 0
         for iteration in range(MAX_AGENT_LOOPS):
             if channel_stop_requested[message.channel.id]:
-                print(f"[Autonomous Loop Interrupted by User !stop]", flush=True)
+                outcome.settle(outcome_mod.STOPPED, outcome_mod.DETAIL_USER_STOP)
+                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 break
 
             # [실시간 사용자 동적 개입 주입]
@@ -1460,21 +1467,27 @@ async def on_message(message: discord.Message):
             if iteration == 0 and not direct_call_failed and not tool_calls_to_run and content_text.strip():
                 direct_text = clean_direct_response(content_text)
                 if direct_text:
-                    direct_answer = True
+                    outcome.settle(outcome_mod.COMPLETED, outcome_mod.DETAIL_DIRECT_ANSWER)
                     final_raw = direct_text
                     break
 
-            # [finish_task 전용 완료 도구 호출 여부 확인]
-            is_task_completed = False
-            final_completed_report = ""
-            for tc in tool_calls_to_run:
-                if tc["name"] == "finish_task":
-                    is_task_completed = True
-                    final_completed_report = tc["arguments"].get("report", "")
-                    break
-
-            if is_task_completed:
-                print(f"[Autonomous Goal Achieved via finish_task at Step {iteration+1}]", flush=True)
+            # [finish_task = 유일한 구조화된 완료 신호]
+            # 동반 도구 호출 정책: finish_task와 같은 응답에 온 다른 도구 호출은
+            # 실행하지 않는다. 완료 판단 이후에 부작용을 남기지 않기 위한 것이고,
+            # 무엇이 거부되었는지는 로그와 최종 메시지에 남긴다.
+            finish_calls = [tc for tc in tool_calls_to_run if tc["name"] == "finish_task"]
+            if finish_calls:
+                final_completed_report = finish_calls[0]["arguments"].get("report", "")
+                companions = [tc["name"] for tc in tool_calls_to_run if tc is not finish_calls[0]]
+                if companions:
+                    refused_companion_calls = companions
+                    log_session_event(
+                        session_file,
+                        f"⛔ [Step {iteration+1} finish_task 동반 호출 거부]",
+                        "실행하지 않은 도구: " + ", ".join(companions),
+                    )
+                outcome.settle(outcome_mod.COMPLETED, outcome_mod.DETAIL_FINISH_TASK)
+                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 final_raw = final_completed_report or full_raw_thought
                 break
 
@@ -1654,54 +1667,100 @@ async def on_message(message: discord.Message):
                             f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
                         )})
 
-                await maybe_roll_context(iteration + 1)
-                continue
+                consecutive_no_tool_responses = 0
 
-            # [핵심 방어: 도구를 호출하지 않고 중간 멘트만 뱉었을 때 임의 종료 방지]
-            if iteration < MAX_AGENT_LOOPS - 1 and not channel_stop_requested[message.channel.id]:
-                cleaned_text = re.sub(r"<think>.*?</think>", "", full_raw_thought, flags=re.DOTALL).strip()
-                if ("최종" in cleaned_text or "보고서" in cleaned_text or "결론" in cleaned_text) and len(cleaned_text) > 400:
-                    final_raw = full_raw_thought
+                # 마지막 스텝이면 여기서 소진으로 확정한다. 불필요한 롤오버를
+                # 한 번 더 돌리고 나서 루프 경계로 조용히 끝나지 않도록.
+                if iteration + 1 >= MAX_AGENT_LOOPS:
+                    outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
+                    print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
+                    break
+                if channel_stop_requested[message.channel.id]:
+                    outcome.settle(outcome_mod.STOPPED, outcome_mod.DETAIL_USER_STOP)
+                    print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                     break
 
-                nudge_content = (
-                    "[🤖 시스템 자율 루프 유지 안내: 도구가 호출되지 않았습니다. "
-                    "사용자의 목표를 100% 달성하기 위해 필요한 bash_exec 명령어를 계속 실행하세요. "
-                    "만약 모든 조사가 완전히 끝났다면 finish_task(report=...)를 호출하여 최종 보고서를 제출하세요.]"
-                )
-                messages_payload.append({
-                    "role": "assistant",
-                    "content": content_text or "[중간 진행 계획]"
-                })
-                messages_payload.append({
-                    "role": "user",
-                    "content": nudge_content
-                })
-                log_session_event(session_file, f"🔄 [Step {iteration+1} 자율 루프 지속 추진(Nudge)]", content_text or "(진행 중)")
-                try:
-                    await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 루프 가속 진행 중... ▌")
-                except Exception:
-                    pass
                 await maybe_roll_context(iteration + 1)
                 continue
 
-            final_raw = full_raw_thought or content_text
-            break
+            # [도구 호출 없는 응답] 완료 의사는 문구로 추정하지 않는다.
+            # finish_task만이 완료 신호이며, 여기서는 그것을 요구하고 계속 진행한다.
+            consecutive_no_tool_responses += 1
+            if consecutive_no_tool_responses >= MAX_NO_TOOL_RESPONSES:
+                outcome.settle(
+                    outcome_mod.EXHAUSTED,
+                    f"{outcome_mod.DETAIL_NO_TOOL_STALL} {consecutive_no_tool_responses}회",
+                )
+                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
+                final_raw = full_raw_thought or content_text
+                break
 
-        cleaned_check = re.sub(r"<think>.*?</think>|</?(function|parameter|tool_call)[^>]*>", "", final_raw, flags=re.DOTALL).strip()
-        
-        # [핵심 결론 보장]
-        needs_synthesis = (total_tools_executed > 0 and (not cleaned_check or channel_stop_requested[message.channel.id] or len(cleaned_check) < 250))
-        
-        if needs_synthesis:
+            if iteration + 1 >= MAX_AGENT_LOOPS:
+                outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
+                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
+                final_raw = full_raw_thought or content_text
+                break
+
+            if channel_stop_requested[message.channel.id]:
+                outcome.settle(outcome_mod.STOPPED, outcome_mod.DETAIL_USER_STOP)
+                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
+                final_raw = full_raw_thought or content_text
+                break
+
+            nudge_content = (
+                "[🤖 시스템 자율 루프 유지 안내: 도구가 호출되지 않았습니다. "
+                "사용자의 목표를 100% 달성하기 위해 필요한 bash_exec 명령어를 계속 실행하세요. "
+                "조사가 완전히 끝났다면 반드시 finish_task(report=...)를 호출하세요. "
+                "본문에 '최종 보고서'라고 쓰는 것만으로는 종료되지 않습니다.]"
+            )
+            messages_payload.append({
+                "role": "assistant",
+                "content": content_text or "[중간 진행 계획]"
+            })
+            messages_payload.append({
+                "role": "user",
+                "content": nudge_content
+            })
+            log_session_event(session_file, f"🔄 [Step {iteration+1} 자율 루프 지속 추진(Nudge)]", content_text or "(진행 중)")
             try:
-                await status_msg.edit(content="🛠️ **[자율 목표 탐색 완료]** 최종 심층 분석 종합 결론 보고서 작성 중... ▌")
+                await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 루프 가속 진행 중... ▌")
             except Exception:
                 pass
-            
+            await maybe_roll_context(iteration + 1)
+            continue
+
+        # 루프가 break 없이 끝나는 경로도 사유 없이 남지 않게 한다.
+        outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
+
+        cleaned_check = re.sub(r"<think>.*?</think>|</?(function|parameter|tool_call)[^>]*>", "", final_raw, flags=re.DOTALL).strip()
+
+        # [핵심 결론 보장] 합성 여부는 길이 추정이 아니라 종료 사유로 결정한다.
+        # 완료가 아니면 부분 보고서를 합성하고, 완료인데 본문이 없으면 합성한다.
+        needs_synthesis = (not outcome.is_completed) or (not cleaned_check)
+        if outcome.detail == outcome_mod.DETAIL_DIRECT_ANSWER:
+            needs_synthesis = False
+
+        if needs_synthesis:
+            try:
+                await status_msg.edit(content=f"🛠️ **[{outcome.label}]** 수집된 결과 종합 보고서 작성 중... ▌")
+            except Exception:
+                pass
+
+            if outcome.is_completed:
+                closing_instruction = (
+                    "사용자의 원래 질문에 대해 한국어로 매우 명확하고 완성도 높은 최종 종합 결론 보고서를 "
+                    "마크다운으로 상세히 작성하세요."
+                )
+            else:
+                closing_instruction = (
+                    f"이 조사는 완료되지 않았습니다 (사유: {outcome.describe()}). 완료된 것처럼 쓰지 마세요.\n"
+                    "지금까지 확인된 것과 확인되지 않은 것을 구분해 한국어 마크다운으로 중간 보고서를 작성하고, "
+                    "남은 미해결 항목과 다음에 이어서 해야 할 작업을 반드시 명시하세요."
+                )
+
             final_report_prompt = (
-                "당신은 지금까지의 모든 자율 탐색 및 분석 결과를 종합하여 최종 보고서를 작성하는 수석 분석가입니다.\n"
-                "절대로 도구를 호출하지 말고, 아래 모든 실행 기록과 수집 데이터를 바탕으로 사용자의 원래 질문에 대해 한국어로 매우 명확하고 완성도 높은 최종 종합 결론 보고서를 마크다운으로 상세히 작성하세요.\n"
+                "당신은 지금까지의 모든 자율 탐색 및 분석 결과를 종합하여 보고서를 작성하는 수석 분석가입니다.\n"
+                f"절대로 도구를 호출하지 말고, 아래 모든 실행 기록과 수집 데이터를 바탕으로 {closing_instruction}\n"
                 "권위 있는 조사 상태 블록이 사실의 기준입니다. 반증된(rejected) 가설을 유망한 후보로 되살리지 말고, "
                 "무효 결론을 현재 사실로 제시하지 마세요. 폐기된 방향은 왜 폐기되었는지 근거 증거와 함께 밝히세요."
             )
@@ -1719,7 +1778,7 @@ async def on_message(message: discord.Message):
             )
             synthesis_payload = [
                 {"role": "system", "content": final_report_prompt},
-                {"role": "user", "content": f"{synth_context}\n\n위 전체 결과를 바탕으로 사용자를 위한 최종 종합 결론 보고서를 마크다운으로 상세히 작성해 주세요."}
+                {"role": "user", "content": f"{synth_context}\n\n위 결과를 바탕으로 보고서를 마크다운으로 상세히 작성해 주세요."}
             ]
             synth_resp = await create_streaming_completion(
                 model=MODEL_NAME,
@@ -1729,17 +1788,43 @@ async def on_message(message: discord.Message):
                 reasoning_effort="none"
             )
             final_raw = synth_resp.choices[0].message.content or ""
-            log_session_event(session_file, "📝 [최종 종합 답변 합성]", final_raw)
+            log_session_event(session_file, f"📝 [보고서 합성 - {outcome.describe()}]", final_raw)
 
         final_text = format_full_discord_output(final_raw)
         if not final_text:
-            final_text = "작업을 완료했으나 모델이 텍스트를 출력하지 않았습니다. 대화 기록을 !reset 후 다시 시도해 주세요."
+            if outcome.is_completed:
+                final_text = "모델이 텍스트를 출력하지 않았습니다. 대화 기록을 !reset 후 다시 시도해 주세요."
+            else:
+                final_text = (
+                    f"수집된 결과 없이 조사가 종료되었습니다 (사유: {outcome.describe()}). "
+                    "완료된 작업은 없습니다. 다시 요청하거나 목표를 더 구체적으로 지정해 주세요."
+                )
 
         elapsed = time.time() - start_time
         completion_ts = int(time.time())
         elapsed_str = format_elapsed_time(elapsed)
-        footer_text = "" if direct_answer else f"\n\n> ⏱️ **완료 시간**: <t:{completion_ts}:T> (모드: `자동 연장 자율 모드` / 총 {total_tools_executed}개 도구 실행 / 소요: {elapsed_str})"
-        final_text_with_footer = final_text + footer_text
+
+        # 종료 사유가 라벨과 푸터를 결정한다. 중단·소진·실패에는 완료 라벨도,
+        # '완료 시간' 푸터도 붙지 않는다.
+        is_direct_answer = outcome.detail == outcome_mod.DETAIL_DIRECT_ANSWER
+        if is_direct_answer:
+            final_text_with_footer = final_text
+        else:
+            run_stats = f"총 {total_tools_executed}개 도구 실행 / 소요: {elapsed_str}"
+            if outcome.is_completed:
+                footer_text = f"\n\n> ⏱️ **완료 시간**: <t:{completion_ts}:T> ({run_stats})"
+            else:
+                footer_text = (
+                    f"\n\n> 🔻 **{outcome.label}** — 종료 시각 <t:{completion_ts}:T> ({run_stats})\n"
+                    f"> 사유: `{outcome.describe()}`. 이 보고서는 완료된 조사 결과가 아닙니다."
+                )
+            if refused_companion_calls:
+                footer_text += (
+                    "\n> ⛔ finish_task와 함께 온 도구 호출은 실행하지 않았습니다: "
+                    + ", ".join(f"`{name}`" for name in refused_companion_calls)
+                )
+            header_text = "" if outcome.is_completed else f"**{outcome.label}**\n\n"
+            final_text_with_footer = header_text + final_text + footer_text
 
         chunks = []
         remaining = final_text_with_footer
@@ -1763,12 +1848,21 @@ async def on_message(message: discord.Message):
             await message.channel.send(extra_chunk)
 
         history.append({"role": "assistant", "content": final_text})
-        print(f"[Reply to {message.author} finished]: {len(final_text)} chars in {elapsed_str} (Auto-Extension)", flush=True)
+        log_session_event(
+            session_file,
+            f"🏁 [런 종료: {outcome.describe()}]",
+            f"도구 실행 {total_tools_executed}건 / 소요 {elapsed_str} / 응답 {len(final_text)}자",
+        )
+        print(
+            f"[Run finished: {outcome.describe()}] {len(final_text)} chars in {elapsed_str}",
+            flush=True,
+        )
 
     except Exception as e:
-        err_msg = f"⚠️ 작업 도중 예외 발생: `{e}`\n📁 현재까지의 추론/도구 실행 기록은 시스템 로그에 저장되었습니다."
-        print(f"[Error in agent loop]: {e}", file=sys.stderr, flush=True)
-        log_session_event(session_file, "⚠️ [오류 발생 중단]", str(e))
+        outcome.settle(outcome_mod.FAILED, f"예외: {type(e).__name__}")
+        err_msg = f"⚠️ **{outcome.label}** — 작업 도중 예외 발생: `{e}`\n📁 현재까지의 추론/도구 실행 기록은 시스템 로그에 저장되었습니다."
+        print(f"[Run settled: {outcome.describe()}] {e}", file=sys.stderr, flush=True)
+        log_session_event(session_file, f"⚠️ [종료: {outcome.describe()}]", str(e))
         try:
             await status_msg.edit(content=err_msg)
         except Exception:
