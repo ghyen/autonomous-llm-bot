@@ -5,50 +5,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-os.environ.setdefault("DISCORD_BOT_TOKEN", "test")
+from test_support import FakeMessage  # sets the required config env before bot imports
 
 import bot
-
-
-class FakeSentMessage:
-    async def edit(self, **kwargs):
-        pass
-
-    async def delete(self):
-        pass
-
-
-class FakeChannel:
-    def __init__(self, channel_id):
-        self.id = channel_id
-        self.sent = []
-
-    async def typing(self):
-        pass
-
-    async def send(self, content):
-        self.sent.append(content)
-        return FakeSentMessage()
-
-
-class FakeAuthor:
-    bot = False
-
-    def __str__(self):
-        return "tester"
-
-
-class FakeMessage:
-    def __init__(self, content, channel_id):
-        self.content = content
-        self.channel = FakeChannel(channel_id)
-        self.author = FakeAuthor()
-        self.mentions = []
-        self.replies = []
-
-    async def reply(self, content):
-        self.replies.append(content)
-        return FakeSentMessage()
 
 
 class RoutingTest(unittest.IsolatedAsyncioTestCase):

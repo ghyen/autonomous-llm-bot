@@ -26,24 +26,28 @@ from duckduckgo_search import DDGS
 from types import SimpleNamespace
 
 from ledger import ResearchLedger
+from config import ConfigError, load_config, startup_diagnostics
 
-DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-if not DISCORD_TOKEN:
-    print("[Error] DISCORD_BOT_TOKEN environment variable is not set. Please provide it via environment variable or .env file.", file=sys.stderr)
+# Configuration is fully validated before any filesystem or network side effect.
+try:
+    CONFIG = load_config()
+except ConfigError as config_error:
+    print(f"[Config Error] {config_error}", file=sys.stderr)
     sys.exit(1)
 
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:18080/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", os.getenv("LLM_MODEL_NAME", "default"))
+DISCORD_TOKEN = CONFIG.discord_token
+LLM_BASE_URL = CONFIG.llm_base_url
+MODEL_NAME = CONFIG.model_name
+FREE_RESPONSE_CHANNEL_IDS = set(CONFIG.free_response_channel_ids)
+ALLOWED_USER_IDS = set(CONFIG.allowed_user_ids)
+ADMIN_USER_IDS = set(CONFIG.admin_user_ids)
+TOOLS_ENABLED = CONFIG.tools_enabled
+WORKSPACE_DIR = CONFIG.workspace_dir
+SYSTEM_LOG_DIR = CONFIG.system_log_dir
 
-raw_free_channels = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
-FREE_RESPONSE_CHANNEL_IDS = set()
-for c_id in raw_free_channels.split(","):
-    c_id = c_id.strip()
-    if c_id.isdigit():
-        FREE_RESPONSE_CHANNEL_IDS.add(int(c_id))
+for diagnostic_line in startup_diagnostics(CONFIG):
+    print(f"[Config] {diagnostic_line}", flush=True)
 
-WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", os.path.expanduser("~/discord-llm-bot/workspace"))
-SYSTEM_LOG_DIR = os.getenv("SYSTEM_LOG_DIR", os.path.expanduser("~/discord-llm-bot/.system_logs"))
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
 os.makedirs(SYSTEM_LOG_DIR, exist_ok=True)
 
@@ -311,7 +315,7 @@ KEEP_RECENT_TOOL_MESSAGES = 8
 ROLLING_SUMMARY_SOURCE_MAX_CHARS = 24000
 ROLLING_SUMMARY_MAX_CHARS = 10000
 
-client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key="not-needed", timeout=None)
+client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=CONFIG.llm_api_key, timeout=None)
 
 async def keep_typing_heartbeat(channel, stop_event: asyncio.Event):
     """상시 '입력 중...' 상태를 7초마다 갱신하여 끊김 없이 유지하는 하트비트 루프"""
