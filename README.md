@@ -95,20 +95,38 @@ pip install -r requirements.txt
 
 ### 3. Configuration
 
-Create `.env` file from `.env.example`:
+Create `.env` from `.env.example`:
 
 ```bash
 cp .env.example .env
 ```
 
-Configure your environment variables:
+`config.py` reads `.env` and the process environment; a real environment variable
+always wins over the file. Configuration is fully validated before the bot
+creates any directory or opens any socket, and malformed values fail startup
+rather than being silently dropped.
 
 ```env
 DISCORD_BOT_TOKEN=your_discord_bot_token_here
+DISCORD_ALLOWED_USER_IDS=111111111111111111,222222222222222222
 LLM_BASE_URL=http://127.0.0.1:18080/v1
 MODEL_NAME=default
 DISCORD_FREE_RESPONSE_CHANNELS=123456789012345678
 ```
+
+Startup fails, loudly, when:
+
+- `DISCORD_BOT_TOKEN` is missing or blank.
+- `DISCORD_ALLOWED_USER_IDS` is empty while tools are enabled. The agent runs
+  shell commands on the host, so there is no safe default. Set
+  `BOT_TOOLS_ENABLED=false` to run a tool-free bot without an allowlist.
+- Any ID list contains a non-numeric entry.
+- `DISCORD_ADMIN_USER_IDS` names someone outside `DISCORD_ALLOWED_USER_IDS`.
+- `LLM_BASE_URL` is non-local without `LLM_ALLOW_REMOTE=true`. Conversation
+  content and tool results would leave the machine.
+
+See `.env.example` for the full set. On startup the bot prints a secret-free
+diagnostic block including a fingerprint of the effective policy.
 
 ### 4. Running the Bot
 
@@ -133,9 +151,12 @@ python bot.py
 
 ```bash
 python3 -m unittest discover
+python3 tools/check_no_credential_defaults.py bot.py config.py ledger.py tools
 ```
 
-`test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing.
+`test_config.py` covers configuration loading and its failure modes, `test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing. `test_support.py` holds the shared bootstrap and Discord doubles; every identifier in tests is synthetic.
+
+Both commands also run in CI (`.github/workflows/ci.yml`) on Python 3.10 and 3.12.
 
 ---
 
