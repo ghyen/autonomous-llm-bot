@@ -145,6 +145,13 @@ async def with_deadline(awaitable, seconds: Optional[float], token: Optional[Can
             _discard(awaitable)
         raise RunCancelled(token.reason)
 
+    if seconds is not None and seconds <= 0:
+        if asyncio.isfuture(awaitable):
+            await _reap(awaitable)
+        else:
+            _discard(awaitable)
+        raise StageTimeout(stage, seconds)
+
     task = asyncio.ensure_future(awaitable)
     cancel_waiter = asyncio.ensure_future(token.wait()) if token is not None else None
     waiters = {task} if cancel_waiter is None else {task, cancel_waiter}
@@ -165,6 +172,8 @@ async def with_deadline(awaitable, seconds: Optional[float], token: Optional[Can
 
     if task.done():
         await _reap(cancel_waiter)
+        if token is not None:
+            token.raise_if_cancelled()
         return task.result()
 
     # Cancel first, then wait for the cleanup to finish, then report why.

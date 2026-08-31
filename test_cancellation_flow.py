@@ -646,6 +646,126 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
 
 
 class StageDeadlineTest(CancellationTestCase):
+    # Mutation caught: OpenAI wraps a transport connect timeout in
+    # APITimeoutError. Letting that escape the production stage boundary makes
+    # the direct route start a second, agent request instead of failing locally.
+    async def test_direct_sdk_connect_timeout_is_typed_without_agent_fallback(self):
+        requests = []
+
+        async def connect_timeout(request):
+            requests.append(request)
+            raise bot.httpx.ConnectTimeout("connect timed out", request=request)
+
+        tight = dataclasses.replace(
+            bot.CONFIG,
+            connect_timeout=0.1,
+            idle_timeout=0.2,
+            model_stage_timeout=1.0,
+        )
+        http_client = bot.httpx.AsyncClient(
+            transport=bot.httpx.MockTransport(connect_timeout)
+        )
+        test_client = bot.AsyncOpenAI(
+            base_url="http://transport.test/v1",
+            api_key="synthetic-test-key",
+            timeout=bot.httpx.Timeout(
+                tight.model_stage_timeout,
+                connect=tight.connect_timeout,
+                read=tight.idle_timeout,
+            ),
+            max_retries=0,
+            http_client=http_client,
+        )
+        message = FakeMessage("간단히 답해줘", CHANNEL_ID)
+
+        try:
+            with tempfile.TemporaryDirectory() as log_dir, \
+                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    patch.object(bot, "CONFIG", tight), \
+                    patch.object(bot, "client", test_client), \
+                    patch.object(bot, "MAX_AGENT_LOOPS", 2), \
+                    patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                    patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99):
+                await bot.on_message(message)
+        finally:
+            await test_client.close()
+
+        delivered = "\n".join(message.replies + message.channel.sent)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(self.reason, outcome_mod.FAILED)
+        self.assertIn("direct:connect", self.detail)
+        self.assertIn("direct:connect", delivered)
+        self.assertIn("미완료", delivered)
+        self.assertNotIn("작업 도중 예외 발생", delivered)
+
+    # Mutation caught: a streaming HTTPX read timeout can escape the OpenAI
+    # stream iterator directly. It must become a phase-specific StageTimeout so
+    # the agent route uses its deterministic FAILED report without synthesis.
+    async def test_agent_httpx_read_timeout_uses_typed_local_report(self):
+        requests = []
+
+        class ReadTimeoutStream(bot.httpx.AsyncByteStream):
+            def __init__(self, request):
+                self.request = request
+
+            async def __aiter__(self):
+                raise bot.httpx.ReadTimeout("read timed out", request=self.request)
+                yield b""  # pragma: no cover - keeps this an async generator
+
+            async def aclose(self):
+                pass
+
+        async def read_timeout(request):
+            requests.append(request)
+            return bot.httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                request=request,
+                stream=ReadTimeoutStream(request),
+            )
+
+        tight = dataclasses.replace(
+            bot.CONFIG,
+            connect_timeout=0.1,
+            idle_timeout=0.2,
+            model_stage_timeout=1.0,
+        )
+        http_client = bot.httpx.AsyncClient(
+            transport=bot.httpx.MockTransport(read_timeout)
+        )
+        test_client = bot.AsyncOpenAI(
+            base_url="http://transport.test/v1",
+            api_key="synthetic-test-key",
+            timeout=bot.httpx.Timeout(
+                tight.model_stage_timeout,
+                connect=tight.connect_timeout,
+                read=tight.idle_timeout,
+            ),
+            max_retries=0,
+            http_client=http_client,
+        )
+        message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
+
+        try:
+            with tempfile.TemporaryDirectory() as log_dir, \
+                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    patch.object(bot, "CONFIG", tight), \
+                    patch.object(bot, "client", test_client), \
+                    patch.object(bot, "MAX_AGENT_LOOPS", 2), \
+                    patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                    patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99):
+                await bot.on_message(message)
+        finally:
+            await test_client.close()
+
+        delivered = "\n".join(message.replies[1:] + message.channel.sent)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(self.reason, outcome_mod.FAILED)
+        self.assertIn("agent:read", self.detail)
+        self.assertIn("agent:read", delivered)
+        self.assertIn("미완료", delivered)
+        self.assertNotIn("작업 도중 예외 발생", delivered)
+
     # Mutation caught: wrapping the whole SDK stream acquisition in the connect
     # budget misclassifies delayed response headers as connection establishment.
     async def test_delayed_response_headers_use_read_not_connect_budget(self):

@@ -314,9 +314,10 @@ bot = CustomBot(command_prefix="!", intents=intents)
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
 channel_reasoning = defaultdict(lambda: "high")
-# The public token/owner identify the newest live controllable run. The lease
-# list only restores an older live direct run after overlap; it does not gate,
-# queue, or delay admission.
+# Public control follows the newest active lease when one exists; otherwise it
+# follows the newest pending direct lease. The list restores the surviving
+# caller-owned controller after either overlap completion order and never gates,
+# queues, or delays admission.
 channel_cancel_token = {}
 channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
@@ -971,17 +972,31 @@ async def run_completion_stage(token=None, stage="agent", deadline=None, **kwarg
     cannot accidentally bypass cancellation or the total deadline. A supplied
     monotonic deadline lets recovery attempts share one stage budget.
     """
+    from openai import APITimeoutError
+
     seconds = (
         CONFIG.model_stage_timeout
         if deadline is None
         else max(0.0, deadline - time.monotonic())
     )
-    return await with_deadline(
-        create_streaming_completion(token=token, stage=stage, **kwargs),
-        seconds,
-        token,
-        stage,
-    )
+    try:
+        return await with_deadline(
+            create_streaming_completion(token=token, stage=stage, **kwargs),
+            seconds,
+            token,
+            stage,
+        )
+    except (APITimeoutError, httpx.TimeoutException) as timeout_error:
+        phase_error = getattr(timeout_error, "__cause__", None)
+        if not isinstance(phase_error, httpx.TimeoutException):
+            phase_error = timeout_error
+        if isinstance(phase_error, httpx.ConnectTimeout):
+            phase, phase_seconds = "connect", CONFIG.connect_timeout
+        elif isinstance(phase_error, httpx.ReadTimeout):
+            phase, phase_seconds = "read", CONFIG.idle_timeout
+        else:
+            phase, phase_seconds = "transport", seconds
+        raise StageTimeout(f"{stage}:{phase}", phase_seconds) from timeout_error
 
 
 async def create_streaming_completion(token=None, stage="agent", **kwargs):
@@ -1229,7 +1244,7 @@ async def slash_reset(interaction: discord.Interaction):
     clear_channel_state(interaction.channel_id)
     await interaction.response.send_message("🧹 **대화 기록과 컨텍스트 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
 
-@bot.tree.command(name="stop", description="현재 진행 중인 자율 탐색을 즉시 중단하고 최종 보고서를 합성합니다.")
+@bot.tree.command(name="stop", description="현재 단계를 취소하고 보존된 조사 상태를 보고합니다.")
 async def slash_stop(interaction: discord.Interaction):
     decision = authorize_caller(
         authz.CONTROL, getattr(interaction.user, "id", None), channel_id=interaction.channel_id
@@ -1414,27 +1429,38 @@ async def on_message(message: discord.Message):
     token = CancelToken()
     lease = {"token": token, "owner": caller_id, "active": False}
     channel_run_leases[message.channel.id].append(lease)
-    channel_cancel_token[message.channel.id] = token
-    channel_run_owner[message.channel.id] = caller_id
-    channel_user_queue[message.channel.id].clear()
 
-    def release_run():
-        leases = channel_run_leases[message.channel.id]
-        if not any(candidate is lease for candidate in leases):
-            return
-        leases[:] = [candidate for candidate in leases if candidate is not lease]
+    def publish_run_control():
+        leases = channel_run_leases.get(message.channel.id, [])
         channel_active_runs[message.channel.id] = any(
             candidate["active"] for candidate in leases
         )
-        if leases:
-            current = leases[-1]
-            channel_cancel_token[message.channel.id] = current["token"]
-            channel_run_owner[message.channel.id] = current["owner"]
+        if not leases:
+            channel_run_leases.pop(message.channel.id, None)
+            channel_cancel_token.pop(message.channel.id, None)
+            channel_run_owner.pop(message.channel.id, None)
+            channel_user_queue[message.channel.id].clear()
             return
-        channel_run_leases.pop(message.channel.id, None)
-        channel_cancel_token.pop(message.channel.id, None)
-        channel_run_owner.pop(message.channel.id, None)
-        channel_user_queue[message.channel.id].clear()
+        current = next(
+            (
+                candidate
+                for candidate in reversed(leases)
+                if candidate["active"]
+            ),
+            leases[-1],
+        )
+        channel_cancel_token[message.channel.id] = current["token"]
+        channel_run_owner[message.channel.id] = current["owner"]
+
+    publish_run_control()
+    channel_user_queue[message.channel.id].clear()
+
+    def release_run():
+        leases = channel_run_leases.get(message.channel.id, [])
+        if not any(candidate is lease for candidate in leases):
+            return
+        leases[:] = [candidate for candidate in leases if candidate is not lease]
+        publish_run_control()
 
     async def send_reply_chunks(text, local_fallback=False):
         if local_fallback:
@@ -1554,7 +1580,7 @@ async def on_message(message: discord.Message):
         release_run()
         raise
     lease["active"] = True
-    channel_active_runs[message.channel.id] = True
+    publish_run_control()
 
     total_tools_executed = 0
     executed_call_signatures = []
@@ -1584,10 +1610,18 @@ async def on_message(message: discord.Message):
     def settle_stage_failure(error):
         if isinstance(error, RunCancelled):
             outcome.settle(outcome_mod.STOPPED, error.reason)
-        else:
+        elif isinstance(error, StageTimeout):
             outcome.settle(
                 outcome_mod.FAILED,
                 f"마감 초과: {error.stage} {error.seconds:g}s",
+            )
+        else:
+            failure = _clip_summary_text(
+                f"{type(error).__name__}: {error}", 500
+            )
+            outcome.settle(
+                outcome_mod.FAILED,
+                f"업스트림 실패: {failure}",
             )
         print(f"[Run settled: {outcome.describe()}]", flush=True)
 
@@ -1682,8 +1716,12 @@ async def on_message(message: discord.Message):
                     except (RunCancelled, StageTimeout) as stage_error:
                         settle_stage_failure(stage_error)
                         break
+                    except Exception as retry_error:
+                        settle_stage_failure(retry_error)
+                        break
                 else:
-                    raise api_err
+                    settle_stage_failure(api_err)
+                    break
 
             # A response completed concurrently with !stop must not enable
             # logging, counters, messages, or tool work after cancellation.
@@ -1846,6 +1884,9 @@ async def on_message(message: discord.Message):
                     )
                 except (RunCancelled, StageTimeout) as stage_error:
                     settle_stage_failure(stage_error)
+                    break
+                except Exception as tool_error:
+                    settle_stage_failure(tool_error)
                     break
 
                 for tc, tool_result in zip(tool_calls_to_run, parallel_results):
