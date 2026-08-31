@@ -3,13 +3,16 @@
 Every identifier here is synthetic.
 """
 
+import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import discord
 
+from deadlines import CancelToken
 from test_support import (
     FakeAuthor,
     FakeChannel,
@@ -44,11 +47,12 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
         self._log_dir.cleanup()
         bot.FREE_RESPONSE_CHANNEL_IDS.discard(CHANNEL_ID)
         bot.channel_run_owner.pop(CHANNEL_ID, None)
+        bot.channel_cancel_token.pop(CHANNEL_ID, None)
         for state in (
             bot.channel_history,
             bot.channel_summary,
             bot.channel_reasoning,
-            bot.channel_stop_requested,
+            bot.channel_cancel_token,
             bot.channel_active_runs,
             bot.channel_user_queue,
             bot.channel_ledger,
@@ -60,7 +64,7 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
         self.completion.assert_not_awaited()
         self.execute_tools.assert_not_awaited()
         self.assertEqual(bot.channel_history[CHANNEL_ID], [])
-        self.assertFalse(bot.channel_stop_requested[CHANNEL_ID])
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
         self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
         self.assertEqual(os.listdir(self._log_dir.name), [])
 
@@ -105,12 +109,20 @@ class DeniedRequestTest(GateTestCase):
 
 
 class ControlCommandOrderTest(GateTestCase):
-    async def test_outsider_stop_does_not_set_the_flag(self):
+    def start_fake_run(self, owner_id):
+        """Stand in for an in-flight run so !stop has a token to cancel."""
+        token = CancelToken()
+        bot.channel_cancel_token[CHANNEL_ID] = token
+        bot.channel_run_owner[CHANNEL_ID] = owner_id
+        return token
+
+    async def test_outsider_stop_does_not_cancel_the_run(self):
+        token = self.start_fake_run(TEST_USER_ID)
         message = FakeMessage("!stop", CHANNEL_ID, author=FakeAuthor(TEST_OUTSIDER_ID, "outsider"))
 
         await bot.on_message(message)
 
-        self.assertFalse(bot.channel_stop_requested[CHANNEL_ID])
+        self.assertFalse(token.cancelled)
         self.assertIn("권한이 없습니다", message.replies[-1])
 
     async def test_outsider_reset_does_not_clear_history(self):
@@ -122,37 +134,166 @@ class ControlCommandOrderTest(GateTestCase):
         self.assertEqual(len(bot.channel_history[CHANNEL_ID]), 1)
 
     async def test_control_command_outside_a_routed_channel_is_ignored(self):
-        message = FakeMessage("!stop", 987654504, author=FakeAuthor(TEST_USER_ID))
+        other_channel = 987654504
+        token = CancelToken()
+        bot.channel_cancel_token[other_channel] = token
+        try:
+            message = FakeMessage("!stop", other_channel, author=FakeAuthor(TEST_USER_ID))
+            await bot.on_message(message)
+            self.assertFalse(token.cancelled)
+            self.assertEqual(message.replies, [])
+        finally:
+            bot.channel_cancel_token.pop(other_channel, None)
 
-        await bot.on_message(message)
-
-        self.assertFalse(bot.channel_stop_requested[987654504])
-        self.assertEqual(message.replies, [])
-        bot.channel_stop_requested.pop(987654504, None)
-
-    async def test_allowed_caller_stop_works(self):
+    async def test_allowed_owner_stop_cancels_the_run(self):
+        token = self.start_fake_run(TEST_USER_ID)
         message = FakeMessage("!stop", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
 
         await bot.on_message(message)
 
-        self.assertTrue(bot.channel_stop_requested[CHANNEL_ID])
+        self.assertTrue(token.cancelled)
+
+    async def test_stop_with_no_run_in_flight_says_so(self):
+        message = FakeMessage("!stop", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
+
+        await bot.on_message(message)
+
+        self.assertIn("진행 중인 자율 탐색이 없습니다", message.replies[-1])
 
     async def test_non_owner_cannot_stop_someone_elses_run(self):
-        bot.channel_run_owner[CHANNEL_ID] = TEST_ADMIN_ID
+        token = self.start_fake_run(TEST_ADMIN_ID)
         message = FakeMessage("!stop", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
 
         await bot.on_message(message)
 
-        self.assertFalse(bot.channel_stop_requested[CHANNEL_ID])
+        self.assertFalse(token.cancelled)
         self.assertIn("시작한 사용자", message.replies[-1])
 
     async def test_admin_can_stop_another_users_run(self):
-        bot.channel_run_owner[CHANNEL_ID] = TEST_USER_ID
+        token = self.start_fake_run(TEST_USER_ID)
         message = FakeMessage("!stop", CHANNEL_ID, author=FakeAuthor(TEST_ADMIN_ID, "admin"))
 
         await bot.on_message(message)
 
-        self.assertTrue(bot.channel_stop_requested[CHANNEL_ID])
+        self.assertTrue(token.cancelled)
+
+
+class PendingDirectOwnershipTest(GateTestCase):
+    # Mutation caught: publishing a direct-run token before its owner lets an
+    # unrelated allowlisted non-admin cancel the pending response.
+    async def test_non_owner_cannot_stop_a_pending_direct_run(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def model(**kwargs):
+            started.set()
+            await release.wait()
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="직접 답변"),
+            )])
+
+        self.completion.side_effect = model
+        owner_message = FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(TEST_ADMIN_ID, "admin"),
+        )
+        run = asyncio.create_task(bot.on_message(owner_message))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        token = bot.channel_cancel_token[CHANNEL_ID]
+
+        try:
+            stop = FakeMessage(
+                "!stop",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID, "other-user"),
+            )
+            await bot.on_message(stop)
+
+            self.assertFalse(token.cancelled)
+            self.assertIn("시작한 사용자", stop.replies[-1])
+        finally:
+            release.set()
+            await asyncio.gather(run, return_exceptions=True)
+
+    # Mutation caught: letting caller-level CancelledError bypass direct-route
+    # cleanup leaves an owner and active token for a run that no longer exists.
+    async def test_caller_cancellation_releases_a_pending_direct_run(self):
+        started = asyncio.Event()
+        finalized = asyncio.Event()
+
+        async def model(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized.set()
+
+        self.completion.side_effect = model
+        message = FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(TEST_USER_ID),
+        )
+        run = asyncio.create_task(bot.on_message(message))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        run.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await run
+
+        self.assertTrue(finalized.is_set())
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+        self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
+        self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
+
+    # Mutation caught: delaying active-run registration lets a second message
+    # start another direct model stage and replace the first run's token.
+    async def test_second_request_cannot_start_beside_a_pending_direct_run(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def model(**kwargs):
+            calls.append(kwargs.get("stage"))
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="직접 답변"),
+            )])
+
+        self.completion.side_effect = model
+        first_message = FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(TEST_USER_ID),
+        )
+        first_run = asyncio.create_task(bot.on_message(first_message))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        original_token = bot.channel_cancel_token[CHANNEL_ID]
+
+        try:
+            second_message = FakeMessage(
+                "간단히 답해줘",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID),
+            )
+            await asyncio.wait_for(bot.on_message(second_message), timeout=1)
+
+            self.assertEqual(calls, ["direct"])
+            self.assertIs(bot.channel_cancel_token[CHANNEL_ID], original_token)
+            self.assertFalse(first_run.done())
+            self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
+            self.assertIn("끝난 뒤 다시", second_message.replies[-1])
+            self.assertNotIn("실시간 개입 수신", second_message.replies[-1])
+        finally:
+            release.set()
+            await asyncio.gather(first_run, return_exceptions=True)
+
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+        self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
+        self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
 
 
 class PurgeTest(GateTestCase):

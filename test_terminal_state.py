@@ -13,6 +13,7 @@ from test_support import FakeMessage
 
 import bot
 import outcome as outcome_mod
+from deadlines import StageTimeout
 
 CHANNEL_ID = 987654600
 
@@ -74,7 +75,7 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
             bot.channel_history,
             bot.channel_summary,
             bot.channel_reasoning,
-            bot.channel_stop_requested,
+            bot.channel_cancel_token,
             bot.channel_active_runs,
             bot.channel_user_queue,
             bot.channel_ledger,
@@ -96,7 +97,7 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
                 return _response(content=LONG_REPORT)
             calls["count"] += 1
             if stop_after is not None and calls["count"] == stop_after:
-                bot.channel_stop_requested[CHANNEL_ID] = True
+                bot.request_run_cancel(CHANNEL_ID)
             return script.pop(0) if script else _response(content="계속 진행합니다.")
 
         self.synthesis_calls = []
@@ -155,6 +156,8 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
         self.assertIn("미완료", self.final_reply)
         self.assertNotIn("완료 시간", self.final_reply)
 
+    # Mutation caught: omitting the post-model cancellation checkpoint lets
+    # the response returned after cancellation start its second tool, probe2.
     async def test_3_stop_arriving_at_the_checkpoint_yields_stopped(self):
         await self.drive(
             [
@@ -170,6 +173,11 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
 
         self.assertEqual(len(self.recorder.settled), 1)
         self.assertEqual(self.recorder.reason, outcome_mod.STOPPED)
+        self.assertIn("총 1개 도구 실행", self.final_reply)
+        self.assertEqual(
+            [call.args[0] for call in self.bash_exec.await_args_list],
+            ["probe"],
+        )
         self.assertIn("미완료", self.final_reply)
         self.assertNotIn("완료 시간", self.final_reply)
 
@@ -259,6 +267,88 @@ class NoWorkAfterSettlingTest(TerminalStateTestCase):
 
 
 class DirectAnswerTest(TerminalStateTestCase):
+    # Mutation caught: returning from the fast direct route before common cleanup
+    # leaves a stale cancel token registered for a run that already answered.
+    async def test_direct_route_cleans_the_token_after_success(self):
+        message = await self.run_agent(
+            [_response(content="짧은 답변입니다.")],
+            request="간단히 답해줘",
+        )
+
+        self.assertIn("짧은 답변입니다.", message.replies)
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+
+    # Mutation caught: omitting the direct-stage token and typed cancellation
+    # handling turns a stop into a successful direct answer or research fallback.
+    async def test_direct_route_stop_is_not_swallowed_by_generic_fallback(self):
+        message = await self.run_agent(
+            [_response(content="취소 뒤 답변하면 안 됩니다.")],
+            request="간단히 답해줘",
+            stop_after=1,
+        )
+
+        delivered = "\n".join(message.replies + message.channel.sent)
+        self.assertIn(outcome_mod.LABELS[outcome_mod.STOPPED], delivered)
+        self.assertNotIn("취소 뒤 답변하면 안 됩니다.", delivered)
+        self.assertEqual(self.synthesis_calls, [])
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+
+    # Mutation caught: sending a deterministic direct-route failure report as
+    # one reply exceeds Discord's message limit when preserved state is long.
+    async def test_direct_route_timeout_report_is_split_into_bounded_chunks(self):
+        async def timed_out(**kwargs):
+            raise StageTimeout("direct", 0.1)
+
+        bot.channel_summary[CHANNEL_ID] = "긴 보존 요약 " * 700
+        message = FakeMessage("간단히 답해줘", CHANNEL_ID)
+        chunk_lengths = []
+        original_reply = message.reply
+        original_send = message.channel.send
+
+        async def reply(content):
+            chunk_lengths.append(len(content))
+            return await original_reply(content)
+
+        async def send(content):
+            chunk_lengths.append(len(content))
+            return await original_send(content)
+
+        message.reply = reply
+        message.channel.send = send
+        with tempfile.TemporaryDirectory() as log_dir, \
+                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                patch.object(bot, "create_streaming_completion", timed_out), \
+                self.recorder.install():
+            await bot.on_message(message)
+
+        delivered = "\n".join(message.replies + message.channel.sent)
+        self.assertGreater(len(chunk_lengths), 1)
+        self.assertLessEqual(max(chunk_lengths), 1900)
+        self.assertIn("마감 초과", delivered)
+
+    # Mutation caught: a broad direct-route fallback that catches StageTimeout
+    # starts a second model request instead of reporting the bounded failure.
+    async def test_direct_route_timeout_does_not_start_research_fallback(self):
+        calls = []
+
+        async def timed_out(**kwargs):
+            calls.append(kwargs.get("stage"))
+            raise StageTimeout("direct", 0.1)
+
+        message = FakeMessage("간단히 답해줘", CHANNEL_ID)
+        with tempfile.TemporaryDirectory() as log_dir, \
+                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                patch.object(bot, "MAX_AGENT_LOOPS", 3), \
+                patch.object(bot, "create_streaming_completion", timed_out), \
+                self.recorder.install():
+            await bot.on_message(message)
+
+        delivered = "\n".join(message.replies + message.channel.sent)
+        self.assertEqual(calls, ["direct"])
+        self.assertEqual(self.recorder.reason, outcome_mod.FAILED)
+        self.assertIn("마감 초과", delivered)
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+
     async def test_direct_answer_completes_without_a_footer(self):
         await self.drive(
             [_response(content="인증된 상태는 본인 확인이 끝난 상태입니다.")],

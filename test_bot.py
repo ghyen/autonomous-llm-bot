@@ -46,7 +46,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_history,
                 bot.channel_summary,
                 bot.channel_reasoning,
-                bot.channel_stop_requested,
+                bot.channel_cancel_token,
                 bot.channel_active_runs,
                 bot.channel_user_queue,
             ):
@@ -86,7 +86,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_history,
                 bot.channel_summary,
                 bot.channel_reasoning,
-                bot.channel_stop_requested,
+                bot.channel_cancel_token,
                 bot.channel_active_runs,
                 bot.channel_user_queue,
             ):
@@ -146,7 +146,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_history,
                 bot.channel_summary,
                 bot.channel_reasoning,
-                bot.channel_stop_requested,
+                bot.channel_cancel_token,
                 bot.channel_active_runs,
                 bot.channel_user_queue,
             ):
@@ -203,7 +203,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_history,
                 bot.channel_summary,
                 bot.channel_reasoning,
-                bot.channel_stop_requested,
+                bot.channel_cancel_token,
                 bot.channel_active_runs,
                 bot.channel_user_queue,
             ):

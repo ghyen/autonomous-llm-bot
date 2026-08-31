@@ -12,6 +12,7 @@ policy is a startup failure, not a silently open door.
 """
 
 import hashlib
+import math
 import os
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Mapping, Optional
@@ -22,6 +23,14 @@ DEFAULT_WORKSPACE_DIR = "~/discord-llm-bot/workspace"
 DEFAULT_SYSTEM_LOG_DIR = "~/discord-llm-bot/.system_logs"
 
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"})
+
+# Per-stage deadlines. Separated on purpose: connecting, waiting for the next
+# stream chunk, and the whole stage are different failure modes.
+DEFAULT_CONNECT_TIMEOUT = 15.0
+DEFAULT_IDLE_TIMEOUT = 120.0
+DEFAULT_MODEL_STAGE_TIMEOUT = 600.0
+DEFAULT_TOOL_STAGE_TIMEOUT = 120.0
+DEFAULT_BASH_TIMEOUT = 60.0
 
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -44,6 +53,11 @@ class BotConfig:
     system_log_dir: str
     tools_enabled: bool
     allow_remote_llm: bool
+    connect_timeout: float
+    idle_timeout: float
+    model_stage_timeout: float
+    tool_stage_timeout: float
+    bash_timeout: float
 
     @property
     def llm_is_local(self) -> bool:
@@ -65,6 +79,13 @@ class BotConfig:
             self.system_log_dir,
             str(self.tools_enabled),
             str(self.allow_remote_llm),
+            "{0}/{1}/{2}/{3}/{4}".format(
+                self.connect_timeout,
+                self.idle_timeout,
+                self.model_stage_timeout,
+                self.tool_stage_timeout,
+                self.bash_timeout,
+            ),
         ])
         return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
@@ -118,6 +139,22 @@ def parse_bool(raw, field: str, default: bool) -> bool:
             field, raw, ", ".join(sorted(TRUE_VALUES | FALSE_VALUES))
         )
     )
+
+
+def parse_positive_float(raw, field: str, default: float) -> float:
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        raise ConfigError("{0}: '{1}'은 숫자가 아닙니다.".format(field, raw))
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(
+            "{0}: '{1}'은 유한한 0보다 큰 숫자여야 합니다. 마감을 없애려면 큰 값을 쓰세요.".format(
+                field, raw
+            )
+        )
+    return value
 
 
 def load_env_file(path) -> Dict[str, str]:
@@ -213,6 +250,21 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         system_log_dir=os.path.expanduser(get("SYSTEM_LOG_DIR", DEFAULT_SYSTEM_LOG_DIR)),
         tools_enabled=tools_enabled,
         allow_remote_llm=allow_remote_llm,
+        connect_timeout=parse_positive_float(
+            get("LLM_CONNECT_TIMEOUT_SECONDS"), "LLM_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT
+        ),
+        idle_timeout=parse_positive_float(
+            get("LLM_IDLE_TIMEOUT_SECONDS"), "LLM_IDLE_TIMEOUT_SECONDS", DEFAULT_IDLE_TIMEOUT
+        ),
+        model_stage_timeout=parse_positive_float(
+            get("MODEL_STAGE_TIMEOUT_SECONDS"), "MODEL_STAGE_TIMEOUT_SECONDS", DEFAULT_MODEL_STAGE_TIMEOUT
+        ),
+        tool_stage_timeout=parse_positive_float(
+            get("TOOL_STAGE_TIMEOUT_SECONDS"), "TOOL_STAGE_TIMEOUT_SECONDS", DEFAULT_TOOL_STAGE_TIMEOUT
+        ),
+        bash_timeout=parse_positive_float(
+            get("BASH_TIMEOUT_SECONDS"), "BASH_TIMEOUT_SECONDS", DEFAULT_BASH_TIMEOUT
+        ),
     )
 
     if not config.llm_is_local and not allow_remote_llm:
@@ -239,6 +291,13 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             len(config.allowed_user_ids), len(config.admin_user_ids)
         ),
         "free-response channels: {0}".format(len(config.free_response_channel_ids)),
+        "deadlines(s): connect={0} idle={1} model={2} tool={3} bash={4}".format(
+            config.connect_timeout,
+            config.idle_timeout,
+            config.model_stage_timeout,
+            config.tool_stage_timeout,
+            config.bash_timeout,
+        ),
         "workspace: {0}".format(config.workspace_dir),
         "system logs: {0}".format(config.system_log_dir),
     ]
