@@ -393,6 +393,185 @@ class PendingDirectOwnershipTest(GateTestCase):
         self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
         self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
         self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
+    async def _start_active_run_with_newer_pending_direct(
+            self, active_owner_id, pending_owner_id):
+        first_direct_started = asyncio.Event()
+        second_direct_started = asyncio.Event()
+        first_direct_release = asyncio.Event()
+        second_direct_release = asyncio.Event()
+        active_started = asyncio.Event()
+        active_cleanup_started = asyncio.Event()
+        active_cleanup_release = asyncio.Event()
+        direct_calls = 0
+
+        async def model(**kwargs):
+            nonlocal direct_calls
+            if kwargs.get("stage") == "direct":
+                direct_calls += 1
+                if direct_calls == 1:
+                    first_direct_started.set()
+                    await first_direct_release.wait()
+                    content = ""
+                else:
+                    second_direct_started.set()
+                    await second_direct_release.wait()
+                    content = "대기 중 직접 답변"
+                return SimpleNamespace(choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=content),
+                )])
+
+            active_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                active_cleanup_started.set()
+                await active_cleanup_release.wait()
+
+        self.completion.side_effect = model
+        active_run = asyncio.create_task(bot.on_message(FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(active_owner_id, "active-owner"),
+        )))
+        await asyncio.wait_for(first_direct_started.wait(), timeout=1)
+        active_token = bot.channel_cancel_token[CHANNEL_ID]
+
+        pending_run = asyncio.create_task(bot.on_message(FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(pending_owner_id, "pending-owner"),
+        )))
+        await asyncio.wait_for(second_direct_started.wait(), timeout=1)
+        pending_token = bot.channel_cancel_token[CHANNEL_ID]
+
+        first_direct_release.set()
+        await asyncio.wait_for(active_started.wait(), timeout=1)
+        return SimpleNamespace(
+            active_run=active_run,
+            pending_run=pending_run,
+            active_token=active_token,
+            pending_token=pending_token,
+            first_direct_release=first_direct_release,
+            second_direct_release=second_direct_release,
+            active_cleanup_started=active_cleanup_started,
+            active_cleanup_release=active_cleanup_release,
+        )
+
+    # Mutation caught: newest-pending publication must not authorize that owner
+    # to steer the older active run or make stop cancel the pending token. After
+    # active-first completion, control returns to the surviving pending lease.
+    async def test_active_lease_controls_overlap_when_active_finishes_first(self):
+        pending_owner_id = 333333333333333333
+        bot.ALLOWED_USER_IDS.add(pending_owner_id)
+        state = await self._start_active_run_with_newer_pending_direct(
+            TEST_USER_ID, pending_owner_id
+        )
+
+        try:
+            pending_steering = FakeMessage(
+                "대기 소유자의 잘못된 지시",
+                CHANNEL_ID,
+                author=FakeAuthor(pending_owner_id, "pending-owner"),
+            )
+            await bot.on_message(pending_steering)
+            self.assertIn("시작한 사용자", pending_steering.replies[-1])
+            self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
+
+            active_steering = FakeMessage(
+                "활성 소유자의 지시",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID, "active-owner"),
+            )
+            await bot.on_message(active_steering)
+            self.assertEqual(active_steering.reactions, ["📥"])
+            self.assertEqual(
+                bot.channel_user_queue[CHANNEL_ID],
+                [("active-owner", "활성 소유자의 지시")],
+            )
+
+            stop = FakeMessage(
+                "!stop",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID, "active-owner"),
+            )
+            await bot.on_message(stop)
+            self.assertTrue(state.active_token.cancelled)
+            self.assertFalse(state.pending_token.cancelled)
+            await asyncio.wait_for(state.active_cleanup_started.wait(), timeout=1)
+            state.active_cleanup_release.set()
+            await asyncio.wait_for(state.active_run, timeout=1)
+
+            self.assertIs(
+                bot.channel_cancel_token.get(CHANNEL_ID), state.pending_token
+            )
+            self.assertEqual(
+                bot.channel_run_owner.get(CHANNEL_ID), pending_owner_id
+            )
+            self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
+
+            state.second_direct_release.set()
+            await asyncio.wait_for(state.pending_run, timeout=1)
+        finally:
+            bot.ALLOWED_USER_IDS.discard(pending_owner_id)
+            state.first_direct_release.set()
+            state.second_direct_release.set()
+            state.active_cleanup_release.set()
+            state.active_run.cancel()
+            state.pending_run.cancel()
+            await asyncio.gather(
+                state.active_run, state.pending_run, return_exceptions=True
+            )
+
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+        self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
+        self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
+
+    # Mutation caught: stop must target the active lease even when cancellation
+    # cleanup is held open and the newer pending direct run completes first.
+    async def test_active_lease_controls_overlap_when_pending_finishes_first(self):
+        pending_owner_id = 333333333333333333
+        bot.ALLOWED_USER_IDS.add(pending_owner_id)
+        state = await self._start_active_run_with_newer_pending_direct(
+            TEST_USER_ID, pending_owner_id
+        )
+
+        try:
+            stop = FakeMessage(
+                "!stop",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID, "active-owner"),
+            )
+            await bot.on_message(stop)
+            self.assertTrue(state.active_token.cancelled)
+            self.assertFalse(state.pending_token.cancelled)
+            await asyncio.wait_for(state.active_cleanup_started.wait(), timeout=1)
+
+            state.second_direct_release.set()
+            await asyncio.wait_for(state.pending_run, timeout=1)
+            self.assertIs(
+                bot.channel_cancel_token.get(CHANNEL_ID), state.active_token
+            )
+            self.assertEqual(
+                bot.channel_run_owner.get(CHANNEL_ID), TEST_USER_ID
+            )
+            self.assertTrue(bot.channel_active_runs[CHANNEL_ID])
+
+            state.active_cleanup_release.set()
+            await asyncio.wait_for(state.active_run, timeout=1)
+        finally:
+            bot.ALLOWED_USER_IDS.discard(pending_owner_id)
+            state.first_direct_release.set()
+            state.second_direct_release.set()
+            state.active_cleanup_release.set()
+            state.active_run.cancel()
+            state.pending_run.cancel()
+            await asyncio.gather(
+                state.active_run, state.pending_run, return_exceptions=True
+            )
+
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+        self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
+        self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
 
 
 class PurgeTest(GateTestCase):

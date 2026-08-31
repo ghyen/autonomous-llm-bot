@@ -367,20 +367,170 @@ class DirectAnswerTest(TerminalStateTestCase):
 
 
 class FailureTest(TerminalStateTestCase):
-    async def test_an_exception_settles_failed_and_never_claims_completion(self):
+    # Mutation caught: letting an ordinary primary-model error reach the outer
+    # handler drops the ledger/summary and sends only an unbounded raw error.
+    async def test_agent_exception_uses_bounded_preserved_state_report(self):
+        marker = "E_AGENT_UPSTREAM_FAILURE"
+        summary = "SUMMARY_BEFORE_AGENT_FAILURE"
+        ledger = bot.channel_ledger[CHANNEL_ID]
+        ledger.apply_updates({
+            "evidence": [{
+                "id": marker,
+                "summary": "모델 실패 전에 보존된 관측",
+                "source": "test://agent-failure",
+            }],
+        })
+        full_ledger = ledger.render()
+        bot.channel_summary[CHANNEL_ID] = summary
+        stages = []
+        failure = "MODEL_FAILURE_PREFIX " + ("x" * 700) + " MODEL_FAILURE_TAIL"
+
         async def exploding(**kwargs):
-            raise RuntimeError("backend exploded")
+            stages.append(kwargs.get("stage"))
+            raise RuntimeError(failure)
 
         message = FakeMessage("조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
                 patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 3), \
+                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
                 patch.object(bot, "create_streaming_completion", exploding), \
                 self.recorder.install():
             await bot.on_message(message)
 
+        chunks = message.replies[1:] + message.channel.sent
+        delivered = "".join(chunks)
+        self.assertEqual(stages, ["agent"])
         self.assertEqual(self.recorder.reason, outcome_mod.FAILED)
-        self.assertIn("예외", self.recorder.detail)
+        self.assertIn("업스트림 실패", self.recorder.detail)
+        self.assertIn("MODEL_FAILURE_PREFIX", delivered)
+        self.assertIn("...[생략]", delivered)
+        self.assertNotIn("MODEL_FAILURE_TAIL", delivered)
+        self.assertIn(marker, delivered)
+        self.assertIn(summary, delivered)
+        self.assertIn("미완료", delivered)
+        self.assertNotIn("작업 도중 예외 발생", delivered)
+        self.assertTrue(chunks)
+        self.assertLessEqual(len(chunks), 3)
+        self.assertLessEqual(sum(len(chunk) for chunk in chunks), 5700)
+        self.assertLessEqual(max(len(chunk) for chunk in chunks), 1900)
+        self.assertEqual(ledger.render(), full_ledger)
+
+    # Mutation caught: a 400 recovery attempt is still the same bounded model
+    # stage. An ordinary retry failure must not escape to the raw outer handler.
+    async def test_400_retry_exception_uses_preserved_state_report(self):
+        marker = "E_RETRY_UPSTREAM_FAILURE"
+        summary = "SUMMARY_BEFORE_RETRY_FAILURE"
+        bot.channel_ledger[CHANNEL_ID].apply_updates({
+            "evidence": [{
+                "id": marker,
+                "summary": "재시도 실패 전에 보존된 관측",
+                "source": "test://retry-failure",
+            }],
+        })
+        bot.channel_summary[CHANNEL_ID] = summary
+        stages = []
+        failure = "RETRY_FAILURE_PREFIX " + ("z" * 700) + " RETRY_FAILURE_TAIL"
+
+        async def model(**kwargs):
+            stages.append(kwargs.get("stage"))
+            if len(stages) == 1:
+                raise RuntimeError("400 invalid tool_call_id")
+            raise OSError(failure)
+
+        message = FakeMessage("조사해줘", CHANNEL_ID)
+        with tempfile.TemporaryDirectory() as log_dir, \
+                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                patch.object(bot, "MAX_AGENT_LOOPS", 3), \
+                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
+                patch.object(bot, "create_streaming_completion", model), \
+                self.recorder.install():
+            await bot.on_message(message)
+
+        delivered = "".join(message.replies[1:] + message.channel.sent)
+        self.assertEqual(stages, ["agent", "agent:retry"])
+        self.assertEqual(self.recorder.reason, outcome_mod.FAILED)
+        self.assertIn("업스트림 실패", self.recorder.detail)
+        self.assertIn("RETRY_FAILURE_PREFIX", delivered)
+        self.assertIn("...[생략]", delivered)
+        self.assertNotIn("RETRY_FAILURE_TAIL", delivered)
+        self.assertIn(marker, delivered)
+        self.assertIn(summary, delivered)
+        self.assertNotIn("작업 도중 예외 발생", delivered)
+
+    # Mutation caught: an ordinary child-tool error is reaped by the batch
+    # helper, but must also settle FAILED at the caller boundary so preserved
+    # state is reported without starting synthesis.
+    async def test_tool_exception_uses_bounded_preserved_state_report(self):
+        marker = "E_TOOL_UPSTREAM_FAILURE"
+        summary = "SUMMARY_BEFORE_TOOL_FAILURE"
+        ledger = bot.channel_ledger[CHANNEL_ID]
+        ledger.apply_updates({
+            "evidence": [{
+                "id": marker,
+                "summary": "도구 실패 전에 보존된 관측",
+                "source": "test://tool-failure",
+            }],
+        })
+        full_ledger = ledger.render()
+        bot.channel_summary[CHANNEL_ID] = summary
+        sibling_started = bot.asyncio.Event()
+        sibling_finalized = bot.asyncio.Event()
+        release = bot.asyncio.Event()
+        stages = []
+        failure = "TOOL_FAILURE_PREFIX " + ("y" * 700) + " TOOL_FAILURE_TAIL"
+
+        async def model(**kwargs):
+            stages.append(kwargs.get("stage"))
+            return _response(tool_calls=[
+                _tool_call("c1", "bash_exec", {"command": "fail"}),
+                _tool_call("c2", "bash_exec", {"command": "block"}),
+            ])
+
+        async def tool(command):
+            if command == "fail":
+                await sibling_started.wait()
+                raise ValueError(failure)
+            sibling_started.set()
+            try:
+                await release.wait()
+            finally:
+                sibling_finalized.set()
+
+        message = FakeMessage("조사해줘", CHANNEL_ID)
+        try:
+            with tempfile.TemporaryDirectory() as log_dir, \
+                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    patch.object(bot, "MAX_AGENT_LOOPS", 3), \
+                    patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                    patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
+                    patch.object(bot, "create_streaming_completion", model), \
+                    patch.object(bot, "tool_bash_exec", tool), \
+                    self.recorder.install():
+                await bot.on_message(message)
+        finally:
+            release.set()
+
+        chunks = message.replies[1:] + message.channel.sent
+        delivered = "".join(chunks)
+        self.assertTrue(sibling_finalized.is_set())
+        self.assertEqual(stages, ["agent"])
+        self.assertEqual(self.recorder.reason, outcome_mod.FAILED)
+        self.assertIn("업스트림 실패", self.recorder.detail)
+        self.assertIn("TOOL_FAILURE_PREFIX", delivered)
+        self.assertIn("...[생략]", delivered)
+        self.assertNotIn("TOOL_FAILURE_TAIL", delivered)
+        self.assertIn(marker, delivered)
+        self.assertIn(summary, delivered)
+        self.assertIn("미완료", delivered)
+        self.assertNotIn("작업 도중 예외 발생", delivered)
+        self.assertTrue(chunks)
+        self.assertLessEqual(len(chunks), 3)
+        self.assertLessEqual(sum(len(chunk) for chunk in chunks), 5700)
+        self.assertLessEqual(max(len(chunk) for chunk in chunks), 1900)
+        self.assertEqual(ledger.render(), full_ledger)
 
 
 if __name__ == "__main__":

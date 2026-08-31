@@ -118,6 +118,56 @@ class WithDeadlineTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(started, [])
 
+    # Mutation caught: scheduling a coroutine before checking an exhausted
+    # budget lets transport work begin after the stage deadline has elapsed.
+    async def test_nonpositive_deadline_never_starts_a_coroutine(self):
+        for seconds in (0, -TICK):
+            with self.subTest(seconds=seconds):
+                started = []
+
+                async def work():
+                    started.append(True)
+                    return "should not run"
+
+                with self.assertRaises(StageTimeout) as caught:
+                    await with_deadline(
+                        work(), seconds, stage="agent:retry"
+                    )
+
+                self.assertEqual(caught.exception.stage, "agent:retry")
+                self.assertEqual(caught.exception.seconds, seconds)
+                self.assertEqual(started, [])
+
+    # Mutation caught: rejecting an exhausted budget without distinguishing a
+    # pre-created Future abandons its child and can leak terminal warnings.
+    async def test_nonpositive_deadline_reaps_an_already_created_gather(self):
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        async def wedged():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+        child = asyncio.create_task(wedged())
+        await started.wait()
+        batch = asyncio.gather(child)
+
+        try:
+            with self.assertRaises(StageTimeout) as caught:
+                await with_deadline(batch, 0, stage="tool")
+
+            self.assertEqual(caught.exception.stage, "tool")
+            self.assertEqual(
+                (batch.done(), child.done(), cleaned.is_set()),
+                (True, True, True),
+            )
+        finally:
+            batch.cancel()
+            await asyncio.gather(batch, return_exceptions=True)
+
     # Mutation caught: treating a pre-created Future like an unopened coroutine
     # leaves its child running and its terminal exception unobserved.
     async def test_pre_cancelled_token_reaps_an_already_created_gather(self):
@@ -220,6 +270,40 @@ class WithDeadlineTest(unittest.IsolatedAsyncioTestCase):
             cleanup_release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await outer
+            self.assertTrue(cleanup_done.is_set())
+        finally:
+            cleanup_release.set()
+            await asyncio.gather(outer, return_exceptions=True)
+
+    # Mutation caught: token cancellation can arrive while the completed-work
+    # branch is awaiting its cancellation-waiter cleanup. It must still beat
+    # the completed result before that result is returned.
+    async def test_token_cancellation_during_waiter_cleanup_beats_completed_result(self):
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_done = asyncio.Event()
+
+        class GatedToken(CancelToken):
+            async def wait(self):
+                try:
+                    await super().wait()
+                finally:
+                    cleanup_started.set()
+                    await cleanup_release.wait()
+                    self.cancel("정리 중 중단")
+                    cleanup_done.set()
+
+        token = GatedToken()
+        outer = asyncio.create_task(
+            with_deadline(asyncio.sleep(0, result="done"), 60, token)
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        try:
+            cleanup_release.set()
+            with self.assertRaises(RunCancelled) as caught:
+                await outer
+            self.assertEqual(caught.exception.reason, "정리 중 중단")
             self.assertTrue(cleanup_done.is_set())
         finally:
             cleanup_release.set()
