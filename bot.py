@@ -59,12 +59,53 @@ SYSTEM_PROMPT = f"""당신은 터미널 환경과 전용 작업 공간(workspace
   - `web_search(query)`: DuckDuckGo 웹 검색
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
 
-[필수 행동 지침]
+[요청 라우팅 - 최우선]
+먼저 사용자의 요청을 판단하세요.
+- 단순한 설명·개념 질문·대화이거나 짧은 답을 요청한 경우: 도구를 호출하지 말고 현재 대화만으로 짧게 답하세요. 웹 검색, 파일 조회, `plan.md`/`findings.md` 확인, 긴 추론을 하지 마세요.
+- 최신 정보·외부 사실 검증, 파일·로그·코드 조회, 명령 실행·수정, 다단계 조사가 필요한 경우: 아래 자율 탐색 지침에 따라 도구를 사용하세요.
+
+[딥리서치 요청에만 적용하는 자율 탐색 지침]
 1. 목표를 달성할 때까지 멈추지 말고 필요한 도구를 연속적으로 실행하세요.
 2. 중간에 추측하지 말고 반드시 도구(`bash_exec`, `web_search` 등)를 통해 사실을 검증하세요.
 3. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
 4. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
 """
+
+DIRECT_RESPONSE_PATTERN = re.compile(
+    r"(?:^|[?!.。,，。！？:：]\s*)"
+    r"(?:간단히|간단하게|짧게|한\s*줄(?:로)?|핵심만|답만|결론만)\s*"
+    r"(?:답|답변|대답|설명|알려|말해)"
+    r"(?:해\s*(?:요|줘|주세요|줘요)?|줘(?:요)?|주세요)?"
+    r"\s*(?:[?!.。,，。！？])?\s*$"
+)
+DIRECT_RESPONSE_EN_PATTERN = re.compile(
+    r"^(?:please\s+)?(?:answer|reply)\s+"
+    r"(?:briefly|concise(?:ly)?|in a short answer)\s*[?!.。,，。！？]?\s*$",
+    re.IGNORECASE,
+)
+DIRECT_RESPONSE_PROMPT = """사용자가 짧은 답변을 요청했습니다. 현재 대화만 사용해 질문에 바로 짧게 답하세요.
+도구, 웹 검색, 파일 조회, 자율 탐색을 하지 말고 추론 과정도 공개하지 마세요.
+현재 대화만으로 확실히 답할 수 없으면 추측하지 말고 추가 확인이 필요하다고 짧게 말하세요."""
+
+
+def wants_direct_response(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    return bool(
+        DIRECT_RESPONSE_PATTERN.search(normalized)
+        or DIRECT_RESPONSE_EN_PATTERN.search(normalized)
+    )
+
+
+def clean_direct_response(text: str) -> str:
+    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r"<tool_call>.*?</tool_call>|<tool_call>.*|<function=[^>]*>.*?</function>|"
+        r"<parameter=[^>]*>.*?</parameter>|</?(function|parameter|tool_call)[^>]*>",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    return text.strip()
 
 TOOLS_SCHEMA = [
     {
@@ -876,6 +917,33 @@ async def on_message(message: discord.Message):
         channel_history[message.channel.id] = recent_turns
         history = recent_turns
 
+    direct_call_failed = False
+    if wants_direct_response(content):
+        try:
+            direct_resp = await create_streaming_completion(
+                model=MODEL_NAME,
+                messages=[{"role": "system", "content": DIRECT_RESPONSE_PROMPT}, *history],
+                max_tokens=512,
+                temperature=0.3,
+                reasoning_effort="none",
+            )
+            direct_text = direct_resp.choices[0].message.content or ""
+            direct_text = clean_direct_response(direct_text)
+        except Exception as direct_error:
+            direct_call_failed = True
+            print(f"[Direct Reply Fallback]: {direct_error}", file=sys.stderr, flush=True)
+        else:
+            if direct_text:
+                direct_chunks = [direct_text[i:i + 1900] for i in range(0, len(direct_text), 1900)]
+                await message.reply(direct_chunks[0])
+                for direct_chunk in direct_chunks[1:]:
+                    await message.channel.send(direct_chunk)
+                history.append({"role": "assistant", "content": direct_text})
+                log_session_event(session_file, "💬 [간단 답변 완료]", direct_text)
+                print(f"[Direct Reply to {message.author} finished]: {len(direct_text)} chars", flush=True)
+                return
+            direct_call_failed = True
+
     # 400 Chat template error 방지: 0번째에 단일 시스템 프롬프트로 병합
     full_system_content = SYSTEM_PROMPT
     if channel_summary[message.channel.id]:
@@ -910,6 +978,7 @@ async def on_message(message: discord.Message):
 
     try:
         final_raw = ""
+        direct_answer = False
         for iteration in range(MAX_AGENT_LOOPS):
             if channel_stop_requested[message.channel.id]:
                 print(f"[Autonomous Loop Interrupted by User !stop]", flush=True)
@@ -932,7 +1001,9 @@ async def on_message(message: discord.Message):
                         pass
 
             extra_params = {}
-            if current_effort and current_effort != "none":
+            if iteration == 0:
+                extra_params["reasoning_effort"] = "none"
+            elif current_effort and current_effort != "none":
                 extra_params["reasoning_effort"] = current_effort
 
             compacted_payload = sanitize_messages_for_chat_template(apply_micro_compaction(messages_payload, preserve_recent_tool_steps=2))
@@ -943,7 +1014,7 @@ async def on_message(message: discord.Message):
                     messages=compacted_payload,
                     tools=TOOLS_SCHEMA,
                     tool_choice="auto",
-                    max_tokens=4096,
+                    max_tokens=1024 if iteration == 0 else 4096,
                     temperature=0.7,
                     **extra_params
                 )
@@ -971,7 +1042,7 @@ async def on_message(message: discord.Message):
                         messages=sanitize_messages_for_chat_template(sanitized_payload),
                         tools=TOOLS_SCHEMA,
                         tool_choice="auto",
-                        max_tokens=4096,
+                        max_tokens=1024 if iteration == 0 else 4096,
                         temperature=0.7,
                         **extra_params
                     )
@@ -1045,6 +1116,13 @@ async def on_message(message: discord.Message):
                         "name": e["name"],
                         "arguments": e["arguments"]
                     })
+
+            if iteration == 0 and not direct_call_failed and not tool_calls_to_run and content_text.strip():
+                direct_text = clean_direct_response(content_text)
+                if direct_text:
+                    direct_answer = True
+                    final_raw = direct_text
+                    break
 
             # [finish_task 전용 완료 도구 호출 여부 확인]
             is_task_completed = False
@@ -1261,7 +1339,7 @@ async def on_message(message: discord.Message):
         elapsed = time.time() - start_time
         completion_ts = int(time.time())
         elapsed_str = format_elapsed_time(elapsed)
-        footer_text = f"\n\n> ⏱️ **완료 시간**: <t:{completion_ts}:T> (모드: `자동 연장 자율 모드` / 총 {total_tools_executed}개 도구 실행 / 소요: {elapsed_str})"
+        footer_text = "" if direct_answer else f"\n\n> ⏱️ **완료 시간**: <t:{completion_ts}:T> (모드: `자동 연장 자율 모드` / 총 {total_tools_executed}개 도구 실행 / 소요: {elapsed_str})"
         final_text_with_footer = final_text + footer_text
 
         chunks = []
