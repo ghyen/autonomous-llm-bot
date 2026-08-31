@@ -25,6 +25,8 @@ from openai import AsyncOpenAI
 from duckduckgo_search import DDGS
 from types import SimpleNamespace
 
+from ledger import ResearchLedger
+
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not DISCORD_TOKEN:
     print("[Error] DISCORD_BOT_TOKEN environment variable is not set. Please provide it via environment variable or .env file.", file=sys.stderr)
@@ -57,7 +59,16 @@ SYSTEM_PROMPT = f"""당신은 터미널 환경과 전용 작업 공간(workspace
   - `read_file(path)`: 파일 읽기
   - `write_file(path, content)`: 파일 생성 및 덮어쓰기
   - `web_search(query)`: DuckDuckGo 웹 검색
+  - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
+
+[상태 관리 - 자율 탐색의 절대 규칙]
+`[권위 있는 조사 상태]` 블록이 이번 조사에서 무엇이 사실인지에 대한 유일한 권위입니다.
+- 판단을 추론(생각)에만 남기지 마세요. 추론은 다음 스텝에 남지 않습니다. 가설을 세우거나 반증하거나 결론을 내릴 때마다 즉시 `record_state`로 짧은 구조화된 갱신을 기록하세요.
+- 증거는 먼저 `evidence`에 id·요약·출처로 등록하고, 가설 전이는 그 증거 id를 인용하세요.
+- 반증된 가설(`rejected`)을 다시 유망한 후보로 되살리려면, 이전에 인용하지 않은 새 증거를 등록하고 `status="reopen"`으로 요청해야 합니다. 그냥 다시 `active`로 쓰는 요청은 거부됩니다.
+- 결론은 `premises`에 근거 가설 id를 명시하세요. 전제가 교체되면 그 결론은 자동으로 무효가 되며, 무효 결론을 현재 사실처럼 보고하지 마세요.
+- 요약이나 보고서가 상태 블록과 다르면 상태 블록이 옳습니다.
 
 [요청 라우팅 - 최우선]
 먼저 사용자의 요청을 판단하세요.
@@ -68,7 +79,8 @@ SYSTEM_PROMPT = f"""당신은 터미널 환경과 전용 작업 공간(workspace
 1. 목표를 달성할 때까지 멈추지 말고 필요한 도구를 연속적으로 실행하세요.
 2. 중간에 추측하지 말고 반드시 도구(`bash_exec`, `web_search` 등)를 통해 사실을 검증하세요.
 3. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
-4. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
+4. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
+5. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
 """
 
 DIRECT_RESPONSE_PATTERN = re.compile(
@@ -183,6 +195,75 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "record_state",
+            "description": (
+                "목표·증거·가설·결론의 권위 있는 상태를 갱신합니다. 판단은 추론에 남기지 말고 "
+                "이 도구로 기록하세요. 반증된 가설을 다시 active로 만드는 요청은 거부되며, "
+                "새 증거를 인용한 status=\"reopen\"만 허용됩니다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "현재 조사 목표 (변경이 없으면 생략)"
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "description": "새로 확인한 증거. 가설 전이보다 먼저 등록해야 합니다.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "짧은 증거 식별자 (예: E_NEG)"},
+                                "summary": {"type": "string", "description": "증거 요약 한두 문장"},
+                                "source": {"type": "string", "description": "출처 URL, 파일 경로 또는 명령어"}
+                            },
+                            "required": ["id", "summary"]
+                        }
+                    },
+                    "hypotheses": {
+                        "type": "array",
+                        "description": "가설 선언 또는 상태 전이",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "짧은 가설 식별자 (예: H_A)"},
+                                "statement": {"type": "string", "description": "가설 진술"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["active", "rejected", "confirmed", "reopen"],
+                                    "description": "active/rejected/confirmed, 또는 반증된 가설을 되살리는 reopen"
+                                },
+                                "evidence_id": {"type": "string", "description": "이 전이의 근거 증거 id"},
+                                "note": {"type": "string", "description": "짧은 부가 설명"}
+                            },
+                            "required": ["id"]
+                        }
+                    },
+                    "conclusions": {
+                        "type": "array",
+                        "description": "결론. premises의 전제 가설이 교체되면 자동으로 무효가 됩니다.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "짧은 결론 식별자 (예: C_A)"},
+                                "statement": {"type": "string", "description": "결론 진술"},
+                                "premises": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "이 결론이 의존하는 가설 id 목록"
+                                }
+                            },
+                            "required": ["id", "statement"]
+                        }
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_task",
             "description": "사용자의 목표를 100% 완수하여 모든 조사가 끝났을 때 최종 결론 보고서를 제출하며 자율 탐색을 공식 종료합니다.",
             "parameters": {
@@ -216,6 +297,7 @@ channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
 channel_reasoning = defaultdict(lambda: "high")
 channel_stop_requested = defaultdict(bool)
+channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
 channel_user_queue = defaultdict(list)
@@ -357,11 +439,25 @@ async def tool_web_search(query: str) -> str:
     except Exception as e:
         return f"[Error performing web search: {e}]"
 
+async def tool_record_state(ledger, updates) -> str:
+    if ledger is None:
+        return "[Error: 이 실행에는 상태 원장이 연결되어 있지 않습니다]"
+    if isinstance(updates, str):
+        try:
+            updates = json.loads(updates)
+        except Exception:
+            return "[Error: record_state 인자를 JSON 객체로 해석할 수 없습니다]"
+    print("[Tool: record_state]", flush=True)
+    try:
+        return ledger.apply_updates(updates)
+    except Exception as e:
+        return f"[Error applying state update: {e}]"
+
 async def tool_finish_task(report: str) -> str:
     print(f"[Tool: finish_task Called!]", flush=True)
     return f"[Task Completed Successfully. Final Report Registered ({len(report)} chars)]"
 
-async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1) -> list:
+async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1, ledger=None) -> list:
     async def _exec_single(tc):
         name = tc["name"]
         args = tc["arguments"]
@@ -378,6 +474,8 @@ async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1) -> list
         elif name == "web_search":
             q = args.get("query", "")
             return await tool_web_search(q)
+        elif name == "record_state":
+            return await tool_record_state(ledger, args)
         elif name == "finish_task":
             r = args.get("report", "")
             return await tool_finish_task(r)
@@ -428,8 +526,11 @@ def _msg_role(m) -> str:
     return getattr(m, "role", "") or ""
 
 def _msg_content(m) -> str:
+    # `content` is explicitly set to None for assistant tool-call messages, so
+    # `.get("content", "")` would still hand back None. Every caller here wants
+    # a string.
     if isinstance(m, dict):
-        return m.get("content", "")
+        return m.get("content") or ""
     return getattr(m, "content", "") or ""
 
 def _msg_name(m) -> str:
@@ -490,12 +591,67 @@ def sanitize_messages_for_chat_template(messages: list) -> list:
 
 # --- User's Rolling Compaction (Rollup) Architecture ---
 
+ROLLING_SUMMARY_LABEL = "누적 작업 요약 및 이전 대화 컨텍스트"
+STATE_UPDATE_BLOCK_PATTERN = re.compile(r"```state_update\s*(.*?)```", re.DOTALL)
+
+
+def build_system_content(base_prompt: str, ledger=None, summary: str = "") -> str:
+    """Compose message 0.
+
+    The state block goes last and message 0 sits before the first tool
+    message, so `apply_micro_compaction` never rewrites it and every request,
+    checkpoint and rollover sees the same authoritative state.
+    """
+    parts = [base_prompt]
+    summary = str(summary or "").strip()
+    if summary:
+        parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
+    state_block = ledger.render() if ledger is not None else ""
+    if state_block:
+        parts.append(state_block)
+    return "\n\n".join(parts)
+
+
+def parse_state_update_blocks(text: str):
+    """Split ```state_update JSON blocks out of a report.
+
+    Returns (update payloads, report text with the blocks removed) so a
+    checkpoint correction reaches the ledger instead of only Discord.
+    """
+    updates = []
+
+    def _collect(match):
+        try:
+            parsed = json.loads(match.group(1).strip())
+        except Exception:
+            return ""
+        if isinstance(parsed, dict):
+            updates.append(parsed)
+        elif isinstance(parsed, list):
+            updates.extend(item for item in parsed if isinstance(item, dict))
+        return ""
+
+    cleaned = STATE_UPDATE_BLOCK_PATTERN.sub(_collect, str(text or ""))
+    return updates, cleaned.strip()
+
+
+def missing_state_markers(text: str, markers) -> list:
+    text = str(text or "")
+    return [marker for marker in markers or [] if marker not in text]
+
+
 def build_rollup_source(messages: list, max_chars: int = ROLLING_SUMMARY_SOURCE_MAX_CHARS) -> str:
-    """Create a bounded, chronological source for the LLM-generated rollup."""
+    """Create a bounded, chronological source for the LLM-generated rollup.
+
+    The budget is spent newest-first and the blocks are re-ordered afterwards.
+    Oldest material is already covered by the cumulative summary, so filling
+    oldest-first would drop the newest refutation - the one thing the summary
+    does not yet know about.
+    """
     blocks = []
     used = 0
 
-    for msg in messages:
+    for msg in reversed(messages):
         role = _msg_role(msg)
         if role == "system":
             continue
@@ -520,10 +676,13 @@ def build_rollup_source(messages: list, max_chars: int = ROLLING_SUMMARY_SOURCE_
         blocks.append(block)
         used += len(block) + 2
 
+    blocks.reverse()
     return "\n\n".join(blocks)
 
-def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = KEEP_RECENT_TOOL_MESSAGES):
+def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = None):
     """Split at a complete assistant-tool group so tool_call_ids stay valid."""
+    if keep_recent_tool_messages is None:
+        keep_recent_tool_messages = KEEP_RECENT_TOOL_MESSAGES
     tool_indices = [i for i, m in enumerate(messages) if _msg_role(m) == "tool"]
     if len(tool_indices) <= keep_recent_tool_messages:
         return messages, []
@@ -536,23 +695,49 @@ def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = 
 
     return messages[:boundary], messages[boundary:]
 
-async def rollover_agent_context(messages: list, existing_summary: str, step_num: int, session_file: str = ""):
+async def rollover_agent_context(messages: list, existing_summary: str, step_num: int, session_file: str = "", ledger=None):
     """Summarize old steps and replace the live payload with a bounded tail."""
     old_messages, recent_messages = split_recent_agent_context(messages)
     if not recent_messages:
         return messages, existing_summary
 
     source = build_rollup_source(old_messages)
+    if not source.strip() or source.strip() in (existing_summary or ""):
+        # Nothing new to fold in. Asking the model to rewrite the summary from
+        # material it already covers is how a summary silently reverts to an
+        # older state, so record a no-op instead.
+        if session_file:
+            log_session_event(
+                session_file,
+                f"⏭️ [Step {step_num} 롤링 압축 no-op]",
+                "압축할 새 실행 기록이 없어 요약을 갱신하지 않고 건너뜁니다.",
+            )
+        print(f"[Rolling Compaction Skipped at Step {step_num}] no new source content", flush=True)
+        return messages, existing_summary
+
+    state_block = ledger.render() if ledger is not None else ""
+    required_markers = ledger.state_markers() if ledger is not None else []
+    marker_hint = ""
+    if required_markers:
+        marker_hint = (
+            "다음 상태 마커는 요약에 반드시 문자 그대로 남기고, 상태를 과거로 되돌리지 마세요: "
+            + ", ".join(required_markers)
+            + "\n"
+        )
+
     summary_prompt = (
         "이것은 장시간 자율 에이전트의 컨텍스트 압축 작업입니다.\n"
         "이전 원본 대화를 그대로 반복하지 말고, 다음 에이전트가 작업을 이어갈 수 있는 "
         "정확한 누적 요약만 작성하세요.\n"
         "반드시 포함할 것: 원래 사용자 목표, 완료한 작업, 확인된 사실/수치/URL/파일 경로, "
-        "실패와 원인, 아직 검증하지 않은 가정, 다음에 해야 할 구체적인 작업.\n"
+        "실패와 원인, 반증된 가설과 그 근거, 무효가 된 결론, 아직 검증하지 않은 가정, "
+        "다음에 해야 할 구체적인 작업.\n"
+        f"{marker_hint}"
         "도구 결과가 불확실하면 추측하지 말고 불확실하다고 표시하세요. "
         "한국어 마크다운으로 10,000자 이내로 작성하고 요약 외의 인사말은 쓰지 마세요.\n\n"
-        f"[기존 누적 요약]\n{_clip_summary_text(existing_summary, ROLLING_SUMMARY_MAX_CHARS)}\n\n"
-        f"[이번 구간의 원본 실행 기록]\n{source}"
+        + (f"{state_block}\n\n" if state_block else "")
+        + f"[기존 누적 요약]\n{_clip_summary_text(existing_summary, ROLLING_SUMMARY_MAX_CHARS)}\n\n"
+        + f"[이번 구간의 원본 실행 기록]\n{source}"
     )
 
     new_summary = ""
@@ -572,21 +757,33 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
     except Exception as compaction_error:
         print(f"[Rolling Compaction Summary Error at Step {step_num}]: {compaction_error}", flush=True)
 
+    validation_notes = []
+    if new_summary and existing_summary and new_summary == existing_summary.strip():
+        # The source had new content but the compactor echoed the old summary.
+        # Accepting it would freeze the state at its previous revision.
+        validation_notes.append("압축기가 기존 요약을 그대로 반환하여 거부했습니다.")
+        new_summary = ""
+
     if not new_summary:
         new_summary = _clip_summary_text(
             "\n".join(part for part in [existing_summary, source] if part),
             ROLLING_SUMMARY_MAX_CHARS,
         )
+        validation_notes.append("결정적 폴백 요약(기존 요약 + 원본 기록)을 사용했습니다.")
     else:
         new_summary = _clip_summary_text(new_summary, ROLLING_SUMMARY_MAX_CHARS)
 
+    dropped_markers = missing_state_markers(new_summary, required_markers)
+    if dropped_markers:
+        validation_notes.append("누락된 상태 마커를 권위 있는 상태 블록으로 보정했습니다: " + ", ".join(dropped_markers))
+        new_summary = f"{state_block}\n\n{new_summary}".strip()
+
     # 400 Chat template error 완벽 방지: 단일 시스템 프롬프트로 병합
-    combined_system_prompt = f"{SYSTEM_PROMPT}\n\n[Step {step_num}까지의 누적 작업 요약]\n{new_summary}"
     replaced_messages = [
-        {"role": "system", "content": combined_system_prompt},
+        {"role": "system", "content": build_system_content(SYSTEM_PROMPT, ledger, new_summary)},
         {
             "role": "user",
-            "content": "[롤링 컨텍스트 재개] 위 요약을 기준으로 최근 도구 실행 결과를 반영하고 다음 작업을 계속하세요.",
+            "content": "[롤링 컨텍스트 재개] 위 요약과 권위 있는 조사 상태를 기준으로 최근 도구 실행 결과를 반영하고 다음 작업을 계속하세요.",
         },
     ]
     replaced_messages.extend(recent_messages)
@@ -597,14 +794,16 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
     compaction_record = (
         f"메시지: {len(messages)} -> {len(replaced_messages)}\n"
         f"내용 문자: {before_chars} -> {after_chars}\n"
-        f"최근 도구 메시지 보존: {KEEP_RECENT_TOOL_MESSAGES}\n\n"
+        f"최근 도구 메시지 보존: {KEEP_RECENT_TOOL_MESSAGES}\n"
+        f"요약 검증: {'; '.join(validation_notes) if validation_notes else '통과'}\n\n"
         f"{new_summary}"
     )
     if session_file:
         log_session_event(session_file, f"🧹 [Step {step_num} 롤링 컨텍스트 교체]", compaction_record)
     print(
         f"[Rolling Compaction at Step {step_num}] messages {len(messages)}->{len(replaced_messages)}, "
-        f"chars {before_chars}->{after_chars}",
+        f"chars {before_chars}->{after_chars}"
+        + (f", validation: {'; '.join(validation_notes)}" if validation_notes else ""),
         flush=True,
     )
     return replaced_messages, new_summary
@@ -776,6 +975,7 @@ async def on_ready():
 async def slash_reset(interaction: discord.Interaction):
     channel_history[interaction.channel_id].clear()
     channel_summary[interaction.channel_id] = ""
+    channel_ledger[interaction.channel_id].clear()
     channel_stop_requested[interaction.channel_id] = False
     channel_user_queue[interaction.channel_id].clear()
     await interaction.response.send_message("🧹 **대화 기록과 컨텍스트 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
@@ -790,6 +990,7 @@ async def slash_clear(interaction: discord.Interaction, count: int = 50):
     try:
         channel_history[interaction.channel_id].clear()
         channel_summary[interaction.channel_id] = ""
+        channel_ledger[interaction.channel_id].clear()
         channel_stop_requested[interaction.channel_id] = False
         channel_user_queue[interaction.channel_id].clear()
         amt = min(max(1, count), 100)
@@ -835,6 +1036,7 @@ async def on_message(message: discord.Message):
     if cmd_name in ["!reset", "!new", "!리셋", "!초기화", "/reset", "/new"]:
         channel_history[message.channel.id].clear()
         channel_summary[message.channel.id] = ""
+        channel_ledger[message.channel.id].clear()
         channel_stop_requested[message.channel.id] = False
         channel_user_queue[message.channel.id].clear()
         await message.reply("🧹 **대화 기록과 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
@@ -848,6 +1050,7 @@ async def on_message(message: discord.Message):
 
         channel_history[message.channel.id].clear()
         channel_summary[message.channel.id] = ""
+        channel_ledger[message.channel.id].clear()
         channel_stop_requested[message.channel.id] = False
         channel_user_queue[message.channel.id].clear()
         print(f"[Clear Command]: Purging {amount} messages in channel {message.channel.id}", flush=True)
@@ -945,11 +1148,12 @@ async def on_message(message: discord.Message):
             direct_call_failed = True
 
     # 400 Chat template error 방지: 0번째에 단일 시스템 프롬프트로 병합
-    full_system_content = SYSTEM_PROMPT
-    if channel_summary[message.channel.id]:
-        full_system_content += f"\n\n[이전 대화 핵심 요약 컨텍스트]:\n{channel_summary[message.channel.id]}"
+    ledger = channel_ledger[message.channel.id]
+    rolling_summary = channel_summary[message.channel.id]
 
-    messages_payload = [{"role": "system", "content": full_system_content}]
+    messages_payload = [
+        {"role": "system", "content": build_system_content(SYSTEM_PROMPT, ledger, rolling_summary)}
+    ]
     messages_payload.extend(history)
     messages_payload = sanitize_messages_for_chat_template(messages_payload)
 
@@ -958,7 +1162,6 @@ async def on_message(message: discord.Message):
 
     total_tools_executed = 0
     executed_call_signatures = []
-    rolling_summary = channel_summary[message.channel.id]
 
     async def maybe_roll_context(step_num: int):
         nonlocal messages_payload, rolling_summary
@@ -969,6 +1172,7 @@ async def on_message(message: discord.Message):
             rolling_summary,
             step_num,
             session_file=session_file,
+            ledger=ledger,
         )
 
     # 상시 타이핑 하트비트 루프 백그라운드 구동
@@ -1005,6 +1209,14 @@ async def on_message(message: discord.Message):
                 extra_params["reasoning_effort"] = "none"
             elif current_effort and current_effort != "none":
                 extra_params["reasoning_effort"] = current_effort
+
+            # 권위 있는 조사 상태를 매 스텝 0번 메시지에 재고정한다.
+            # 0번은 첫 tool 메시지보다 앞이라 apply_micro_compaction이 건드리지 않는다.
+            if messages_payload and _msg_role(messages_payload[0]) == "system":
+                messages_payload[0] = {
+                    "role": "system",
+                    "content": build_system_content(SYSTEM_PROMPT, ledger, rolling_summary),
+                }
 
             compacted_payload = sanitize_messages_for_chat_template(apply_micro_compaction(messages_payload, preserve_recent_tool_steps=2))
 
@@ -1177,7 +1389,7 @@ async def on_message(message: discord.Message):
                     print(f"Executing tool {tc['name']} with args {tc['arguments']}", flush=True)
                     log_session_event(session_file, f"🛠️ [Step {iteration+1} 도구 호출] {tc['name']}", json.dumps(tc['arguments'], ensure_ascii=False, indent=2))
 
-                parallel_results = await execute_tools_in_parallel(tool_calls_to_run, step_num=iteration+1)
+                parallel_results = await execute_tools_in_parallel(tool_calls_to_run, step_num=iteration+1, ledger=ledger)
 
                 for tc, tool_result in zip(tool_calls_to_run, parallel_results):
                     sig = (tc["name"], json.dumps(tc["arguments"], sort_keys=True))
@@ -1212,13 +1424,27 @@ async def on_message(message: discord.Message):
                         "절대로 도구를 호출하지 말고, 아래 탐색 기록을 바탕으로 다음 3가지 항목에 맞추어 한국어 마크다운으로 상세한 '중간 진행 상황 보고서'를 작성하세요:\n"
                         "### 1. 📌 현재까지 완료된 핵심 작업\n"
                         "### 2. 🔍 발견된 핵심 데이터 및 보안 단서\n"
-                        "### 3. 🎯 향후 진행할 구체적인 작업 계획"
+                        "### 3. 🎯 향후 진행할 구체적인 작업 계획\n\n"
+                        "권위 있는 조사 상태 블록이 주어지면 그것을 사실의 기준으로 삼으세요. "
+                        "반증된 가설과 무효 결론을 현재 사실처럼 쓰지 말고, 반증되었다고 명시하세요.\n"
+                        "상태 블록을 정정해야 한다면 보고서 끝에 ```state_update 로 시작하는 코드블록 하나를 붙여 "
+                        "record_state와 같은 형식(goal, evidence, hypotheses, conclusions)의 JSON을 넣으세요. "
+                        "이 블록은 사용자에게 보이지 않고 상태에 반영됩니다. 정정할 것이 없으면 붙이지 마세요."
                     )
+                    inter_state_block = ledger.render()
                     inter_source = build_rollup_source(messages_payload[-16:])
+                    inter_context = "\n\n".join(
+                        part for part in [
+                            inter_state_block,
+                            f"[현재까지의 탐색 및 도구 실행 기록]\n{inter_source}",
+                        ] if part
+                    )
                     inter_payload = [
                         {"role": "system", "content": report_prompt},
-                        {"role": "user", "content": f"[현재까지의 탐색 및 도구 실행 기록]\n{inter_source}\n\n위 내용을 종합하여 사용자가 한눈에 진행 상황을 파악할 수 있도록 중간 보고서를 작성해 주세요."}
+                        {"role": "user", "content": f"{inter_context}\n\n위 내용을 종합하여 사용자가 한눈에 진행 상황을 파악할 수 있도록 중간 보고서를 작성해 주세요."}
                     ]
+                    checkpoint_ok = False
+                    inter_text = ""
                     try:
                         inter_resp = await create_streaming_completion(
                             model=MODEL_NAME,
@@ -1228,6 +1454,18 @@ async def on_message(message: discord.Message):
                             reasoning_effort="none"
                         )
                         inter_text = inter_resp.choices[0].message.content or ""
+
+                        # 보고서에만 있던 정정을 롤오버 이전에 권위 있는 상태로 반영한다.
+                        state_updates, inter_text = parse_state_update_blocks(inter_text)
+                        for update_payload in state_updates:
+                            state_report = ledger.apply_updates(update_payload)
+                            log_session_event(
+                                session_file,
+                                f"🧾 [Step {iteration+1} 체크포인트 상태 정정 반영]",
+                                state_report,
+                            )
+                            print(f"[Checkpoint State Update Applied at Step {iteration+1}]", flush=True)
+
                         inter_formatted = format_full_discord_output(inter_text)
 
                         elapsed_checkpoint = time.time() - start_time
@@ -1256,17 +1494,37 @@ async def on_message(message: discord.Message):
                             await message.channel.send(c)
 
                         log_session_event(session_file, f"📊 [Step {iteration+1} 중간 진행 보고서 제출 & 자동 연장]", inter_text)
+                        checkpoint_ok = True
 
                     except Exception as cp_err:
                         print(f"[Intermediate Report Synthesis Error]: {cp_err}", flush=True)
+                        log_session_event(session_file, f"⚠️ [Step {iteration+1} 중간 보고서 실패]", str(cp_err))
 
-                    continuation_nudge = (
-                        f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 중간 보고서가 디스코드에 전송되었습니다. "
-                        f"목표를 100% 달성할 때까지 전용 작업 공간(plan.md, findings.md)을 업데이트하며 다음 분석 작업을 계속 실행하세요. "
-                        f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
-                    )
-                    messages_payload.append({"role": "assistant", "content": "[중간 보고서 제출 완료]"})
-                    messages_payload.append({"role": "user", "content": continuation_nudge})
+                    if checkpoint_ok:
+                        # 보고서 본문을 payload에 남긴다. 이것이 없으면 보고서에만 존재한
+                        # 정정이 바로 뒤 롤오버의 압축 입력에서 사라진다.
+                        messages_payload.append({
+                            "role": "assistant",
+                            "content": "[중간 보고서 제출 완료]\n" + _clip_summary_text(inter_text, 2000),
+                        })
+                        messages_payload.append({"role": "user", "content": (
+                            f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 중간 보고서가 디스코드에 전송되었습니다. "
+                            f"목표를 100% 달성할 때까지 전용 작업 공간(plan.md, findings.md)을 업데이트하며 다음 분석 작업을 계속 실행하세요. "
+                            f"판단이 바뀐 부분은 record_state로 상태를 갱신하세요. "
+                            f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
+                        )})
+                    else:
+                        # 실패한 체크포인트에 성공 마커를 남기지 않는다.
+                        messages_payload.append({
+                            "role": "assistant",
+                            "content": f"[중간 보고서 생성 실패 - Step {iteration+1} 체크포인트는 제출되지 않았습니다]",
+                        })
+                        messages_payload.append({"role": "user", "content": (
+                            f"[🤖 시스템 안내: Step {iteration+1} 중간 보고서 생성이 실패했습니다. 제출된 것으로 간주하지 마세요. "
+                            f"권위 있는 조사 상태 블록을 기준으로 다음 분석 작업을 계속 실행하고, "
+                            f"판단이 바뀐 부분은 record_state로 상태를 갱신하세요. "
+                            f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
+                        )})
 
                 await maybe_roll_context(iteration + 1)
                 continue
@@ -1315,12 +1573,25 @@ async def on_message(message: discord.Message):
             
             final_report_prompt = (
                 "당신은 지금까지의 모든 자율 탐색 및 분석 결과를 종합하여 최종 보고서를 작성하는 수석 분석가입니다.\n"
-                "절대로 도구를 호출하지 말고, 아래 모든 실행 기록과 수집 데이터를 바탕으로 사용자의 원래 질문에 대해 한국어로 매우 명확하고 완성도 높은 최종 종합 결론 보고서를 마크다운으로 상세히 작성하세요."
+                "절대로 도구를 호출하지 말고, 아래 모든 실행 기록과 수집 데이터를 바탕으로 사용자의 원래 질문에 대해 한국어로 매우 명확하고 완성도 높은 최종 종합 결론 보고서를 마크다운으로 상세히 작성하세요.\n"
+                "권위 있는 조사 상태 블록이 사실의 기준입니다. 반증된(rejected) 가설을 유망한 후보로 되살리지 말고, "
+                "무효 결론을 현재 사실로 제시하지 마세요. 폐기된 방향은 왜 폐기되었는지 근거 증거와 함께 밝히세요."
             )
+            # 롤오버 이후 누적 요약은 교체된 system 메시지 안에만 남는데
+            # build_rollup_source는 system을 건너뛴다. 그래서 상태 블록과 누적 요약을
+            # 최신 tail과 함께 명시적으로 넣는다.
+            synth_state_block = ledger.render()
             synth_source = build_rollup_source(messages_payload)
+            synth_context = "\n\n".join(
+                part for part in [
+                    synth_state_block,
+                    f"[{ROLLING_SUMMARY_LABEL}]\n{rolling_summary}" if rolling_summary else "",
+                    f"[최근 탐색 및 분석 결과 기록]\n{synth_source}",
+                ] if part
+            )
             synthesis_payload = [
                 {"role": "system", "content": final_report_prompt},
-                {"role": "user", "content": f"[전체 탐색 및 분석 결과 기록]\n{synth_source}\n\n위 전체 결과를 바탕으로 사용자를 위한 최종 종합 결론 보고서를 마크다운으로 상세히 작성해 주세요."}
+                {"role": "user", "content": f"{synth_context}\n\n위 전체 결과를 바탕으로 사용자를 위한 최종 종합 결론 보고서를 마크다운으로 상세히 작성해 주세요."}
             ]
             synth_resp = await create_streaming_completion(
                 model=MODEL_NAME,
