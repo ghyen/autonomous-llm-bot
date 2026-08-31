@@ -9,7 +9,8 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 ## ✨ Key Features
 
 - 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 250 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
-- 🔄 **Rolling Context Compaction (Rollup Architecture)**: Every 10 steps, old execution history is dynamically rolled up and summarized by the LLM, keeping context bounded and preventing out-of-memory context blowups.
+- 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, checkpoint, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves.
+- 🔄 **Rolling Context Compaction (Rollup Architecture)**: Every 10 steps, old execution history is dynamically rolled up and summarized by the LLM, keeping context bounded and preventing out-of-memory context blowups. The rollup budget is spent newest-first, and a summary that drops state markers or echoes the previous one is rejected or corrected.
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
 - 🛠️ **Built-in Power Tools**:
@@ -17,6 +18,7 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
   - `read_file`: Inspect local files with line truncation.
   - `write_file`: Create and modify files in the workspace.
   - `web_search`: Live DuckDuckGo search.
+  - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
 - 💬 **Mid-Flight Dynamic User Steering**: Users can send messages into the channel while the agent is running; instructions are automatically queued and injected into the agent's next step without restarting.
 - 🛡️ **Chat Template Sanitizer (400 Error Immunity)**: Automatically cleanses multi-system messages to adhere strictly to Qwen/DeepSeek Jinja chat templates (`System message must be at the beginning`).
@@ -46,6 +48,15 @@ User Prompt (Discord) ────────┐
     └───────────┘       └───────────┘       └───────────┘
           │                   │                   │
           └───────────────────┼───────────────────┘
+                              │
+                              ▼
+               ┌─────────────────────────────┐
+               │  Research Ledger            │  record_state
+               │  (hypotheses / evidence /   │◄─────────────
+               │   conclusions, per channel) │
+               └──────────────┬──────────────┘
+                   state block pinned into
+                   every payload and report
                               │
                ┌──────────────▼──────────────┐
                │  10-Step Rolling Compaction │
@@ -112,9 +123,19 @@ python bot.py
 | Command | Description |
 | :--- | :--- |
 | `!stop` / `/stop` | Immediately interrupts autonomous execution and synthesizes a final report from collected data. |
-| `!reset` / `/reset` | Clears conversation history and workspace context cache. |
-| `!clear [count]` / `/clear` | Purges recent channel messages and resets context. |
+| `!reset` / `/reset` | Clears conversation history, context cache, and the channel's research ledger. |
+| `!clear [count]` / `/clear` | Purges recent channel messages and resets context and the research ledger. |
 | `/reasoning [level]` | Changes reasoning effort (`none`, `low`, `medium`, `high`). |
+
+---
+
+## 🧪 Tests
+
+```bash
+python3 -m unittest discover
+```
+
+`test_ledger.py` covers the state transition rules, `test_state_flow.py` proves the state markers survive micro compaction, checkpoints, rollover, a following run, and final synthesis, and `test_bot.py` covers request routing.
 
 ---
 
