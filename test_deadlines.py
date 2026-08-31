@@ -192,6 +192,69 @@ class WithDeadlineTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(work, outer, return_exceptions=True)
             await asyncio.wait_for(waiter_cleaned.wait(), timeout=1)
 
+    # Mutation caught: cancelling with_deadline after work completed but while
+    # its token waiter is finalizing must not interrupt the owned cleanup.
+    async def test_completion_cleanup_is_shielded_from_late_caller_cancellation(self):
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_done = asyncio.Event()
+
+        class GatedToken(CancelToken):
+            async def wait(self):
+                try:
+                    await super().wait()
+                finally:
+                    cleanup_started.set()
+                    await cleanup_release.wait()
+                    cleanup_done.set()
+
+        outer = asyncio.create_task(
+            with_deadline(asyncio.sleep(0, result="done"), 60, GatedToken())
+        )
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        try:
+            outer.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(outer.done())
+            cleanup_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await outer
+            self.assertTrue(cleanup_done.is_set())
+        finally:
+            cleanup_release.set()
+            await asyncio.gather(outer, return_exceptions=True)
+
+    # Mutation caught: caller cancellation arriving while timeout cleanup is in
+    # an asynchronous finalizer must wait for that finalizer before surfacing.
+    async def test_timeout_cleanup_is_shielded_from_late_caller_cancellation(self):
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_done = asyncio.Event()
+
+        async def wedged():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await cleanup_release.wait()
+                cleanup_done.set()
+
+        outer = asyncio.create_task(with_deadline(wedged(), TICK, stage="agent"))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        try:
+            outer.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(outer.done())
+            cleanup_release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await outer
+            self.assertTrue(cleanup_done.is_set())
+        finally:
+            cleanup_release.set()
+            await asyncio.gather(outer, return_exceptions=True)
+
     async def test_child_tasks_are_cancelled_through_gather(self):
         cancelled = []
 

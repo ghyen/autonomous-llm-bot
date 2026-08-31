@@ -529,6 +529,86 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
         self.assertIn("보고서 합성 마감 초과", delivered)
         self.assertIn("미완료", delivered)
 
+    # Mutation caught: per-message chunking alone still permits an unbounded
+    # number of sends when the authoritative ledger has many entries.
+    async def test_synthesis_timeout_fallback_has_total_bound_without_mutating_ledger(self):
+        ledger = bot.channel_ledger[CHANNEL_ID]
+        ledger.apply_updates({
+            "evidence": [
+                {
+                    "id": f"E_BOUND_{index:03d}",
+                    "summary": "보존해야 하는 상세 관측 " * 8,
+                    "source": f"test://bounded/{index}",
+                }
+                for index in range(140)
+            ],
+        })
+        full_ledger = ledger.render()
+
+        async def model(**kwargs):
+            if _is_report_stage(kwargs.get("messages") or []):
+                raise StageTimeout("synthesis", 0.1)
+            return _response(content="")
+
+        message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
+        with tempfile.TemporaryDirectory() as log_dir, \
+                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
+                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
+                patch.object(bot, "create_streaming_completion", model):
+            await bot.on_message(message)
+
+        chunks = message.replies[1:] + message.channel.sent
+        delivered = "".join(chunks)
+        self.assertLessEqual(len(chunks), 3)
+        self.assertLessEqual(sum(len(chunk) for chunk in chunks), 5700)
+        self.assertLessEqual(max(len(chunk) for chunk in chunks), 1900)
+        self.assertIn("[중간 상세 내용 생략 — 전체 원장은 내부 상태에 유지됨]", delivered)
+        self.assertIn("보고서 합성 마감 초과", delivered)
+        self.assertIn("미완료", delivered)
+        self.assertEqual(ledger.render(), full_ledger)
+        self.assertIn("E_BOUND_000", ledger.state_markers())
+        self.assertIn("E_BOUND_139", ledger.state_markers())
+
+    # Mutation caught: an ordinary synthesis exception must use the same local
+    # preserved-state fallback instead of escaping to the outer error handler.
+    async def test_synthesis_error_delivers_preserved_state_fallback(self):
+        stages = []
+        marker = "E_SYNTHESIS_UPSTREAM_FAILURE"
+        bot.channel_ledger[CHANNEL_ID].apply_updates({
+            "evidence": [{
+                "id": marker,
+                "summary": "합성 전까지 보존된 관측",
+                "source": "test://synthesis",
+            }],
+        })
+
+        async def model(**kwargs):
+            stages.append(kwargs.get("stage"))
+            if _is_report_stage(kwargs.get("messages") or []):
+                raise RuntimeError("synthetic synthesis backend failure")
+            return _response(content="")
+
+        message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
+        with tempfile.TemporaryDirectory() as log_dir, \
+                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
+                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
+                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
+                patch.object(bot, "create_streaming_completion", model):
+            await bot.on_message(message)
+
+        delivered = "\n".join(message.replies[1:] + message.channel.sent)
+        self.assertEqual(stages, ["agent", "synthesis"])
+        self.assertEqual(self.reason, outcome_mod.EXHAUSTED)
+        self.assertIn(marker, delivered)
+        self.assertIn("보고서 합성 업스트림 실패", delivered)
+        self.assertIn("synthetic synthesis backend failure", delivered)
+        self.assertIn("미완료", delivered)
+        self.assertNotIn("작업 도중 예외 발생", delivered)
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+
     # Mutation caught: omitting the run token from final synthesis lets a late
     # model report arrive after !stop instead of cancelling into local fallback.
     async def test_stop_cancels_synthesis_and_delivers_local_fallback(self):
@@ -566,6 +646,83 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
 
 
 class StageDeadlineTest(CancellationTestCase):
+    # Mutation caught: wrapping the whole SDK stream acquisition in the connect
+    # budget misclassifies delayed response headers as connection establishment.
+    async def test_delayed_response_headers_use_read_not_connect_budget(self):
+        response_text = "지연 헤더 뒤 응답"
+        request_received = asyncio.Event()
+        handler_done = asyncio.Event()
+
+        async def handle_request(reader, writer):
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                request_received.set()
+                await asyncio.sleep(0.5)
+                chunk = json.dumps({
+                    "id": "chatcmpl-delayed-headers",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": response_text},
+                        "finish_reason": None,
+                    }],
+                }).encode("utf-8")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Connection: close\r\n\r\n"
+                    + b"data: " + chunk + b"\n\n"
+                    + b"data: [DONE]\n\n"
+                )
+                await writer.drain()
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except ConnectionError:
+                    pass
+                handler_done.set()
+
+        server = await asyncio.start_server(handle_request, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        tight = dataclasses.replace(
+            bot.CONFIG,
+            connect_timeout=0.3,
+            idle_timeout=1.0,
+            model_stage_timeout=2.0,
+        )
+        test_client = bot.AsyncOpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="synthetic-test-key",
+            timeout=bot.httpx.Timeout(
+                tight.model_stage_timeout,
+                connect=tight.connect_timeout,
+                read=tight.idle_timeout,
+            ),
+            max_retries=0,
+        )
+
+        try:
+            with patch.object(bot, "CONFIG", tight), patch.object(bot, "client", test_client):
+                response = await bot.run_completion_stage(
+                    stage="agent",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hello"}],
+                    max_tokens=16,
+                )
+            self.assertTrue(request_received.is_set())
+            self.assertEqual(response.choices[0].message.content, response_text)
+        finally:
+            await test_client.close()
+            server.close()
+            await server.wait_closed()
+            if request_received.is_set():
+                await asyncio.wait_for(handler_done.wait(), timeout=1)
+
     async def test_a_wedged_model_stage_fails_with_a_timeout_reason(self):
         async def model(**kwargs):
             if _is_report_stage(kwargs.get("messages") or []):
@@ -673,6 +830,122 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
             ["pgrep", "-f", marker], capture_output=True, text=True
         )
         return [line for line in found.stdout.split() if line.strip()]
+
+    @staticmethod
+    def _pid_exists(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    async def _leader_exited_with_child(self, spawned, child_pid_path):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if spawned and spawned[0].returncode is not None:
+                try:
+                    with open(child_pid_path, encoding="utf-8") as pid_file:
+                        return spawned[0], int(pid_file.read().strip())
+                except (FileNotFoundError, ValueError):
+                    pass
+            await asyncio.sleep(0.01)
+        self.fail("background descendant did not start before its leader exited")
+
+    async def _assert_pid_gone(self, pid):
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if not self._pid_exists(pid):
+                return
+            await asyncio.sleep(0.02)
+        self.fail(f"background descendant {pid} survived process-group cleanup")
+
+    async def _cleanup_failed_probe(self, proc, child_pid):
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if child_pid is not None and self._pid_exists(child_pid):
+            try:
+                os.kill(child_pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + 1
+        while child_pid is not None and self._pid_exists(child_pid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups only")
+    async def test_timeout_reclaims_group_after_leader_exit(self):
+        tight = dataclasses.replace(bot.CONFIG, bash_timeout=0.3)
+        spawned = []
+        leader = None
+        child_pid = None
+        original_spawn = asyncio.create_subprocess_shell
+
+        async def capture_spawn(*args, **kwargs):
+            proc = await original_spawn(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        with tempfile.TemporaryDirectory() as workspace, \
+                patch.object(bot, "CONFIG", tight), \
+                patch.object(bot, "WORKSPACE_DIR", workspace), \
+                patch.object(bot.asyncio, "create_subprocess_shell", capture_spawn):
+            child_pid_path = os.path.join(workspace, "child.pid")
+            task = asyncio.create_task(
+                bot.tool_bash_exec(
+                    "sh -c 'echo $$ > child.pid; sleep 40' p2ach-leader-exit-timeout &"
+                )
+            )
+            try:
+                leader, child_pid = await self._leader_exited_with_child(
+                    spawned, child_pid_path
+                )
+                self.assertIsNotNone(leader.returncode)
+                result = await task
+                self.assertIn("timed out", result)
+                await self._assert_pid_gone(child_pid)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await self._cleanup_failed_probe(leader, child_pid)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups only")
+    async def test_cancellation_reclaims_group_after_leader_exit(self):
+        spawned = []
+        leader = None
+        child_pid = None
+        original_spawn = asyncio.create_subprocess_shell
+
+        async def capture_spawn(*args, **kwargs):
+            proc = await original_spawn(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        with tempfile.TemporaryDirectory() as workspace, \
+                patch.object(bot, "WORKSPACE_DIR", workspace), \
+                patch.object(bot.asyncio, "create_subprocess_shell", capture_spawn):
+            child_pid_path = os.path.join(workspace, "child.pid")
+            task = asyncio.create_task(
+                bot.tool_bash_exec(
+                    "sh -c 'echo $$ > child.pid; sleep 40' p2ach-leader-exit-cancel &"
+                )
+            )
+            try:
+                leader, child_pid = await self._leader_exited_with_child(
+                    spawned, child_pid_path
+                )
+                self.assertIsNotNone(leader.returncode)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await self._assert_pid_gone(child_pid)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await self._cleanup_failed_probe(leader, child_pid)
 
     @unittest.skipUnless(sys.platform != "win32", "POSIX process groups only")
     async def test_timeout_reclaims_the_whole_process_tree(self):

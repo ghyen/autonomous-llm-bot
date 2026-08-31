@@ -247,18 +247,23 @@ class PendingDirectOwnershipTest(GateTestCase):
         self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
         self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
 
-    # Mutation caught: delaying active-run registration lets a second message
-    # start another direct model stage and replace the first run's token.
-    async def test_second_request_cannot_start_beside_a_pending_direct_run(self):
-        started = asyncio.Event()
-        release = asyncio.Event()
+    # Mutation caught: identity-blind cleanup by an older direct run can erase
+    # the newer run's published token and make authorized stop miss its target.
+    async def test_stale_direct_cleanup_preserves_newer_stop_token(self):
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_release = asyncio.Event()
         calls = []
 
         async def model(**kwargs):
             calls.append(kwargs.get("stage"))
             if len(calls) == 1:
-                started.set()
-                await release.wait()
+                first_started.set()
+                await first_release.wait()
+            else:
+                second_started.set()
+                await second_release.wait()
             return SimpleNamespace(choices=[SimpleNamespace(
                 message=SimpleNamespace(content="직접 답변"),
             )])
@@ -267,29 +272,123 @@ class PendingDirectOwnershipTest(GateTestCase):
         first_message = FakeMessage(
             "간단히 답해줘",
             CHANNEL_ID,
-            author=FakeAuthor(TEST_USER_ID),
+            author=FakeAuthor(TEST_USER_ID, "first-owner"),
         )
         first_run = asyncio.create_task(bot.on_message(first_message))
-        await asyncio.wait_for(started.wait(), timeout=1)
-        original_token = bot.channel_cancel_token[CHANNEL_ID]
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        first_token = bot.channel_cancel_token[CHANNEL_ID]
+
+        second_message = FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(TEST_ADMIN_ID, "second-owner"),
+        )
+        second_run = asyncio.create_task(bot.on_message(second_message))
+        second_started_waiter = asyncio.create_task(second_started.wait())
 
         try:
-            second_message = FakeMessage(
-                "간단히 답해줘",
-                CHANNEL_ID,
-                author=FakeAuthor(TEST_USER_ID),
+            done, _ = await asyncio.wait(
+                {second_run, second_started_waiter},
+                timeout=1,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            await asyncio.wait_for(bot.on_message(second_message), timeout=1)
+            self.assertIn(
+                second_started_waiter,
+                done,
+                "the pending-direct admission gate rejected the second request",
+            )
+            self.assertEqual(calls, ["direct", "direct"])
+            second_token = bot.channel_cancel_token[CHANNEL_ID]
+            self.assertIsNot(second_token, first_token)
+            self.assertEqual(bot.channel_run_owner[CHANNEL_ID], TEST_ADMIN_ID)
 
-            self.assertEqual(calls, ["direct"])
-            self.assertIs(bot.channel_cancel_token[CHANNEL_ID], original_token)
-            self.assertFalse(first_run.done())
-            self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
-            self.assertIn("끝난 뒤 다시", second_message.replies[-1])
-            self.assertNotIn("실시간 개입 수신", second_message.replies[-1])
+            first_release.set()
+            await asyncio.wait_for(first_run, timeout=1)
+            self.assertIs(bot.channel_cancel_token[CHANNEL_ID], second_token)
+            self.assertEqual(bot.channel_run_owner[CHANNEL_ID], TEST_ADMIN_ID)
+
+            stop = FakeMessage(
+                "!stop",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_ADMIN_ID, "second-owner"),
+            )
+            await bot.on_message(stop)
+            self.assertTrue(second_token.cancelled)
+            await asyncio.wait_for(second_run, timeout=1)
         finally:
-            release.set()
-            await asyncio.gather(first_run, return_exceptions=True)
+            first_release.set()
+            second_release.set()
+            second_started_waiter.cancel()
+            first_run.cancel()
+            second_run.cancel()
+            await asyncio.gather(
+                first_run, second_run, second_started_waiter,
+                return_exceptions=True,
+            )
+
+        self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
+        self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
+        self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
+
+    # Mutation caught: when the newer direct run finishes first, its cleanup
+    # must republish the older still-live run so that owner's stop remains valid.
+    async def test_newer_direct_cleanup_restores_older_stop_token(self):
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_release = asyncio.Event()
+        calls = []
+
+        async def model(**kwargs):
+            calls.append(kwargs.get("stage"))
+            if len(calls) == 1:
+                first_started.set()
+                await first_release.wait()
+            else:
+                second_started.set()
+                await second_release.wait()
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="직접 답변"),
+            )])
+
+        self.completion.side_effect = model
+        first_run = asyncio.create_task(bot.on_message(FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(TEST_USER_ID, "first-owner"),
+        )))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        first_token = bot.channel_cancel_token[CHANNEL_ID]
+
+        second_run = asyncio.create_task(bot.on_message(FakeMessage(
+            "간단히 답해줘",
+            CHANNEL_ID,
+            author=FakeAuthor(TEST_ADMIN_ID, "second-owner"),
+        )))
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+        second_token = bot.channel_cancel_token[CHANNEL_ID]
+
+        try:
+            second_release.set()
+            await asyncio.wait_for(second_run, timeout=1)
+            self.assertIs(bot.channel_cancel_token.get(CHANNEL_ID), first_token)
+            self.assertEqual(bot.channel_run_owner.get(CHANNEL_ID), TEST_USER_ID)
+
+            stop = FakeMessage(
+                "!stop",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID, "first-owner"),
+            )
+            await bot.on_message(stop)
+            self.assertTrue(first_token.cancelled)
+            self.assertFalse(second_token.cancelled)
+            await asyncio.wait_for(first_run, timeout=1)
+        finally:
+            first_release.set()
+            second_release.set()
+            first_run.cancel()
+            second_run.cancel()
+            await asyncio.gather(first_run, second_run, return_exceptions=True)
 
         self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
         self.assertNotIn(CHANNEL_ID, bot.channel_run_owner)
