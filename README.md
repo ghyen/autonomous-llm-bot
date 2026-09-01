@@ -184,6 +184,21 @@ rollover cancellation still stops the run. User cancellation, stage timeout,
 upstream failure, exhaustion, and normal completion remain distinct in the final
 status.
 
+**Tool execution guardrails:** ordinary tool calls are filtered only after the
+post-dashboard cancellation checkpoint and before dispatch. A signature is the
+tool name plus its compact, key-sorted JSON arguments. Within one model response,
+only the first identical signature can execute; every original call ID still gets
+a tool result, with blocked calls receiving deterministic structured JSON. The
+same unchanged call may fail twice consecutively, but its third and later
+immediately consecutive attempts are blocked until a different signature is
+dispatched or a call succeeds. Failures are limited to the existing explicit
+contracts: a leading `[Error`, a nonzero `bash_exec` exit-code marker, or a
+`record_state` refusal. Each run dispatches at most 250 actual tool executions;
+blocked calls consume no budget. These fixed code-level limits are
+`MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2` and
+`MAX_TOOL_EXECUTIONS_PER_RUN = 250`; they intentionally have no configuration
+surface.
+
 ---
 
 ## 🔐 Access Control
