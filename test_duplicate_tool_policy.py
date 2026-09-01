@@ -899,9 +899,114 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             "consecutive_failure_limit",
         )
 
-    # Mutation caught: admitting a whole 100+ call response without reserving
-    # only the remaining run budget performs excess side effects, while labeling
-    # all requests as executions also exposes a false live count.
+    # Mutation caught: preserving only the last two tool-result messages splits
+    # a newer mixed group, erasing its raw arguments and full producer payloads.
+    async def test_newest_mixed_tool_group_survives_micro_compaction_intact(self):
+        raw_arguments = '{\n  "command": "never-run",\n  "note": "한글 raw bytes"'
+        file_content = (
+            "[Error: latest bytes are evidence, not a failure]\n"
+            "LATEST_READ_PAYLOAD_SENTINEL"
+        )
+        record_update = {"goal": "LATEST_RECORD_PAYLOAD_SENTINEL"}
+        expected_record = await bot.tool_record_state(
+            bot.ResearchLedger(), record_update
+        )
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="latest-group-"
+        ) as source:
+            source.write(file_content)
+            source.flush()
+            latest_calls = [
+                _raw_tool_call("latest-malformed", "bash_exec", raw_arguments),
+                _tool_call("latest-read", "read_file", {"path": source.name}),
+                _tool_call("latest-record", "record_state", record_update),
+                _tool_call(
+                    "latest-bash-1", "bash_exec", {"command": "latest-command-1"}
+                ),
+                _tool_call(
+                    "latest-bash-2", "bash_exec", {"command": "latest-command-2"}
+                ),
+            ]
+            expected_arguments = [
+                call.function.arguments for call in latest_calls
+            ]
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call(
+                        "older-call", "bash_exec", {"command": "older-command"}
+                    ),
+                ]),
+                _response(tool_calls=latest_calls),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        feedback_payload = self.model.agent_payloads[2]
+        latest_ids = [call.id for call in latest_calls]
+        latest_assistant_index = next(
+            index
+            for index, payload_message in enumerate(feedback_payload)
+            if bot._msg_role(payload_message) == "assistant"
+            and [
+                call["id"] for call in payload_message.get("tool_calls") or []
+            ] == latest_ids
+        )
+        latest_assistant = feedback_payload[latest_assistant_index]
+        self.assertEqual(
+            [
+                call["function"]["arguments"]
+                for call in latest_assistant["tool_calls"]
+            ],
+            expected_arguments,
+        )
+        self.assertEqual(
+            latest_assistant["tool_calls"][0]["function"]["arguments"].encode(
+                "utf-8"
+            ),
+            raw_arguments.encode("utf-8"),
+        )
+
+        latest_tool_messages = feedback_payload[
+            latest_assistant_index + 1:latest_assistant_index + 1 + len(latest_calls)
+        ]
+        self.assertEqual(
+            [bot._msg_role(payload_message) for payload_message in latest_tool_messages],
+            ["tool"] * len(latest_calls),
+        )
+        self.assertEqual(
+            [payload_message["tool_call_id"] for payload_message in latest_tool_messages],
+            latest_ids,
+        )
+        self.assertEqual(
+            [payload_message["content"] for payload_message in latest_tool_messages],
+            [
+                '{"directive":"Provide tool arguments as a valid JSON object.",'
+                '"error":"invalid_tool_arguments","reason":"malformed_json",'
+                '"tool":"bash_exec"}',
+                "[read_file status: success]\n" + file_content,
+                expected_record,
+                SUCCESS_RESULT,
+                SUCCESS_RESULT,
+            ],
+        )
+        self.assertIn(
+            "LATEST_RECORD_PAYLOAD_SENTINEL",
+            latest_tool_messages[2]["content"],
+        )
+
+        older_tool = next(
+            payload_message
+            for payload_message in feedback_payload
+            if bot._msg_role(payload_message) == "tool"
+            and payload_message.get("tool_call_id") == "older-call"
+        )
+        self.assertIn("실행 결과 생략", older_tool["content"])
+        self.assertNotEqual(older_tool["content"], SUCCESS_RESULT)
+
+    # Mutation caught: preserving only two results from a 101-call group makes
+    # 96 of its 98 structured run-budget blocks non-JSON in the next payload.
     async def test_run_budget_bounds_large_batch_and_reports_every_original_id(self):
         requested_calls = [
             _tool_call(
@@ -939,13 +1044,22 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             [tool_message["tool_call_id"] for tool_message in tool_messages],
             expected_ids,
         )
-        blocked = json.loads(tool_messages[-1]["content"])
-        self.assertEqual(blocked["reason"], "run_tool_budget_exhausted")
-        self.assertEqual(blocked["tool"], "bash_exec")
-        self.assertEqual(blocked["limit"], 3)
-        self.assertEqual(blocked["count"], 3)
-        self.assertTrue(blocked["blocked"])
-        self.assertEqual(blocked["directive"], BLOCK_DIRECTIVE)
+        blocked_messages = tool_messages[3:]
+        self.assertEqual(len(blocked_messages), 98)
+        for index, tool_message in enumerate(blocked_messages, start=3):
+            with self.subTest(tool_call_id=tool_message["tool_call_id"]):
+                self.assertTrue(
+                    tool_message["content"].startswith("{"),
+                    f"budget-{index:03d} result is not parseable JSON: "
+                    f"{tool_message['content']!r}",
+                )
+                blocked = json.loads(tool_message["content"])
+                self.assertEqual(blocked["reason"], "run_tool_budget_exhausted")
+                self.assertEqual(blocked["tool"], "bash_exec")
+                self.assertEqual(blocked["limit"], 3)
+                self.assertEqual(blocked["count"], 3)
+                self.assertTrue(blocked["blocked"])
+                self.assertEqual(blocked["directive"], BLOCK_DIRECTIVE)
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
         self.assertIn("총 3개 도구 실행", delivered)

@@ -1120,18 +1120,28 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
 
 # --- User's Micro Compaction Algorithm ---
 
-def apply_micro_compaction(messages: list, preserve_recent_tool_steps: int = 2) -> list:
+def apply_micro_compaction(
+    messages: list, preserve_recent_tool_groups: int = 1
+) -> list:
+    """Compact old history without splitting an assistant/tool-result group."""
     tool_msg_indices = [i for i, m in enumerate(messages) if _msg_role(m) == "tool"]
-    preserve_recent_tool_steps = max(0, preserve_recent_tool_steps)
-    if len(tool_msg_indices) <= preserve_recent_tool_steps:
+    if not tool_msg_indices:
         return messages
 
+    preserve_recent_tool_groups = max(0, preserve_recent_tool_groups)
+    tool_group_starts = [
+        i
+        for i, message in enumerate(messages)
+        if _msg_role(message) == "assistant" and _msg_tool_calls(message)
+    ]
+    if preserve_recent_tool_groups:
+        if len(tool_group_starts) <= preserve_recent_tool_groups:
+            return messages
+        compact_before = tool_group_starts[-preserve_recent_tool_groups]
+    else:
+        compact_before = len(messages)
+
     first_tool_index = tool_msg_indices[0]
-    compact_before = (
-        tool_msg_indices[-preserve_recent_tool_steps]
-        if preserve_recent_tool_steps
-        else len(messages)
-    )
     compressed_messages = []
 
     for i, msg in enumerate(messages):
@@ -1711,7 +1721,11 @@ async def on_message(message: discord.Message):
                     "content": build_system_content(SYSTEM_PROMPT, ledger, rolling_summary),
                 }
 
-            compacted_payload = sanitize_messages_for_chat_template(apply_micro_compaction(messages_payload, preserve_recent_tool_steps=2))
+            compacted_payload = sanitize_messages_for_chat_template(
+                apply_micro_compaction(
+                    messages_payload, preserve_recent_tool_groups=1
+                )
+            )
             model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
 
             try:

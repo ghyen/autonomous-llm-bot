@@ -141,7 +141,7 @@ class MicroCompactionTest(unittest.TestCase):
             })
 
         compacted = bot.sanitize_messages_for_chat_template(
-            bot.apply_micro_compaction(payload, preserve_recent_tool_steps=2)
+            bot.apply_micro_compaction(payload, preserve_recent_tool_groups=1)
         )
         text = serialize(compacted)
 
