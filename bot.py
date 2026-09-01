@@ -32,7 +32,6 @@ import outcome as outcome_mod
 from deadlines import (
     CancelToken,
     RunCancelled,
-    StageBudget,
     StageTimeout,
     _reap,
     stream_chunks,
@@ -1049,7 +1048,6 @@ async def run_completion_stage(token=None, stage="agent", deadline=None, **kwarg
 
 async def create_streaming_completion(token=None, stage="agent", **kwargs):
     """Collect a streaming response under transport connect and read-idle bounds."""
-    budget = StageBudget(stage, total=CONFIG.model_stage_timeout, idle=CONFIG.idle_timeout)
     # HTTPX's phase-specific connect timeout governs DNS/TCP/TLS. Awaiting the
     # SDK here also includes response headers, which belong to read/total time.
     stream = await client.chat.completions.create(stream=True, **kwargs)
@@ -1057,7 +1055,7 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
     reasoning_parts = []
     tool_buffers = {}
 
-    async for chunk in stream_chunks(stream, budget, token):
+    async for chunk in stream_chunks(stream, stage, CONFIG.idle_timeout, token):
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
@@ -1291,10 +1289,9 @@ async def deny_interaction(interaction: discord.Interaction, action: str, decisi
 
 
 def interaction_can_manage_messages(interaction: discord.Interaction) -> bool:
-    permissions = getattr(interaction, "permissions", None)
-    if permissions is not None and hasattr(permissions, "manage_messages"):
-        return bool(permissions.manage_messages)
-    return caller_can_manage_messages(interaction.channel, interaction.user)
+    # Interaction.permissions is the caller's own resolved channel permission and
+    # has existed since discord.py 2.0, below the floor requirements.txt sets.
+    return bool(interaction.permissions.manage_messages)
 
 
 @bot.tree.command(name="reset", description="대화 기록 및 캐시를 초기화합니다.")

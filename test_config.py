@@ -204,14 +204,6 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertIn("allowed users: 1", text)
         self.assertIn("tools: enabled", text)
 
-    def test_fingerprint_changes_with_the_policy(self):
-        base = load_config(env=env(), env_file=None)
-        widened = load_config(
-            env=env(DISCORD_ALLOWED_USER_IDS="111111111111111111,222222222222222222"),
-            env_file=None,
-        )
-        self.assertNotEqual(base.fingerprint(), widened.fingerprint())
-
     def test_config_is_immutable(self):
         config = load_config(env=env(), env_file=None)
         with self.assertRaises(Exception):
@@ -299,11 +291,6 @@ class DeadlineConfigTest(unittest.TestCase):
         for bad in ("nan", "inf", "-inf"):
             with self.subTest(value=bad), self.assertRaises(ConfigError):
                 load_config(env=env(MODEL_STAGE_TIMEOUT_SECONDS=bad), env_file=None)
-
-    def test_deadlines_are_part_of_the_fingerprint(self):
-        base = load_config(env=env(), env_file=None)
-        tightened = load_config(env=env(MODEL_STAGE_TIMEOUT_SECONDS="30"), env_file=None)
-        self.assertNotEqual(base.fingerprint(), tightened.fingerprint())
 
     def test_diagnostics_report_the_deadlines(self):
         text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))

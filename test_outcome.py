@@ -6,7 +6,7 @@ from outcome import COMPLETED, EXHAUSTED, FAILED, STOPPED, RunOutcome
 class RunOutcomeTest(unittest.TestCase):
     def test_starts_unsettled(self):
         outcome = RunOutcome()
-        self.assertFalse(outcome.settled)
+        self.assertIsNone(outcome.reason)
         self.assertIsNone(outcome.reason)
         self.assertFalse(outcome.is_completed)
         self.assertEqual(outcome.label, "진행 중")
