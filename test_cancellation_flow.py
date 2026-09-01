@@ -345,7 +345,7 @@ class PostModelCancellationBoundaryTest(CancellationTestCase):
             )
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
-        fired = self.cancel_from_status_edit(message, "터미널 및 네트워크 I/O 실행 중")
+        fired = self.cancel_from_status_edit(message, "도구 요청 검토 중")
         with tempfile.TemporaryDirectory() as log_dir, \
                 patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 1), \
