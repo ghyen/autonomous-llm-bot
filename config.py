@@ -11,7 +11,6 @@ values are deny-by-default: with tools enabled, a missing or malformed user
 policy is a startup failure, not a silently open door.
 """
 
-import hashlib
 import math
 import os
 from dataclasses import dataclass
@@ -63,32 +62,6 @@ class BotConfig:
     def llm_is_local(self) -> bool:
         return _host_of(self.llm_base_url) in LOCAL_HOSTS
 
-    def fingerprint(self) -> str:
-        """Short digest of the effective policy, safe to log.
-
-        Covers everything that changes who may do what, so a log line can be
-        tied back to the configuration that produced it. The token is excluded.
-        """
-        material = "|".join([
-            self.llm_base_url,
-            self.model_name,
-            _id_digest(self.free_response_channel_ids),
-            _id_digest(self.allowed_user_ids),
-            _id_digest(self.admin_user_ids),
-            self.workspace_dir,
-            self.system_log_dir,
-            str(self.tools_enabled),
-            str(self.allow_remote_llm),
-            "{0}/{1}/{2}/{3}/{4}".format(
-                self.connect_timeout,
-                self.idle_timeout,
-                self.model_stage_timeout,
-                self.tool_stage_timeout,
-                self.bash_timeout,
-            ),
-        ])
-        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
-
 
 def _host_of(url: str) -> str:
     remainder = str(url or "").split("://", 1)[-1]
@@ -97,13 +70,6 @@ def _host_of(url: str) -> str:
     if authority.startswith("["):
         return authority.split("]", 1)[0] + "]"
     return authority.rsplit(":", 1)[0] if ":" in authority else authority
-
-
-def _id_digest(ids: FrozenSet[int]) -> str:
-    if not ids:
-        return "-"
-    joined = ",".join(str(value) for value in sorted(ids))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:8]
 
 
 def parse_id_set(raw, field: str) -> FrozenSet[int]:
@@ -162,18 +128,25 @@ def load_env_file(path) -> Dict[str, str]:
 
     No new dependency: the format we document is `KEY=VALUE` with `#` comments,
     an optional `export ` prefix, and optional surrounding quotes.
+
+    Malformed input is refused rather than half-read. This loader exists because
+    misconfiguration used to pass silently, so it must not reintroduce that in
+    its own parsing.
     """
     values: Dict[str, str] = {}
     if not path:
         return values
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        # utf-8-sig, not utf-8: an editor-written BOM would otherwise land inside
+        # the first key, so DISCORD_BOT_TOKEN would parse as "\ufeffDISCORD_BOT_TOKEN"
+        # and the value the operator set would be silently ignored.
+        with open(path, "r", encoding="utf-8-sig") as handle:
             lines = handle.readlines()
     except (FileNotFoundError, NotADirectoryError, IsADirectoryError, PermissionError):
         return values
 
-    for line in lines:
-        line = line.strip()
+    for lineno, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         if line.startswith("export "):
@@ -183,8 +156,19 @@ def load_env_file(path) -> Dict[str, str]:
         if not key:
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        if value[:1] in ("\"", "'"):
+            quote = value[0]
+            end = value.find(quote, 1)
+            if end == -1:
+                raise ConfigError(
+                    "{0} {1}행: {2} 값의 따옴표가 닫히지 않았습니다. "
+                    "값은 한 줄로 적어야 합니다.".format(path, lineno, key)
+                )
+            value = value[1:end]
+        else:
+            # An unquoted value ends at a whitespace-separated '#'. Requiring the
+            # whitespace keeps a '#' that is part of a secret inside the value.
+            value = value.split(" #", 1)[0].split("\t#", 1)[0].strip()
         values[key] = value
     return values
 
@@ -281,7 +265,6 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
 def startup_diagnostics(config: BotConfig) -> List[str]:
     """Startup lines that identify the deployment without leaking secrets."""
     return [
-        "config fingerprint: {0}".format(config.fingerprint()),
         "llm endpoint: {0} ({1})".format(
             config.llm_base_url, "local" if config.llm_is_local else "remote, explicitly allowed"
         ),

@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Fail if a credential-shaped name is assigned a string literal in source.
 
-The bot used to construct its LLM client with `api_key="not-needed"`. That is
-harmless in itself, but an in-source default for a credential-named field is
-exactly the pattern that later becomes a real key someone forgot to move to the
-environment. Credentials come from configuration, so source keeps none.
+The bot used to construct its LLM client with `api_key="not-needed"`. Harmless
+in itself, but an in-source default for a credential-named field is the pattern
+that later becomes a real key someone forgot to move to the environment.
 
-Checked: assignment targets, annotated assignments, and keyword arguments whose
-name looks like a credential and whose value is a string literal long enough to
-be one. Test modules are skipped - they use deliberately invalid dummy values.
+ruff and bandit's hardcoded-password rules key off `password`/`secret` style
+names and miss `api_key`, which is the one that actually bit here.
 
 Usage: python tools/check_no_credential_defaults.py [path ...]
 """
@@ -18,15 +16,8 @@ import os
 import sys
 
 CREDENTIAL_MARKERS = (
-    "token",
-    "password",
-    "passwd",
-    "secret",
-    "api_key",
-    "apikey",
-    "credential",
-    "private_key",
-    "access_key",
+    "token", "password", "passwd", "secret", "api_key", "apikey",
+    "credential", "private_key", "access_key",
 )
 
 # Below this length a literal cannot plausibly be a working credential, which
@@ -49,15 +40,13 @@ def suspicious_literal(node) -> bool:
     )
 
 
-def target_names(target):
+def assigned_name(target):
+    """The bound name, for the two target shapes a credential default can take."""
     if isinstance(target, ast.Name):
-        yield target.id
-    elif isinstance(target, ast.Attribute):
-        yield target.attr
-    elif isinstance(target, (ast.Tuple, ast.List)):
-        for element in target.elts:
-            for name in target_names(element):
-                yield name
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
 
 
 def scan_source(path) -> list:
@@ -70,13 +59,11 @@ def scan_source(path) -> list:
 
     findings = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and suspicious_literal(node.value):
-            for target in node.targets:
-                for name in target_names(target):
-                    if looks_like_credential_name(name):
-                        findings.append((path, node.lineno, name))
-        elif isinstance(node, ast.AnnAssign) and node.value is not None and suspicious_literal(node.value):
-            for name in target_names(node.target):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if not suspicious_literal(node.value):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for name in (assigned_name(target) for target in targets):
                 if looks_like_credential_name(name):
                     findings.append((path, node.lineno, name))
         elif isinstance(node, ast.Call):
@@ -102,16 +89,18 @@ def python_sources(roots) -> list:
             continue
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
-            for filename in sorted(filenames):
-                if filename.endswith(".py") and not filename.startswith("test_"):
-                    found.append(os.path.join(dirpath, filename))
+            found.extend(
+                os.path.join(dirpath, filename)
+                for filename in sorted(filenames)
+                # Test modules use deliberately invalid dummy values.
+                if filename.endswith(".py") and not filename.startswith("test_")
+            )
     return found
 
 
 def main(argv) -> int:
-    roots = argv[1:] or ["."]
     problems = []
-    for path in python_sources(roots):
+    for path in python_sources(argv[1:] or ["."]):
         problems.extend(scan_source(path))
 
     if problems:

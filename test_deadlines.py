@@ -5,7 +5,6 @@ import unittest
 from deadlines import (
     CancelToken,
     RunCancelled,
-    StageBudget,
     StageTimeout,
     stream_chunks,
     with_deadline,
@@ -387,20 +386,20 @@ class FakeStream:
 class StreamChunksTest(unittest.IsolatedAsyncioTestCase):
     async def test_yields_every_chunk_and_closes_the_stream(self):
         stream = FakeStream(["a", "b", "c"])
-        budget = StageBudget("agent", total=10, idle=10 * TICK)
+        idle = 10 * TICK
 
-        collected = [chunk async for chunk in stream_chunks(stream, budget)]
+        collected = [chunk async for chunk in stream_chunks(stream, "agent", idle)]
 
         self.assertEqual(collected, ["a", "b", "c"])
         self.assertTrue(stream.closed)
 
     async def test_idle_gap_beyond_the_budget_times_out(self):
         stream = FakeStream(["a", "b"], stall_after=1)
-        budget = StageBudget("agent", total=60, idle=TICK)
+        idle = TICK
 
         collected = []
         with self.assertRaises(StageTimeout):
-            async for chunk in stream_chunks(stream, budget):
+            async for chunk in stream_chunks(stream, "agent", idle):
                 collected.append(chunk)
 
         self.assertEqual(collected, ["a"])
@@ -408,7 +407,7 @@ class StreamChunksTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_stops_consumption_promptly(self):
         stream = FakeStream(["a"] * 1000, gap=TICK)
-        budget = StageBudget("agent", total=60, idle=10 * TICK)
+        idle = 10 * TICK
         token = CancelToken()
 
         async def cancel_soon():
@@ -418,7 +417,7 @@ class StreamChunksTest(unittest.IsolatedAsyncioTestCase):
         asyncio.ensure_future(cancel_soon())
         started = time.monotonic()
         with self.assertRaises(RunCancelled):
-            async for _ in stream_chunks(stream, budget, token):
+            async for _ in stream_chunks(stream, "agent", idle, token):
                 pass
         elapsed = time.monotonic() - started
 

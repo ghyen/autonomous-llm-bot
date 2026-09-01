@@ -22,7 +22,6 @@ terminal reason has to tell them apart.
 """
 
 import asyncio
-from dataclasses import dataclass
 from typing import Optional
 
 DEFAULT_STAGE = "stage"
@@ -45,26 +44,20 @@ class StageTimeout(Exception):
         super().__init__("{0} 단계가 마감 {1}초를 초과했습니다.".format(stage, seconds))
 
 
-@dataclass(frozen=True)
-class StageBudget:
-    """Separate budgets: total wall clock, and max gap between stream chunks."""
-
-    name: str
-    total: float
-    idle: Optional[float] = None
-
-
 class CancelToken:
     """Cooperative cancellation with an awaitable edge.
 
-    The event is created lazily so a token can be constructed outside a running
-    loop without binding to the wrong one.
+    asyncio.Event has no payload, so the first cancel reason is latched here, and
+    raise_if_cancelled raises RunCancelled rather than CancelledError so a run can
+    survive to settle STOPPED and still deliver its preserved state.
     """
 
     def __init__(self) -> None:
         self._cancelled = False
         self._reason = ""
-        self._event: Optional[asyncio.Event] = None
+        # Event() has not bound a loop at construction time since the `loop`
+        # parameter was removed in 3.10, so there is nothing to defer.
+        self._event = asyncio.Event()
 
     @property
     def cancelled(self) -> bool:
@@ -80,8 +73,7 @@ class CancelToken:
             return False
         self._cancelled = True
         self._reason = reason or "취소됨"
-        if self._event is not None:
-            self._event.set()
+        self._event.set()
         return True
 
     def raise_if_cancelled(self) -> None:
@@ -89,10 +81,6 @@ class CancelToken:
             raise RunCancelled(self._reason)
 
     async def wait(self) -> None:
-        if self._event is None:
-            self._event = asyncio.Event()
-            if self._cancelled:
-                self._event.set()
         await self._event.wait()
 
 
@@ -131,6 +119,14 @@ async def _reap(*tasks) -> None:
         raise cancellation
 
 
+async def _abandon(awaitable) -> None:
+    """Give up on work we decided not to start, whichever kind it is."""
+    if asyncio.isfuture(awaitable):
+        await _reap(awaitable)
+    else:
+        _discard(awaitable)
+
+
 async def with_deadline(awaitable, seconds: Optional[float], token: Optional[CancelToken] = None,
                         stage: str = DEFAULT_STAGE):
     """Await `awaitable` under a total budget and a cancel token.
@@ -139,17 +135,11 @@ async def with_deadline(awaitable, seconds: Optional[float], token: Optional[Can
     work. A stage is never started once the token is already cancelled.
     """
     if token is not None and token.cancelled:
-        if asyncio.isfuture(awaitable):
-            await _reap(awaitable)
-        else:
-            _discard(awaitable)
+        await _abandon(awaitable)
         raise RunCancelled(token.reason)
 
     if seconds is not None and seconds <= 0:
-        if asyncio.isfuture(awaitable):
-            await _reap(awaitable)
-        else:
-            _discard(awaitable)
+        await _abandon(awaitable)
         raise StageTimeout(stage, seconds)
 
     task = asyncio.ensure_future(awaitable)
@@ -181,11 +171,13 @@ async def with_deadline(awaitable, seconds: Optional[float], token: Optional[Can
     raise StageTimeout(stage, seconds)
 
 
-async def stream_chunks(stream, budget: StageBudget, token: Optional[CancelToken] = None):
+async def stream_chunks(stream, stage: str, idle: Optional[float],
+                        token: Optional[CancelToken] = None):
     """Yield stream chunks under an idle deadline, checking the token each turn.
 
     `async for` gives no way to bound the gap between chunks, which is how a
-    silently stalled upstream held a run open for over an hour.
+    silently stalled upstream held a run open for over an hour. Only the idle gap
+    is bounded here; the stage total is enforced by the caller's with_deadline.
     """
     iterator = stream.__aiter__()
     try:
@@ -194,8 +186,8 @@ async def stream_chunks(stream, budget: StageBudget, token: Optional[CancelToken
                 token.raise_if_cancelled()
             step = iterator.__anext__()
             try:
-                if budget.idle:
-                    chunk = await with_deadline(step, budget.idle, token, budget.name + ":idle")
+                if idle:
+                    chunk = await with_deadline(step, idle, token, stage + ":idle")
                 else:
                     chunk = await step
             except StopAsyncIteration:

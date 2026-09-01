@@ -4,6 +4,7 @@ Every identifier here is synthetic.
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import os
@@ -108,6 +109,19 @@ class CancellationTestCase(unittest.IsolatedAsyncioTestCase):
     @property
     def detail(self):
         return self.settled[0][1] if self.settled else ""
+
+    @contextlib.contextmanager
+    def one_step_run(self, model):
+        """The patch set seven of these tests were repeating verbatim."""
+        with tempfile.TemporaryDirectory() as log_dir, patch.multiple(
+            bot,
+            SYSTEM_LOG_DIR=log_dir,
+            MAX_AGENT_LOOPS=1,
+            CHECKPOINT_INTERVAL=99,
+            ROLLING_COMPACTION_INTERVAL=99,
+            create_streaming_completion=model,
+        ):
+            yield
 
 
 class StopLatencyTest(CancellationTestCase):
@@ -321,12 +335,7 @@ class PostModelCancellationBoundaryTest(CancellationTestCase):
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
         fired = self.cancel_from_status_edit(message, "실시간 추론")
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             await bot.on_message(message)
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
@@ -346,12 +355,7 @@ class PostModelCancellationBoundaryTest(CancellationTestCase):
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
         fired = self.cancel_from_status_edit(message, "도구 요청 검토 중")
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             await bot.on_message(message)
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
@@ -485,12 +489,7 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
             )
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             await bot.on_message(message)
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
@@ -515,12 +514,7 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
             return _response(content="")
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             await bot.on_message(message)
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
@@ -551,12 +545,7 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
             return _response(content="")
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             await bot.on_message(message)
 
         chunks = message.replies[1:] + message.channel.sent
@@ -591,12 +580,7 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
             return _response(content="")
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             await bot.on_message(message)
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
@@ -625,12 +609,7 @@ class FinalSynthesisBoundaryTest(CancellationTestCase):
             return _response(content="")
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
-        with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", 1), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
-                patch.object(bot, "create_streaming_completion", model):
+        with self.one_step_run(model):
             run = asyncio.ensure_future(bot.on_message(message))
             await asyncio.wait_for(synthesis_started.wait(), timeout=1)
             requested = time.monotonic()

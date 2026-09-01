@@ -161,16 +161,6 @@ class ResearchLedger:
             self._transition(existing, status, evidence_id, note)
         return existing
 
-    def reject_hypothesis(self, hypothesis_id, evidence_id, note: str = "") -> Hypothesis:
-        return self._transition(
-            self._require_hypothesis(hypothesis_id), REJECTED, evidence_id, note
-        )
-
-    def confirm_hypothesis(self, hypothesis_id, evidence_id, note: str = "") -> Hypothesis:
-        return self._transition(
-            self._require_hypothesis(hypothesis_id), CONFIRMED, evidence_id, note
-        )
-
     def reopen_hypothesis(self, hypothesis_id, evidence_id, note: str = "") -> Hypothesis:
         return self._transition(
             self._require_hypothesis(hypothesis_id), ACTIVE, evidence_id, note, reopen=True
@@ -182,20 +172,14 @@ class ResearchLedger:
             raise LedgerRefusal("결론 id가 비어 있어 등록을 거부했습니다.")
 
         pinned: Dict[str, int] = {}
-        if isinstance(premises, dict):
-            items = premises.items()
-        else:
-            items = [(premise, None) for premise in premises or ()]
-        for premise_id, pinned_revision in items:
+        for premise_id in premises or ():
             premise_id = str(premise_id or "").strip()
             if not premise_id:
                 continue
-            if pinned_revision is None:
-                hypothesis = self._hypotheses.get(premise_id)
-                # An unknown premise pins to revision 0, which no hypothesis can
-                # ever hold, so the conclusion stays invalid until it is declared.
-                pinned_revision = hypothesis.revision if hypothesis else 0
-            pinned[premise_id] = int(pinned_revision)
+            hypothesis = self._hypotheses.get(premise_id)
+            # An unknown premise pins to revision 0, which no hypothesis can ever
+            # hold, so the conclusion stays invalid until it is declared.
+            pinned[premise_id] = hypothesis.revision if hypothesis else 0
 
         conclusion = Conclusion(
             id=conclusion_id, statement=_clip(statement, _STATEMENT_CHARS), premises=pinned
@@ -213,12 +197,9 @@ class ResearchLedger:
         note: str,
         reopen: bool = False,
     ) -> Hypothesis:
-        if status not in TRANSITION_STATUSES:
-            raise LedgerRefusal(
-                "가설 상태 '{0}'는 허용되지 않습니다. 허용: {1} 또는 reopen.".format(
-                    status, ", ".join(TRANSITION_STATUSES)
-                )
-            )
+        # Status is already validated by declare_hypothesis, and reopen_hypothesis
+        # passes the ACTIVE constant, so the only check left here is the invariant
+        # this method exists to hold.
         if hypothesis.status == REJECTED and status == ACTIVE and not reopen:
             raise LedgerRefusal(
                 "{0}는 이미 반증되었습니다. 다시 active로 만들려면 이전에 인용하지 않은 "
@@ -411,15 +392,13 @@ class ResearchLedger:
                     hypothesis = self.reopen_hypothesis(
                         item.get("id"), item.get("evidence_id"), item.get("note", "")
                     )
-                elif status == REJECTED and item.get("id") in self._hypotheses:
-                    hypothesis = self.reject_hypothesis(
-                        item.get("id"), item.get("evidence_id"), item.get("note", "")
-                    )
-                elif status == CONFIRMED and item.get("id") in self._hypotheses:
-                    hypothesis = self.confirm_hypothesis(
-                        item.get("id"), item.get("evidence_id"), item.get("note", "")
-                    )
                 else:
+                    # Every non-reopen status goes through declare_hypothesis, which
+                    # applies a corrected statement *and* the transition. The separate
+                    # rejected/confirmed branches that used to sit here called
+                    # _transition directly and never passed `statement`, so a model
+                    # that corrected a hypothesis while refuting it silently lost the
+                    # correction - the very class of loss this ledger exists to stop.
                     hypothesis = self.declare_hypothesis(
                         item.get("id"),
                         item.get("statement", ""),

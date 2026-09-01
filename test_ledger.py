@@ -12,6 +12,18 @@ def seeded_ledger():
     return ledger
 
 
+def reject(ledger, hypothesis_id, evidence_id, statement=""):
+    """Refute through declare_hypothesis, the only transition path in production.
+
+    bot.py reaches the ledger solely via apply_updates, which routes every
+    non-reopen status here. Tests that called a dedicated reject_hypothesis were
+    exercising an entry point no caller had.
+    """
+    return ledger.declare_hypothesis(
+        hypothesis_id, statement, status=REJECTED, evidence_id=evidence_id
+    )
+
+
 class HypothesisTransitionTest(unittest.TestCase):
     def setUp(self):
         self.ledger = seeded_ledger()
@@ -20,31 +32,31 @@ class HypothesisTransitionTest(unittest.TestCase):
         self.assertEqual(self.ledger.hypothesis_marker("H_A"), "H_A=active@v1")
 
     def test_rejection_advances_revision_and_records_evidence(self):
-        self.ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(self.ledger, "H_A", "E_NEG")
         self.assertEqual(self.ledger.hypothesis_marker("H_A"), "H_A=rejected@v2")
         self.assertIn("E_NEG", self.ledger.cited_evidence("H_A"))
 
     def test_rejected_hypothesis_cannot_be_reactivated_by_declaration(self):
-        self.ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(self.ledger, "H_A", "E_NEG")
         with self.assertRaises(LedgerRefusal):
             self.ledger.declare_hypothesis("H_A", "A 경로가 장애 원인이다", status=ACTIVE)
         self.assertEqual(self.ledger.hypothesis_marker("H_A"), "H_A=rejected@v2")
 
     def test_reopen_is_refused_when_evidence_was_already_cited(self):
-        self.ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(self.ledger, "H_A", "E_NEG")
         with self.assertRaises(LedgerRefusal):
             self.ledger.reopen_hypothesis("H_A", "E_NEG")
         self.assertEqual(self.ledger.hypothesis_marker("H_A"), "H_A=rejected@v2")
 
     def test_reopen_with_new_evidence_reactivates_at_next_revision(self):
-        self.ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(self.ledger, "H_A", "E_NEG")
         self.ledger.add_evidence("E_NEW", "다른 부하 조건에서 A 경로 오류 재현", source="log://3")
         self.ledger.reopen_hypothesis("H_A", "E_NEW")
         self.assertEqual(self.ledger.hypothesis_marker("H_A"), "H_A=active@v3")
 
     def test_transition_requires_registered_evidence(self):
         with self.assertRaises(LedgerRefusal):
-            self.ledger.reject_hypothesis("H_A", "E_UNKNOWN")
+            reject(self.ledger, "H_A", "E_UNKNOWN")
         self.assertEqual(self.ledger.hypothesis_marker("H_A"), "H_A=active@v1")
 
     def test_redeclaring_the_same_status_does_not_advance_revision(self):
@@ -62,13 +74,13 @@ class ConclusionInvalidationTest(unittest.TestCase):
         self.assertEqual(self.ledger.conclusion_marker("C_A"), "C_A=유효")
 
     def test_conclusion_is_invalidated_when_premise_revision_moves(self):
-        self.ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(self.ledger, "H_A", "E_NEG")
         self.assertFalse(self.ledger.conclusion_is_valid("C_A"))
         self.assertEqual(self.ledger.conclusion_marker("C_A"), "C_A=무효")
         self.assertEqual(self.ledger.stale_premises("C_A"), ["H_A"])
 
     def test_conclusion_pinned_to_a_rejected_premise_is_never_valid(self):
-        self.ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(self.ledger, "H_A", "E_NEG")
         self.ledger.add_conclusion("C_B", "A 경로는 장애와 무관하지 않다", ["H_A"])
         self.assertFalse(self.ledger.conclusion_is_valid("C_B"))
 
@@ -81,7 +93,7 @@ class RenderTest(unittest.TestCase):
     def test_render_carries_every_state_marker(self):
         ledger = seeded_ledger()
         ledger.add_conclusion("C_A", "A 경로를 차단하면 장애가 멈춘다", ["H_A"])
-        ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(ledger, "H_A", "E_NEG")
 
         rendered = ledger.render()
         for marker in ("H_A=rejected@v2", "C_A=무효", "E_NEG"):
@@ -141,7 +153,7 @@ class ApplyUpdatesTest(unittest.TestCase):
 
     def test_refused_transition_is_reported_without_changing_state(self):
         ledger = seeded_ledger()
-        ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(ledger, "H_A", "E_NEG")
 
         report = ledger.apply_updates({
             "hypotheses": [{"id": "H_A", "statement": "A 경로가 원인이다", "status": "active"}],
@@ -151,9 +163,29 @@ class ApplyUpdatesTest(unittest.TestCase):
         self.assertIn("reopen", report)
         self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=rejected@v2")
 
+    def test_rejecting_through_a_batch_keeps_a_corrected_statement(self):
+        # Mutation caught: apply_updates used to route a rejected status to a
+        # dedicated reject_hypothesis that took no `statement`, so a model
+        # correcting a hypothesis while refuting it lost the correction and every
+        # later payload kept asserting the stale wording. This is the production
+        # path - bot.py reaches the ledger only through apply_updates.
+        ledger = seeded_ledger()
+        ledger.apply_updates({
+            "hypotheses": [{
+                "id": "H_A",
+                "statement": "A 경로가 아니라 B 경로가 원인이다",
+                "status": "rejected",
+                "evidence_id": "E_NEG",
+            }],
+        })
+        rendered = ledger.render()
+        self.assertIn("A 경로가 아니라 B 경로가 원인이다", rendered)
+        self.assertNotIn("A 경로가 장애 원인이다", rendered)
+        self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=rejected@v2")
+
     def test_reopen_status_keyword_routes_through_the_reopen_rule(self):
         ledger = seeded_ledger()
-        ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(ledger, "H_A", "E_NEG")
         ledger.apply_updates({
             "evidence": [{"id": "E_NEW", "summary": "다른 조건에서 재현", "source": "log://3"}],
             "hypotheses": [{"id": "H_A", "status": "reopen", "evidence_id": "E_NEW"}],
@@ -173,13 +205,8 @@ class ApplyUpdatesTest(unittest.TestCase):
         before = ledger.revision
         ledger.apply_updates({"hypotheses": [{"id": "H_A", "status": "maybe"}]})
         self.assertEqual(ledger.revision, before)
-        ledger.reject_hypothesis("H_A", "E_NEG")
+        reject(ledger, "H_A", "E_NEG")
         self.assertGreater(ledger.revision, before)
-
-
-class StatusConstantTest(unittest.TestCase):
-    def test_status_constants_match_marker_text(self):
-        self.assertEqual((ACTIVE, REJECTED), ("active", "rejected"))
 
 
 if __name__ == "__main__":
