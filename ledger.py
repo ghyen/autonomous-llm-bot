@@ -161,16 +161,6 @@ class ResearchLedger:
             self._transition(existing, status, evidence_id, note)
         return existing
 
-    def reject_hypothesis(self, hypothesis_id, evidence_id, note: str = "") -> Hypothesis:
-        return self._transition(
-            self._require_hypothesis(hypothesis_id), REJECTED, evidence_id, note
-        )
-
-    def confirm_hypothesis(self, hypothesis_id, evidence_id, note: str = "") -> Hypothesis:
-        return self._transition(
-            self._require_hypothesis(hypothesis_id), CONFIRMED, evidence_id, note
-        )
-
     def reopen_hypothesis(self, hypothesis_id, evidence_id, note: str = "") -> Hypothesis:
         return self._transition(
             self._require_hypothesis(hypothesis_id), ACTIVE, evidence_id, note, reopen=True
@@ -411,15 +401,13 @@ class ResearchLedger:
                     hypothesis = self.reopen_hypothesis(
                         item.get("id"), item.get("evidence_id"), item.get("note", "")
                     )
-                elif status == REJECTED and item.get("id") in self._hypotheses:
-                    hypothesis = self.reject_hypothesis(
-                        item.get("id"), item.get("evidence_id"), item.get("note", "")
-                    )
-                elif status == CONFIRMED and item.get("id") in self._hypotheses:
-                    hypothesis = self.confirm_hypothesis(
-                        item.get("id"), item.get("evidence_id"), item.get("note", "")
-                    )
                 else:
+                    # Every non-reopen status goes through declare_hypothesis, which
+                    # applies a corrected statement *and* the transition. The separate
+                    # rejected/confirmed branches that used to sit here called
+                    # _transition directly and never passed `statement`, so a model
+                    # that corrected a hypothesis while refuting it silently lost the
+                    # correction - the very class of loss this ledger exists to stop.
                     hypothesis = self.declare_hypothesis(
                         item.get("id"),
                         item.get("statement", ""),

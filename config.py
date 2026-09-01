@@ -162,18 +162,25 @@ def load_env_file(path) -> Dict[str, str]:
 
     No new dependency: the format we document is `KEY=VALUE` with `#` comments,
     an optional `export ` prefix, and optional surrounding quotes.
+
+    Malformed input is refused rather than half-read. This loader exists because
+    misconfiguration used to pass silently, so it must not reintroduce that in
+    its own parsing.
     """
     values: Dict[str, str] = {}
     if not path:
         return values
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        # utf-8-sig, not utf-8: an editor-written BOM would otherwise land inside
+        # the first key, so DISCORD_BOT_TOKEN would parse as "\ufeffDISCORD_BOT_TOKEN"
+        # and the value the operator set would be silently ignored.
+        with open(path, "r", encoding="utf-8-sig") as handle:
             lines = handle.readlines()
     except (FileNotFoundError, NotADirectoryError, IsADirectoryError, PermissionError):
         return values
 
-    for line in lines:
-        line = line.strip()
+    for lineno, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         if line.startswith("export "):
@@ -183,8 +190,19 @@ def load_env_file(path) -> Dict[str, str]:
         if not key:
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
+        if value[:1] in ("\"", "'"):
+            quote = value[0]
+            end = value.find(quote, 1)
+            if end == -1:
+                raise ConfigError(
+                    "{0} {1}행: {2} 값의 따옴표가 닫히지 않았습니다. "
+                    "값은 한 줄로 적어야 합니다.".format(path, lineno, key)
+                )
+            value = value[1:end]
+        else:
+            # An unquoted value ends at a whitespace-separated '#'. Requiring the
+            # whitespace keeps a '#' that is part of a secret inside the value.
+            value = value.split(" #", 1)[0].split("\t#", 1)[0].strip()
         values[key] = value
     return values
 
