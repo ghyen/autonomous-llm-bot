@@ -20,10 +20,10 @@ CHANNEL_ID = 987654600
 LONG_REPORT = "조사 결과 정리. " + ("확인됨. " * 80)
 
 
-def _response(content="", tool_calls=()):
+def _response(content="", tool_calls=(), reasoning=""):
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
         content=content,
-        reasoning_content="",
+        reasoning_content=reasoning,
         reasoning="",
         tool_calls=list(tool_calls),
     ))])
@@ -64,6 +64,10 @@ class RunRecorder:
 
 
 class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
+    # Subclasses that read the session log after a run set this to a directory
+    # they own, so the tree outlives the run instead of being thrown away.
+    log_root = None
+
     def setUp(self):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(CHANNEL_ID)
         self.recorder = RunRecorder()
@@ -104,15 +108,16 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
         self.bash_exec = AsyncMock(return_value=tool_result)
         message = message if message is not None else FakeMessage(request, CHANNEL_ID)
 
-        with tempfile.TemporaryDirectory() as log_dir, \
-                run_catalog_patch(bot, log_dir), \
-                patch.object(bot, "MAX_AGENT_LOOPS", max_loops), \
-                patch.object(bot, "CHECKPOINT_INTERVAL", checkpoint_interval), \
-                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", compaction_interval), \
-                patch.object(bot, "tool_bash_exec", self.bash_exec), \
-                patch.object(bot, "create_streaming_completion", model), \
-                self.recorder.install():
-            await bot.on_message(message)
+        with tempfile.TemporaryDirectory() as scratch:
+            log_dir = self.log_root or scratch
+            with run_catalog_patch(bot, log_dir), \
+                    patch.object(bot, "MAX_AGENT_LOOPS", max_loops), \
+                    patch.object(bot, "CHECKPOINT_INTERVAL", checkpoint_interval), \
+                    patch.object(bot, "ROLLING_COMPACTION_INTERVAL", compaction_interval), \
+                    patch.object(bot, "tool_bash_exec", self.bash_exec), \
+                    patch.object(bot, "create_streaming_completion", model), \
+                    self.recorder.install():
+                await bot.on_message(message)
 
         return message
 
