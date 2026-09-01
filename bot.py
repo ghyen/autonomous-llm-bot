@@ -39,6 +39,7 @@ from deadlines import (
 )
 from outcome import RunOutcome
 from ledger import ResearchLedger
+from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
 from config import ConfigError, load_config, startup_diagnostics
 
 # Configuration is fully validated before any filesystem or network side effect.
@@ -55,31 +56,29 @@ FREE_RESPONSE_CHANNEL_IDS = set(CONFIG.free_response_channel_ids)
 ALLOWED_USER_IDS = set(CONFIG.allowed_user_ids)
 ADMIN_USER_IDS = set(CONFIG.admin_user_ids)
 TOOLS_ENABLED = CONFIG.tools_enabled
-WORKSPACE_DIR = CONFIG.workspace_dir
-SYSTEM_LOG_DIR = CONFIG.system_log_dir
 
 for diagnostic_line in startup_diagnostics(CONFIG):
     print(f"[Config] {diagnostic_line}", flush=True)
 
-os.makedirs(WORKSPACE_DIR, exist_ok=True)
-os.makedirs(os.path.join(WORKSPACE_DIR, "skills"), exist_ok=True)
-os.makedirs(SYSTEM_LOG_DIR, exist_ok=True)
+RUN_CATALOG = RunCatalog(CONFIG.workspace_dir, CONFIG.system_log_dir)
 
-SYSTEM_PROMPT = f"""당신은 터미널 환경과 전용 작업 공간(workspace)에 직접 접근할 수 있는 **완전자율 목표 달성 AI 에이전트**입니다.
+SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 작업 공간(workspace)에 직접 접근할 수 있는 **완전자율 목표 달성 AI 에이전트**입니다.
 
 [운영 환경]
-- 작업 디렉토리: `{WORKSPACE_DIR}`
-- 시스템 디렉토리 및 파일:
-  - `{WORKSPACE_DIR}/skills/`: 재사용 가능한 사용자 정의 스크립트 및 도구 저장소 (`.py`, `.sh` 등)
-  - `{WORKSPACE_DIR}/plan.md`: 에이전트의 목표 달성 체크리스트 및 실시간 진행 상태
-  - `{WORKSPACE_DIR}/findings.md`: 수집된 핵심 데이터, 단서, 팩트, 취약점 및 결론 누적 기록
+- 현재 실행 작업 디렉토리: `{workspace_root}`
+- 시스템 파일:
+  - `{workspace_root}/skills/`: 현재 실행 전용 재사용 스크립트 및 도구 저장소 (`.py`, `.sh`, `.bash`, `.md`)
+  - `{workspace_root}/plan.md`: 에이전트의 목표 달성 체크리스트 및 실시간 진행 상태
+  - `{workspace_root}/findings.md`: 수집된 핵심 데이터, 단서, 팩트, 취약점 및 결론 누적 기록
 - 사용할 수 있는 도구:
-  - `bash_exec(command)`: 쉘 명령어 실행 (curl, python3, nmap, jq, sed, awk, find, grep 등).
+  - `bash_exec(command)`: 현재 실행 작업 공간에서 쉘 명령어 실행 (curl, python3, nmap, jq, sed, awk, find, grep 등).
   - `read_file(path)`: 파일 읽기
-  - `write_file(path, content)`: 파일 생성 및 덮어쓰기
+  - `write_file(path, content, expected_revision)`: 파일 생성 및 덮어쓰기
   - `web_search(query)`: DuckDuckGo 웹 검색
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
+- 루트 `plan.md`와 `findings.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 없을 때 최초 생성은 `absent`를 사용하세요.
+- 두 파일의 변경된 읽기는 전체 내용과 revision을 반환하고, 변경 없는 재읽기는 내용 대신 hash reference만 반환합니다. conflict이면 최신 내용을 다시 읽고 병합하세요.
 
 [상태 관리 - 자율 탐색의 절대 규칙]
 `[권위 있는 조사 상태]` 블록이 이번 조사에서 무엇이 사실인지에 대한 유일한 권위입니다.
@@ -144,7 +143,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "bash_exec",
-            "description": f"작업 공간({WORKSPACE_DIR}) 내에서 쉘 명령어를 실행합니다. timeout은 {CONFIG.bash_timeout:g}초입니다.",
+            "description": f"현재 실행 작업 공간에서 쉘 명령어를 실행합니다. timeout은 {CONFIG.bash_timeout:g}초입니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -167,7 +166,7 @@ TOOLS_SCHEMA = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "읽을 파일 경로 (절대경로 또는 workspace 기준 상대경로)"
+                        "description": "읽을 파일 경로 (절대경로 또는 현재 실행 작업 공간 기준 상대경로)"
                     }
                 },
                 "required": ["path"]
@@ -178,7 +177,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "파일에 내용을 작성하거나 덮어씁니다.",
+            "description": "현재 실행 작업 공간의 파일을 작성합니다. 루트 plan.md/findings.md는 expected_revision이 필수입니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -189,6 +188,10 @@ TOOLS_SCHEMA = [
                     "content": {
                         "type": "string",
                         "description": "작성할 텍스트 내용"
+                    },
+                    "expected_revision": {
+                        "type": "string",
+                        "description": "루트 plan.md/findings.md 전용: absent 또는 직전 읽기의 sha256:<64 hex> revision"
                     }
                 },
                 "required": ["path", "content"]
@@ -325,7 +328,6 @@ channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
-channel_user_queue = defaultdict(list)
 channel_run_owner = {}
 
 
@@ -378,7 +380,6 @@ def clear_channel_state(channel_id) -> None:
     channel_history[channel_id].clear()
     channel_summary[channel_id] = ""
     channel_ledger[channel_id].clear()
-    channel_user_queue[channel_id].clear()
 
 
 MAX_RECENT_TURNS = 8
@@ -423,6 +424,15 @@ def _invalid_tool_arguments_result(reason: str, tool_name: str) -> str:
 
 
 def _tool_result_failed(tool_name: str, result: str) -> bool:
+    if tool_name in ("read_file", "write_file"):
+        try:
+            envelope = json.loads(result)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(envelope, dict)
+            and envelope.get("status") in ("error", "conflict")
+        )
     if result.startswith("[Error"):
         return True
     if tool_name == "bash_exec":
@@ -522,7 +532,7 @@ async def _terminate_process_tree(proc, process_group_id: int) -> None:
     except Exception:
         pass
 
-async def tool_bash_exec(command: str) -> str:
+async def tool_bash_exec(workspace, command: str) -> str:
     proc = None
     process_group_id = None
     try:
@@ -531,7 +541,7 @@ async def tool_bash_exec(command: str) -> str:
         # descendants, even if the shell exits before its inherited pipes close.
         proc = await asyncio.create_subprocess_shell(
             command,
-            cwd=WORKSPACE_DIR,
+            cwd=workspace.root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -565,30 +575,41 @@ async def tool_bash_exec(command: str) -> str:
     except Exception as e:
         return f"[Error executing bash command: {e}]"
 
-async def tool_read_file(path: str) -> str:
-    try:
-        target_path = path if os.path.isabs(path) else os.path.join(WORKSPACE_DIR, path)
-        print(f"[Tool: read_file] {target_path}", flush=True)
-        if not os.path.exists(target_path):
-            return f"[Error: File not found at {target_path}]"
-        with open(target_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        if len(content) > 4000:
-            content = content[:4000] + f"\n... [파일 내용이 너무 길어 4000자까지만 표시되었습니다. 전체 크기: {len(content)}자]"
-        return "[read_file status: success]\n" + (content or "[File is empty]")
-    except Exception as e:
-        return f"[Error reading file: {e}]"
 
-async def tool_write_file(path: str, content: str) -> str:
+def _workspace_result(payload) -> str:
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+async def tool_read_file(workspace, path: str) -> str:
     try:
-        target_path = path if os.path.isabs(path) else os.path.join(WORKSPACE_DIR, path)
-        print(f"[Tool: write_file] {target_path} ({len(content)} chars)", flush=True)
-        os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"[Successfully written {len(content)} characters to {target_path}]"
+        target_path = workspace.resolve(path)
+        print(f"[Tool: read_file] {target_path}", flush=True)
+        return _workspace_result(workspace.read(path))
     except Exception as e:
-        return f"[Error writing file: {e}]"
+        return _workspace_result({
+            "status": "error",
+            "path": path,
+            "error": str(e),
+        })
+
+
+async def tool_write_file(
+    workspace, path: str, content: str, expected_revision
+) -> str:
+    try:
+        target_path = workspace.resolve(path)
+        print(f"[Tool: write_file] {target_path} ({len(content)} chars)", flush=True)
+        return _workspace_result(
+            await workspace.write(path, content, expected_revision)
+        )
+    except Exception as e:
+        return _workspace_result({
+            "status": "error",
+            "path": path,
+            "error": str(e),
+        })
 
 async def tool_web_search(query: str) -> str:
     try:
@@ -638,20 +659,23 @@ async def tool_finish_task(report: str) -> str:
     print(f"[Tool: finish_task Called!]", flush=True)
     return f"[Task Completed Successfully. Final Report Registered ({len(report)} chars)]"
 
-async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1, ledger=None, token=None) -> list:
+async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int = 1, ledger=None, token=None) -> list:
     async def _exec_single(tc):
         name = tc["name"]
         args = tc["arguments"]
         if name == "bash_exec":
             cmd = args.get("command", "")
-            return await tool_bash_exec(cmd)
+            return await tool_bash_exec(workspace, cmd)
         elif name == "read_file":
             path = args.get("path", "")
-            return await tool_read_file(path)
+            return await tool_read_file(workspace, path)
         elif name == "write_file":
             path = args.get("path", "")
             content = args.get("content", "")
-            return await tool_write_file(path, content)
+            expected_revision = args.get("expected_revision")
+            return await tool_write_file(
+                workspace, path, content, expected_revision
+            )
         elif name == "web_search":
             q = args.get("query", "")
             return await tool_web_search(q)
@@ -736,9 +760,14 @@ def _msg_tool_calls(m) -> list:
 
 def _clip_summary_text(text: str, max_chars: int) -> str:
     text = str(text or "").strip()
+    if max_chars <= 0:
+        return ""
     if len(text) <= max_chars:
         return text
-    return text[:max_chars].rstrip() + " ...[생략]"
+    omission = " ...[생략]"
+    if max_chars <= len(omission):
+        return text[:max_chars]
+    return text[:max_chars - len(omission)].rstrip() + omission
 
 def _tool_call_summary(call) -> str:
     if isinstance(call, dict):
@@ -824,8 +853,8 @@ def _extract_skill_description(content: str, ext: str) -> str:
     return "작업 공간 도구"
 
 
-def discover_workspace_skills(workspace_dir: str = "") -> list:
-    target_dir = os.path.join(workspace_dir or WORKSPACE_DIR, "skills")
+def discover_workspace_skills(workspace) -> list:
+    target_dir = os.path.join(workspace.root, "skills")
     if not os.path.isdir(target_dir):
         return []
     skills = []
@@ -860,8 +889,8 @@ def discover_workspace_skills(workspace_dir: str = "") -> list:
     return skills
 
 
-def render_skills_block(workspace_dir: str = "") -> str:
-    skills = discover_workspace_skills(workspace_dir)
+def render_skills_block(workspace) -> str:
+    skills = discover_workspace_skills(workspace)
     header = "[재사용 가능한 작업 공간 스킬 (Workspace Skills)]"
     if not skills:
         return (
@@ -990,14 +1019,14 @@ def update_hierarchical_summary(
     )
 
 
-def extract_discovered_artifacts(text: str, workspace_dir: str = "") -> list:
+def extract_discovered_artifacts(text: str, workspace) -> list:
     artifacts = []
     for m in re.finditer(r"(`(?:skills/[a-zA-Z0-9_.-]+|findings\.md|plan\.md|[a-zA-Z0-9_.-]+\.(?:py|sh|json|md|txt))`|https?://[^\s)\]]+)", text):
         found = m.group(1).strip()
         item = f"- 참조/산출물: {found}"
         if item not in artifacts:
             artifacts.append(item)
-    skills = discover_workspace_skills(workspace_dir)
+    skills = discover_workspace_skills(workspace)
     for s in skills:
         skill_item = f"- 스킬: `{s['name']}` ({s['description']})"
         if skill_item not in artifacts:
@@ -1011,15 +1040,15 @@ ROLLING_SUMMARY_LABEL = "누적 작업 요약 및 이전 대화 컨텍스트"
 STATE_UPDATE_BLOCK_PATTERN = re.compile(r"```state_update\s*(.*?)```", re.DOTALL)
 
 
-def build_system_content(base_prompt: str, ledger=None, summary: str = "", workspace_dir: str = "") -> str:
-    """Compose message 0.
+def build_system_content(workspace, ledger=None, summary: str = "") -> str:
+    """Compose message 0 for one explicit run workspace.
 
     The state block goes last and message 0 sits before the first tool
     message, so `apply_micro_compaction` never rewrites it and every request,
     checkpoint and rollover sees the same authoritative state.
     """
-    parts = [base_prompt]
-    skills_block = render_skills_block(workspace_dir or WORKSPACE_DIR)
+    parts = [SYSTEM_PROMPT_TEMPLATE.format(workspace_root=workspace.root)]
+    skills_block = render_skills_block(workspace)
     if skills_block:
         parts.append(skills_block)
     summary = str(summary or "").strip()
@@ -1114,7 +1143,7 @@ def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = 
 
     return messages[:boundary], messages[boundary:]
 
-async def rollover_agent_context(messages: list, existing_summary: str, step_num: int, session_file: str = "", ledger=None, token=None):
+async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, session_file: str = "", ledger=None, token=None):
     """Summarize old steps and replace the live payload with a bounded tail."""
     if token is not None:
         token.raise_if_cancelled()
@@ -1148,7 +1177,9 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
 
     start_step = max(1, step_num - ROLLING_COMPACTION_INTERVAL + 1)
     step_range = f"Step {start_step}-{step_num}"
-    discoveries = extract_discovered_artifacts(source + "\n" + (existing_summary or ""))
+    discoveries = extract_discovered_artifacts(
+        source + "\n" + (existing_summary or ""), workspace
+    )
 
     summary_prompt = (
         "이것은 장시간 자율 에이전트의 다단계 계층형 컨텍스트 압축 작업입니다.\n"
@@ -1219,8 +1250,8 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
                 step_range=step_range,
                 discoveries=discoveries,
             )
-        new_summary = _clip_summary_text(new_summary, ROLLING_SUMMARY_MAX_CHARS)
 
+    new_summary = _clip_summary_text(new_summary, ROLLING_SUMMARY_MAX_CHARS)
     dropped_markers = missing_state_markers(new_summary, required_markers)
     if dropped_markers:
         validation_notes.append("누락된 상태 마커를 권위 있는 상태 블록으로 보정했습니다: " + ", ".join(dropped_markers))
@@ -1228,7 +1259,7 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
 
     # 400 Chat template error 완벽 방지: 단일 시스템 프롬프트로 병합
     replaced_messages = [
-        {"role": "system", "content": build_system_content(SYSTEM_PROMPT, ledger, new_summary)},
+        {"role": "system", "content": build_system_content(workspace, ledger, new_summary)},
         {
             "role": "user",
             "content": "[롤링 컨텍스트 재개] 위 요약과 권위 있는 조사 상태를 기준으로 최근 도구 실행 결과를 반영하고 다음 작업을 계속하세요.",
@@ -1513,7 +1544,11 @@ def format_full_discord_output(text: str) -> str:
 @bot.event
 async def on_ready():
     print(f"[Discord LLM Bot] Logged in as {bot.user} (ID: {bot.user.id})", flush=True)
-    print(f"[Discord LLM Bot] Ready in Auto-Extension Goal-Driven Mode! Workspace: {WORKSPACE_DIR}", flush=True)
+    print(
+        f"[Discord LLM Bot] Ready in Auto-Extension Goal-Driven Mode! "
+        f"Run root: {RUN_CATALOG.runs_root}",
+        flush=True,
+    )
     await bot.change_presence(activity=discord.Game(name="Qwen 27B + Auto-Extension"), status=discord.Status.online)
 
 # --- Slash Commands ---
@@ -1541,16 +1576,90 @@ def interaction_can_manage_messages(interaction: discord.Interaction) -> bool:
     return bool(interaction.permissions.manage_messages)
 
 
-@bot.tree.command(name="reset", description="대화 기록 및 캐시를 초기화합니다.")
-async def slash_reset(interaction: discord.Interaction):
+def prepare_new_run(owner_id, channel_id):
+    workspace = RUN_CATALOG.prepare(owner_id, channel_id)
+    clear_channel_state(channel_id)
+    return workspace
+
+
+def resume_run(owner_id, channel_id, run_id):
+    return RUN_CATALOG.resume(owner_id, channel_id, run_id)
+
+
+def delete_run(owner_id, run_id):
+    RUN_CATALOG.delete(owner_id, run_id)
+
+
+async def _slash_prepare_run(interaction):
+    owner_id = getattr(interaction.user, "id", None)
     decision = authorize_caller(
-        authz.CONTROL, getattr(interaction.user, "id", None), channel_id=interaction.channel_id
+        authz.CONTROL, owner_id, channel_id=interaction.channel_id
     )
     if not decision:
         await deny_interaction(interaction, authz.CONTROL, decision)
         return
-    clear_channel_state(interaction.channel_id)
-    await interaction.response.send_message("🧹 **대화 기록과 컨텍스트 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
+    try:
+        workspace = prepare_new_run(owner_id, interaction.channel_id)
+    except RunActiveError:
+        await interaction.response.send_message(
+            "An active run must stop before reset/new.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"🧹 대화 상태를 초기화하고 새 run `{workspace.run_id}`을 다음 목표로 선택했습니다."
+    )
+
+
+@bot.tree.command(name="reset", description="대화 기록을 초기화하고 새 run을 준비합니다.")
+async def slash_reset(interaction: discord.Interaction):
+    await _slash_prepare_run(interaction)
+
+
+@bot.tree.command(name="new", description="대화 기록을 초기화하고 새 run을 준비합니다.")
+async def slash_new(interaction: discord.Interaction):
+    await _slash_prepare_run(interaction)
+
+
+@bot.tree.command(name="resume", description="소유한 run을 다음 목표에서 재개합니다.")
+async def slash_resume(interaction: discord.Interaction, run_id: str):
+    owner_id = getattr(interaction.user, "id", None)
+    decision = authorize_caller(
+        authz.CONTROL, owner_id, channel_id=interaction.channel_id
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.CONTROL, decision)
+        return
+    try:
+        workspace = resume_run(owner_id, interaction.channel_id, run_id)
+    except RunNotFoundError:
+        await interaction.response.send_message("run not found", ephemeral=True)
+        return
+    except RunActiveError:
+        await interaction.response.send_message("run is active", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다."
+    )
+
+
+@bot.tree.command(name="delete", description="소유한 비활성 run을 삭제합니다.")
+async def slash_delete(interaction: discord.Interaction, run_id: str):
+    owner_id = getattr(interaction.user, "id", None)
+    decision = authorize_caller(
+        authz.CONTROL, owner_id, channel_id=interaction.channel_id
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.CONTROL, decision)
+        return
+    try:
+        delete_run(owner_id, run_id)
+    except RunNotFoundError:
+        await interaction.response.send_message("run not found", ephemeral=True)
+        return
+    except RunActiveError:
+        await interaction.response.send_message("run is active", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🗑️ run `{run_id}`을 삭제했습니다.")
 
 @bot.tree.command(name="stop", description="현재 단계를 취소하고 보존된 조사 상태를 보고합니다.")
 async def slash_stop(interaction: discord.Interaction):
@@ -1576,21 +1685,43 @@ async def slash_clear(interaction: discord.Interaction, count: int = 50):
     if not decision:
         await deny_interaction(interaction, authz.PURGE, decision)
         return
+    owner_id = getattr(interaction.user, "id", None)
+    try:
+        reservation = RUN_CATALOG.reserve_reset(owner_id, interaction.channel_id)
+    except RunActiveError:
+        await interaction.response.send_message(
+            "An active run must stop before clear.", ephemeral=True
+        )
+        return
 
     amt = min(max(1, count), 100)
-    await interaction.response.defer(ephemeral=True)
-    # 삭제 성공 이후에만 대화 상태를 지운다.
+    purged = False
     try:
-        deleted = await interaction.channel.purge(limit=amt)
-    except discord.Forbidden:
-        await interaction.followup.send("⚠️ **권한 부족**: 봇에게 채널의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다. 대화 기록은 유지되었습니다.", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ 메시지 삭제 중 오류 발생: `{e}` 대화 기록은 유지되었습니다.", ephemeral=True)
-        return
+        await interaction.response.defer(ephemeral=True)
+        # 삭제 성공 이후에만 대화 상태를 지운다.
+        try:
+            deleted = await interaction.channel.purge(limit=amt)
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ **권한 부족**: 봇에게 채널의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다. 대화 기록은 유지되었습니다.", ephemeral=True)
+            return
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ 메시지 삭제 중 오류 발생: `{e}` 대화 기록은 유지되었습니다.", ephemeral=True)
+            return
+        purged = True
+    finally:
+        if not purged:
+            RUN_CATALOG.cancel_reset(
+                owner_id, interaction.channel_id, reservation
+            )
 
+    workspace = RUN_CATALOG.prepare_reserved(
+        owner_id, interaction.channel_id, reservation
+    )
     clear_channel_state(interaction.channel_id)
-    await interaction.followup.send(f"🧹 **최근 메시지 {len(deleted)}개와 봇 대화 기록을 모두 삭제했습니다.**", ephemeral=True)
+    await interaction.followup.send(
+        f"🧹 최근 메시지 {len(deleted)}개와 대화 상태를 삭제하고 새 run `{workspace.run_id}`을 선택했습니다.",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="reasoning", description="추론 레벨을 변경합니다 (none, low, medium, high)")
 async def slash_reasoning(interaction: discord.Interaction, level: str):
@@ -1661,8 +1792,52 @@ async def on_message(message: discord.Message):
         if not control:
             await message.reply(f"⛔ {control.reason}")
             return
-        clear_channel_state(message.channel.id)
-        await message.reply("🧹 **대화 기록과 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
+        try:
+            workspace = prepare_new_run(caller_id, message.channel.id)
+        except RunActiveError:
+            await message.reply("An active run must stop before reset/new.")
+            return
+        await message.reply(
+            f"🧹 대화 상태를 초기화하고 새 run `{workspace.run_id}`을 다음 목표로 선택했습니다."
+        )
+        return
+
+    if cmd_name in ["!resume", "/resume"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        if len(parts) != 2:
+            await message.reply("사용법: `!resume <run-id>`")
+            return
+        try:
+            workspace = resume_run(caller_id, message.channel.id, parts[1])
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("run is active")
+            return
+        await message.reply(f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다.")
+        return
+
+    if cmd_name in ["!delete", "/delete"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        if len(parts) != 2:
+            await message.reply("사용법: `!delete <run-id>`")
+            return
+        try:
+            delete_run(caller_id, parts[1])
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("run is active")
+            return
+        await message.reply(f"🗑️ run `{parts[1]}`을 삭제했습니다.")
         return
 
     if cmd_name in ["!clear", "!purge", "!삭제", "!청소"]:
@@ -1679,28 +1854,49 @@ async def on_message(message: discord.Message):
             )
             await message.reply(f"⛔ {purge.reason}")
             return
-
         amount = 50
-        if len(parts) > 1 and parts[1].isdigit():
-            amount = int(parts[1])
+        if len(parts) > 1:
+            try:
+                amount = int(parts[1])
+            except ValueError:
+                pass
         amount = min(max(1, amount), 100)
+
+        try:
+            reservation = RUN_CATALOG.reserve_reset(caller_id, message.channel.id)
+        except RunActiveError:
+            await message.reply("An active run must stop before clear.")
+            return
 
         print(f"[Clear Command]: Purging {amount} messages in channel {message.channel.id}", flush=True)
 
         # 삭제를 먼저 시도하고, 성공한 뒤에만 대화 상태를 지운다. 예전에는 순서가
         # 반대여서 권한이 없어 삭제가 실패해도 기록은 이미 사라져 있었다.
+        purged = False
         try:
-            deleted = await message.channel.purge(limit=amount + 1)
-        except discord.Forbidden:
-            await message.channel.send("⚠️ **권한 부족**: 봇에게 서버의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다. 대화 기록은 유지되었습니다.")
-            return
-        except Exception as e:
-            await message.channel.send(f"⚠️ 메시지 삭제 실패: `{e}` 대화 기록은 유지되었습니다.")
-            return
+            try:
+                deleted = await message.channel.purge(limit=amount + 1)
+            except discord.Forbidden:
+                await message.channel.send("⚠️ **권한 부족**: 봇에게 서버의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다. 대화 기록은 유지되었습니다.")
+                return
+            except Exception as e:
+                await message.channel.send(f"⚠️ 메시지 삭제 실패: `{e}` 대화 기록은 유지되었습니다.")
+                return
+            purged = True
+        finally:
+            if not purged:
+                RUN_CATALOG.cancel_reset(
+                    caller_id, message.channel.id, reservation
+                )
 
+        workspace = RUN_CATALOG.prepare_reserved(
+            caller_id, message.channel.id, reservation
+        )
         clear_channel_state(message.channel.id)
         del_count = max(0, len(deleted) - 1)
-        notice = await message.channel.send(f"🧹 **최근 메시지 {del_count}개와 봇 대화 기록을 모두 삭제했습니다.**")
+        notice = await message.channel.send(
+            f"🧹 최근 메시지 {del_count}개와 대화 상태를 삭제하고 새 run `{workspace.run_id}`을 선택했습니다."
+        )
         await asyncio.sleep(3)
         try:
             await notice.delete()
@@ -1711,16 +1907,19 @@ async def on_message(message: discord.Message):
     if content.startswith("!"):
         return
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    session_file = os.path.join(SYSTEM_LOG_DIR, f"{today_str}_channel_{message.channel.id}.md")
-
     # [실시간 동적 개입 큐 주입]
     if channel_active_runs[message.channel.id]:
         steering = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
         if not steering:
             await message.reply(f"⛔ {steering.reason}")
             return
-        channel_user_queue[message.channel.id].append((str(message.author), content))
+        active_lease = next(
+            candidate
+            for candidate in reversed(channel_run_leases[message.channel.id])
+            if candidate["active"]
+        )
+        session_file = active_lease["workspace"].log_path
+        active_lease["steering"].append((str(message.author), content))
         log_session_event(session_file, f"💬 [사용자 실시간 중간 개입] {message.author}", content)
         print(f"[Mid-Flight User Steering Queued from {message.author}]: {content}", flush=True)
 
@@ -1735,7 +1934,21 @@ async def on_message(message: discord.Message):
 
     start_time = time.time()
     token = CancelToken()
-    lease = {"token": token, "owner": caller_id, "active": False}
+    try:
+        workspace = RUN_CATALOG.acquire(caller_id, message.channel.id)
+    except RunActiveError:
+        await message.reply(
+            "A reset/clear operation is in progress; retry this goal."
+        )
+        return
+    session_file = workspace.log_path
+    lease = {
+        "token": token,
+        "owner": caller_id,
+        "active": False,
+        "workspace": workspace,
+        "steering": [],
+    }
     channel_run_leases[message.channel.id].append(lease)
 
     def publish_run_control():
@@ -1747,7 +1960,6 @@ async def on_message(message: discord.Message):
             channel_run_leases.pop(message.channel.id, None)
             channel_cancel_token.pop(message.channel.id, None)
             channel_run_owner.pop(message.channel.id, None)
-            channel_user_queue[message.channel.id].clear()
             return
         current = next(
             (
@@ -1761,14 +1973,20 @@ async def on_message(message: discord.Message):
         channel_run_owner[message.channel.id] = current["owner"]
 
     publish_run_control()
-    channel_user_queue[message.channel.id].clear()
 
-    def release_run():
-        leases = channel_run_leases.get(message.channel.id, [])
-        if not any(candidate is lease for candidate in leases):
+    released = False
+
+    def release_run(status="interrupted"):
+        nonlocal released
+        if released:
             return
-        leases[:] = [candidate for candidate in leases if candidate is not lease]
-        publish_run_control()
+        released = True
+        try:
+            RUN_CATALOG.finish(workspace, status)
+        finally:
+            leases = channel_run_leases.get(message.channel.id, [])
+            leases[:] = [candidate for candidate in leases if candidate is not lease]
+            publish_run_control()
 
     async def send_reply_chunks(text, local_fallback=False):
         if local_fallback:
@@ -1830,7 +2048,7 @@ async def on_message(message: discord.Message):
                 )
                 log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
             finally:
-                release_run()
+                release_run("stopped")
             return
         except StageTimeout as direct_timeout:
             direct_outcome = RunOutcome()
@@ -1851,10 +2069,10 @@ async def on_message(message: discord.Message):
                 )
                 log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
             finally:
-                release_run()
+                release_run("failed")
             return
         except asyncio.CancelledError:
-            release_run()
+            release_run("interrupted")
             raise
         except Exception as direct_error:
             direct_call_failed = True
@@ -1866,8 +2084,14 @@ async def on_message(message: discord.Message):
                     history.append({"role": "assistant", "content": direct_text})
                     log_session_event(session_file, "💬 [간단 답변 완료]", direct_text)
                     print(f"[Direct Reply to {message.author} finished]: {len(direct_text)} chars", flush=True)
-                finally:
-                    release_run()
+                except asyncio.CancelledError:
+                    release_run("interrupted")
+                    raise
+                except Exception:
+                    release_run("failed")
+                    raise
+                else:
+                    release_run("completed")
                 return
             direct_call_failed = True
 
@@ -1876,7 +2100,7 @@ async def on_message(message: discord.Message):
     rolling_summary = channel_summary[message.channel.id]
 
     messages_payload = [
-        {"role": "system", "content": build_system_content(SYSTEM_PROMPT, ledger, rolling_summary)}
+        {"role": "system", "content": build_system_content(workspace, ledger, rolling_summary)}
     ]
     messages_payload.extend(history)
     messages_payload = sanitize_messages_for_chat_template(messages_payload)
@@ -1899,6 +2123,7 @@ async def on_message(message: discord.Message):
         if step_num % ROLLING_COMPACTION_INTERVAL != 0:
             return
         messages_payload, rolling_summary = await rollover_agent_context(
+            workspace,
             messages_payload,
             rolling_summary,
             step_num,
@@ -1942,9 +2167,9 @@ async def on_message(message: discord.Message):
                 break
 
             # [실시간 사용자 동적 개입 주입]
-            if channel_user_queue[message.channel.id]:
-                while channel_user_queue[message.channel.id]:
-                    q_author, q_text = channel_user_queue[message.channel.id].pop(0)
+            if lease["steering"]:
+                while lease["steering"]:
+                    q_author, q_text = lease["steering"].pop(0)
                     steering_block = {
                         "role": "user",
                         "content": f"💬 [사용자({q_author}) 실시간 추가 지침/피드백]:\n{q_text}\n\n(이 지침을 바탕으로 현재 작업 방향을 적절히 조정하거나, 요청받은 내용을 우선 처리하세요.)"
@@ -1968,7 +2193,7 @@ async def on_message(message: discord.Message):
             if messages_payload and _msg_role(messages_payload[0]) == "system":
                 messages_payload[0] = {
                     "role": "system",
-                    "content": build_system_content(SYSTEM_PROMPT, ledger, rolling_summary),
+                    "content": build_system_content(workspace, ledger, rolling_summary),
                 }
 
             compacted_payload = sanitize_messages_for_chat_template(
@@ -2280,7 +2505,11 @@ async def on_message(message: discord.Message):
                 if allowed_calls:
                     try:
                         parallel_results = await execute_tools_in_parallel(
-                            allowed_calls, step_num=iteration+1, ledger=ledger, token=token
+                            workspace,
+                            allowed_calls,
+                            step_num=iteration+1,
+                            ledger=ledger,
+                            token=token,
                         )
                     except (RunCancelled, StageTimeout) as stage_error:
                         settle_stage_failure(stage_error)
@@ -2713,7 +2942,7 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
         finally:
-            release_run()
+            release_run(outcome.reason or "interrupted")
 
 async def main():
     async with bot:

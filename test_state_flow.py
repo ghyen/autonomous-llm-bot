@@ -14,12 +14,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_support import FakeMessage  # sets the required config env before bot imports
+from test_support import FakeMessage, run_catalog_patch  # sets required config env before bot imports
 
 import bot
 from ledger import ResearchLedger
 
 SEED_SUMMARY = "이전 누적 요약: A 경로 가설을 조사 중이며 아직 결론이 없다."
+TEST_WORKSPACE = SimpleNamespace(root="/tmp/run-0123456789abcdef0123456789abcdef")
 
 BASH_RESULT = "\n".join([
     "[stdout]",
@@ -125,7 +126,7 @@ def refuted_ledger():
 class MicroCompactionTest(unittest.TestCase):
     def test_state_block_survives_micro_compaction(self):
         ledger = refuted_ledger()
-        payload = [{"role": "system", "content": bot.build_system_content(bot.SYSTEM_PROMPT, ledger, SEED_SUMMARY)}]
+        payload = [{"role": "system", "content": bot.build_system_content(TEST_WORKSPACE, ledger, SEED_SUMMARY)}]
         for step in range(6):
             payload.append({
                 "role": "assistant",
@@ -170,7 +171,7 @@ class RollupSourceBudgetTest(unittest.TestCase):
 class RolloverValidationTest(unittest.IsolatedAsyncioTestCase):
     def _payload(self):
         ledger = refuted_ledger()
-        payload = [{"role": "system", "content": bot.build_system_content(bot.SYSTEM_PROMPT, ledger, SEED_SUMMARY)}]
+        payload = [{"role": "system", "content": bot.build_system_content(TEST_WORKSPACE, ledger, SEED_SUMMARY)}]
         for step in range(12):
             payload.append({
                 "role": "assistant",
@@ -192,7 +193,7 @@ class RolloverValidationTest(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(bot, "create_streaming_completion", stub):
             rolled, summary = await bot.rollover_agent_context(
-                payload, SEED_SUMMARY, 10, ledger=ledger
+                TEST_WORKSPACE, payload, SEED_SUMMARY, 10, ledger=ledger
             )
 
         # The echoed summary was refused, so the new summary is not the old one.
@@ -210,7 +211,7 @@ class RolloverValidationTest(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(bot, "create_streaming_completion", stub):
             rolled, summary = await bot.rollover_agent_context(
-                payload, already_summarized, 10, ledger=ledger
+                TEST_WORKSPACE, payload, already_summarized, 10, ledger=ledger
             )
 
         self.assertEqual(stub.calls, [])
@@ -257,7 +258,6 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
             bot.channel_reasoning,
             bot.channel_cancel_token,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(self.CHANNEL_ID, None)
@@ -290,7 +290,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
         stub = ModelStub(first_run)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 2), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 2), \
@@ -335,7 +335,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
             })]),
         ])
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "create_streaming_completion", next_run):
             await bot.on_message(FakeMessage("아까 A 경로 가설 다시 보자", self.CHANNEL_ID))
@@ -364,7 +364,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
         stub = ModelStub(responses)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 5), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -400,7 +400,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
         stub = ModelStub(responses)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 5), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -423,7 +423,6 @@ class CheckpointFailureTest(unittest.IsolatedAsyncioTestCase):
             bot.channel_reasoning,
             bot.channel_cancel_token,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(self.CHANNEL_ID, None)
@@ -446,7 +445,7 @@ class CheckpointFailureTest(unittest.IsolatedAsyncioTestCase):
             return await stub(**kwargs)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 2), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \

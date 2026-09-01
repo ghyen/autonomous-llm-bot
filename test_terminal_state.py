@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_support import FakeMessage
+from test_support import FakeMessage, run_catalog_patch
 
 import bot
 import outcome as outcome_mod
@@ -77,7 +77,6 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
             bot.channel_reasoning,
             bot.channel_cancel_token,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(CHANNEL_ID, None)
@@ -106,7 +105,7 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
         message = message if message is not None else FakeMessage(request, CHANNEL_ID)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", max_loops), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", checkpoint_interval), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", compaction_interval), \
@@ -175,7 +174,7 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
         self.assertEqual(self.recorder.reason, outcome_mod.STOPPED)
         self.assertIn("총 1개 도구 실행", self.final_reply)
         self.assertEqual(
-            [call.args[0] for call in self.bash_exec.await_args_list],
+            [call.args[1] for call in self.bash_exec.await_args_list],
             ["probe"],
         )
         self.assertIn("미완료", self.final_reply)
@@ -314,7 +313,7 @@ class DirectAnswerTest(TerminalStateTestCase):
         message = FakeMessage("간단히 답해줘", CHANNEL_ID)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "create_streaming_completion", timed_out), \
                 self.recorder.install():
             await bot.on_message(message)
@@ -341,7 +340,7 @@ class DirectAnswerTest(TerminalStateTestCase):
 
         message = FakeMessage("간단히 답해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 3), \
                 patch.object(bot, "create_streaming_completion", timed_out), \
                 self.recorder.install():
@@ -391,7 +390,7 @@ class FailureTest(TerminalStateTestCase):
 
         message = FakeMessage("조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 3), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -441,7 +440,7 @@ class FailureTest(TerminalStateTestCase):
 
         message = FakeMessage("조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 3), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -489,7 +488,7 @@ class FailureTest(TerminalStateTestCase):
                 _tool_call("c2", "bash_exec", {"command": "block"}),
             ])
 
-        async def tool(command):
+        async def tool(workspace, command):
             if command == "fail":
                 await sibling_started.wait()
                 raise ValueError(failure)
@@ -502,7 +501,7 @@ class FailureTest(TerminalStateTestCase):
         message = FakeMessage("조사해줘", CHANNEL_ID)
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "MAX_AGENT_LOOPS", 3), \
                     patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                     patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
