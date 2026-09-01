@@ -15,7 +15,7 @@ Two rules are enforced structurally rather than by prompt:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 ACTIVE = "active"
 REJECTED = "rejected"
@@ -371,9 +371,14 @@ class ResearchLedger:
     # --- batch entry point used by the record_state tool and checkpoints ---
 
     def apply_updates(self, payload) -> str:
-        """Apply a structured update batch, reporting accepted and refused items."""
+        """Apply a structured update batch and return its human-readable report."""
+        report, _had_refusal = self.apply_updates_with_status(payload)
+        return report
+
+    def apply_updates_with_status(self, payload) -> Tuple[str, bool]:
+        """Apply updates and return the report plus producer-owned refusal status."""
         if not isinstance(payload, dict):
-            return "상태 갱신을 거부했습니다: 객체 형식이 아닙니다."
+            return "상태 갱신을 거부했습니다: 객체 형식이 아닙니다.", True
 
         applied: List[str] = []
         refused: List[str] = []
@@ -448,4 +453,4 @@ class ResearchLedger:
         if not report:
             report.append("반영할 상태 갱신이 없습니다.")
         report.append(self.render() or "(상태 비어 있음)")
-        return "\n\n".join(report)
+        return "\n\n".join(report), bool(refused)
