@@ -14,7 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_bot import FakeMessage  # also sets DISCORD_BOT_TOKEN before bot imports
+from test_support import FakeMessage  # sets the required config env before bot imports
 
 import bot
 from ledger import ResearchLedger
