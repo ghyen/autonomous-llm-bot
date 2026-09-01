@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -172,6 +174,98 @@ class DiagnosticsTest(unittest.TestCase):
         with self.assertRaises(Exception):
             config.discord_token = "changed"
         self.assertIsInstance(config, BotConfig)
+
+
+class DeadlineConfigTest(unittest.TestCase):
+    # Mutation caught: changing any documented deadline default silently changes
+    # operator-visible stop and timeout behavior.
+    def test_defaults_match_the_documented_seconds(self):
+        config = load_config(env=env(), env_file=None)
+        self.assertEqual(
+            (
+                config.connect_timeout,
+                config.idle_timeout,
+                config.model_stage_timeout,
+                config.tool_stage_timeout,
+                config.bash_timeout,
+            ),
+            (15.0, 120.0, 600.0, 120.0, 60.0),
+        )
+
+    def test_overrides_are_applied(self):
+        config = load_config(
+            env=env(
+                LLM_CONNECT_TIMEOUT_SECONDS="5",
+                LLM_IDLE_TIMEOUT_SECONDS="30",
+                MODEL_STAGE_TIMEOUT_SECONDS="90",
+                TOOL_STAGE_TIMEOUT_SECONDS="45",
+                BASH_TIMEOUT_SECONDS="10",
+            ),
+            env_file=None,
+        )
+        self.assertEqual(
+            (
+                config.connect_timeout,
+                config.idle_timeout,
+                config.model_stage_timeout,
+                config.tool_stage_timeout,
+                config.bash_timeout,
+            ),
+            (5.0, 30.0, 90.0, 45.0, 10.0),
+        )
+
+    # Mutation caught: hard-coding 60 seconds in the model-facing tool schema
+    # misstates the actual shell deadline on an overridden deployment.
+    def test_bash_tool_schema_reports_the_configured_timeout(self):
+        child_env = dict(os.environ)
+        child_env.update(MINIMAL_ENV)
+        child_env.update({
+            "BASH_TIMEOUT_SECONDS": "7.5",
+            "DISCORD_ADMIN_USER_IDS": "",
+            "LLM_BASE_URL": "http://127.0.0.1:18080/v1",
+        })
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import bot; print(bot.TOOLS_SCHEMA[0]['function']['description'])",
+            ],
+            cwd=os.path.dirname(__file__),
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("timeout은 7.5초", probe.stdout)
+
+    def test_non_numeric_deadline_fails(self):
+        with self.assertRaises(ConfigError) as caught:
+            load_config(env=env(MODEL_STAGE_TIMEOUT_SECONDS="soon"), env_file=None)
+        self.assertIn("MODEL_STAGE_TIMEOUT_SECONDS", str(caught.exception))
+
+    def test_non_positive_deadline_fails(self):
+        for bad in ("0", "-5"):
+            with self.assertRaises(ConfigError):
+                load_config(env=env(TOOL_STAGE_TIMEOUT_SECONDS=bad), env_file=None)
+
+    # Mutation caught: validating only value <= 0 accepts NaN and infinity,
+    # which cannot provide a meaningful finite stage budget.
+    def test_non_finite_deadline_fails(self):
+        for bad in ("nan", "inf", "-inf"):
+            with self.subTest(value=bad), self.assertRaises(ConfigError):
+                load_config(env=env(MODEL_STAGE_TIMEOUT_SECONDS=bad), env_file=None)
+
+    def test_deadlines_are_part_of_the_fingerprint(self):
+        base = load_config(env=env(), env_file=None)
+        tightened = load_config(env=env(MODEL_STAGE_TIMEOUT_SECONDS="30"), env_file=None)
+        self.assertNotEqual(base.fingerprint(), tightened.fingerprint())
+
+    def test_diagnostics_report_the_deadlines(self):
+        text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))
+        self.assertIn("deadlines(s):", text)
+
 
 
 if __name__ == "__main__":

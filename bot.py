@@ -14,6 +14,7 @@ import sys
 import re
 import json
 import time
+import signal
 import asyncio
 from datetime import datetime
 from collections import defaultdict
@@ -21,12 +22,22 @@ from typing import List, Dict, Any, Optional
 
 import discord
 from discord.ext import commands
+import httpx
 from openai import AsyncOpenAI
 from duckduckgo_search import DDGS
 from types import SimpleNamespace
 
 import authz
 import outcome as outcome_mod
+from deadlines import (
+    CancelToken,
+    RunCancelled,
+    StageBudget,
+    StageTimeout,
+    _reap,
+    stream_chunks,
+    with_deadline,
+)
 from outcome import RunOutcome
 from ledger import ResearchLedger
 from config import ConfigError, load_config, startup_diagnostics
@@ -131,7 +142,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "bash_exec",
-            "description": f"작업 공간({WORKSPACE_DIR}) 내에서 쉘 명령어를 실행합니다. timeout은 60초입니다.",
+            "description": f"작업 공간({WORKSPACE_DIR}) 내에서 쉘 명령어를 실행합니다. timeout은 {CONFIG.bash_timeout:g}초입니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -303,7 +314,12 @@ bot = CustomBot(command_prefix="!", intents=intents)
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
 channel_reasoning = defaultdict(lambda: "high")
-channel_stop_requested = defaultdict(bool)
+# Public control follows the newest active lease when one exists; otherwise it
+# follows the newest pending direct lease. The list restores the surviving
+# caller-owned controller after either overlap completion order and never gates,
+# queues, or delays admission.
+channel_cancel_token = {}
+channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
@@ -346,11 +362,20 @@ def agent_tool_params() -> dict:
     return {"tools": TOOLS_SCHEMA, "tool_choice": "auto"}
 
 
+def request_run_cancel(channel_id, reason=outcome_mod.DETAIL_USER_STOP) -> bool:
+    """Cancel the in-flight run for a channel. False when nothing is running."""
+    token = channel_cancel_token.get(channel_id)
+    if token is None:
+        return False
+    token.cancel(reason)
+    print(f"[Cancel requested] channel={channel_id} reason={reason}", flush=True)
+    return True
+
+
 def clear_channel_state(channel_id) -> None:
     channel_history[channel_id].clear()
     channel_summary[channel_id] = ""
     channel_ledger[channel_id].clear()
-    channel_stop_requested[channel_id] = False
     channel_user_queue[channel_id].clear()
 
 
@@ -365,7 +390,21 @@ KEEP_RECENT_TOOL_MESSAGES = 8
 ROLLING_SUMMARY_SOURCE_MAX_CHARS = 24000
 ROLLING_SUMMARY_MAX_CHARS = 10000
 
-client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=CONFIG.llm_api_key, timeout=None)
+# Transport-level bounds. Application-level stage budgets live in deadlines.py;
+# these stop a request from hanging below the layer those budgets can see.
+client = AsyncOpenAI(
+    base_url=LLM_BASE_URL,
+    api_key=CONFIG.llm_api_key,
+    timeout=httpx.Timeout(
+        CONFIG.model_stage_timeout,
+        connect=CONFIG.connect_timeout,
+        read=CONFIG.idle_timeout,
+    ),
+    max_retries=0,
+)
+# OpenAI initializes this resource lazily; resolve it before the request event
+# loop starts so the first request cannot block cancellation progress.
+client.chat.completions
 
 async def keep_typing_heartbeat(channel, stop_event: asyncio.Event):
     """상시 '입력 중...' 상태를 7초마다 갱신하여 끊김 없이 유지하는 하트비트 루프"""
@@ -413,23 +452,53 @@ async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
 
 # --- Tool Execution Functions ---
 
-async def tool_bash_exec(command: str) -> str:
+async def _terminate_process_tree(proc, process_group_id: int) -> None:
+    """Kill the child's captured process group and reap its direct child.
+
+    `proc.pid` is the process-group id because the shell is spawned with
+    `start_new_session=True`. Capture it at spawn time: once the shell exits,
+    looking the group up through that dead leader is no longer reliable.
+    """
+    if proc is None:
+        return
     try:
-        print(f"[Tool: bash_exec] {command}", flush=True)
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            cwd=WORKSPACE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-        except asyncio.TimeoutError:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        if proc.returncode is None:
             try:
                 proc.kill()
             except Exception:
                 pass
-            return "[Error: Command timed out after 60 seconds]"
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except Exception:
+        pass
+
+async def tool_bash_exec(command: str) -> str:
+    proc = None
+    process_group_id = None
+    try:
+        print(f"[Tool: bash_exec] {command}", flush=True)
+        # start_new_session makes the shell PID the stable process-group id for
+        # descendants, even if the shell exits before its inherited pipes close.
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=WORKSPACE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        process_group_id = proc.pid
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=CONFIG.bash_timeout
+            )
+        except asyncio.TimeoutError:
+            await _terminate_process_tree(proc, process_group_id)
+            return f"[Error: Command timed out after {CONFIG.bash_timeout:g} seconds]"
+        except asyncio.CancelledError:
+            await _terminate_process_tree(proc, process_group_id)
+            raise
 
         out_str = stdout.decode("utf-8", errors="replace")
         err_str = stderr.decode("utf-8", errors="replace")
@@ -476,10 +545,18 @@ async def tool_write_file(path: str, content: str) -> str:
 async def tool_web_search(query: str) -> str:
     try:
         print(f"[Tool: web_search] {query}", flush=True)
+
         def _search():
-            with DDGS() as ddgs:
+            # ponytail: to_thread cannot be interrupted, so the DDGS timeout is
+            # the real bound here. On cancellation the worker thread may outlive
+            # the run briefly; it holds no run state. Upgrade path is a
+            # cancellable HTTP client instead of the blocking DDGS call.
+            with DDGS(timeout=int(CONFIG.tool_stage_timeout)) as ddgs:
                 return list(ddgs.text(query, max_results=5))
-        results = await asyncio.to_thread(_search)
+
+        results = await asyncio.wait_for(
+            asyncio.to_thread(_search), timeout=CONFIG.tool_stage_timeout
+        )
         if not results:
             return (
                 "검색 결과가 없습니다.\n\n"
@@ -511,7 +588,7 @@ async def tool_finish_task(report: str) -> str:
     print(f"[Tool: finish_task Called!]", flush=True)
     return f"[Task Completed Successfully. Final Report Registered ({len(report)} chars)]"
 
-async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1, ledger=None) -> list:
+async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1, ledger=None, token=None) -> list:
     async def _exec_single(tc):
         name = tc["name"]
         args = tc["arguments"]
@@ -536,8 +613,18 @@ async def execute_tools_in_parallel(tool_calls: list, step_num: int = 1, ledger=
         else:
             return f"[Error: Unknown tool function '{name}']"
 
-    tasks = [_exec_single(tc) for tc in tool_calls]
-    return await asyncio.gather(*tasks)
+    if token is not None:
+        token.raise_if_cancelled()
+    tasks = [asyncio.ensure_future(_exec_single(tc)) for tc in tool_calls]
+    try:
+        return await with_deadline(
+            asyncio.gather(*tasks), CONFIG.tool_stage_timeout, token, "tool"
+        )
+    except BaseException:
+        # A completed gather propagates one child failure without cancelling
+        # pending siblings. Reap the tasks this layer owns on every exit.
+        await _reap(*tasks)
+        raise
 
 def extract_tool_calls_from_text(text: str) -> list:
     extracted = []
@@ -749,8 +836,10 @@ def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = 
 
     return messages[:boundary], messages[boundary:]
 
-async def rollover_agent_context(messages: list, existing_summary: str, step_num: int, session_file: str = "", ledger=None):
+async def rollover_agent_context(messages: list, existing_summary: str, step_num: int, session_file: str = "", ledger=None, token=None):
     """Summarize old steps and replace the live payload with a bounded tail."""
+    if token is not None:
+        token.raise_if_cancelled()
     old_messages, recent_messages = split_recent_agent_context(messages)
     if not recent_messages:
         return messages, existing_summary
@@ -795,8 +884,11 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
     )
 
     new_summary = ""
+    validation_notes_prefix = ""
     try:
-        summary_resp = await create_streaming_completion(
+        summary_resp = await run_completion_stage(
+            token=token,
+            stage="rollover",
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": "당신은 자율 에이전트의 정확한 컨텍스트 압축기입니다."},
@@ -808,10 +900,18 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
         )
         new_summary = (summary_resp.choices[0].message.content or "").strip()
         new_summary = re.sub(r"<think>.*?</think>", "", new_summary, flags=re.DOTALL).strip()
+    except RunCancelled:
+        # Cancellation must not silently degrade into a fallback summary.
+        raise
+    except StageTimeout as compaction_timeout:
+        # Rollover is an optimization: the original source is still available,
+        # so a bounded timeout can safely use deterministic local compaction.
+        validation_notes_prefix = str(compaction_timeout)
+        print(f"[Rolling Compaction Timeout at Step {step_num}]: {compaction_timeout}", flush=True)
     except Exception as compaction_error:
         print(f"[Rolling Compaction Summary Error at Step {step_num}]: {compaction_error}", flush=True)
 
-    validation_notes = []
+    validation_notes = [validation_notes_prefix] if validation_notes_prefix else []
     if new_summary and existing_summary and new_summary == existing_summary.strip():
         # The source had new content but the compactor echoed the old summary.
         # Accepting it would freeze the state at its previous revision.
@@ -864,14 +964,52 @@ async def rollover_agent_context(messages: list, existing_summary: str, step_num
 
 # --- User's Streaming Completion Collector ---
 
-async def create_streaming_completion(**kwargs):
-    """Collect a streaming response while keeping long requests alive."""
+async def run_completion_stage(token=None, stage="agent", deadline=None, **kwargs):
+    """Run any completion implementation under the stage's total budget.
+
+    This wrapper deliberately sits at the call-site boundary, outside the
+    streaming implementation. Alternative backends and test doubles therefore
+    cannot accidentally bypass cancellation or the total deadline. A supplied
+    monotonic deadline lets recovery attempts share one stage budget.
+    """
+    from openai import APITimeoutError
+
+    seconds = (
+        CONFIG.model_stage_timeout
+        if deadline is None
+        else max(0.0, deadline - time.monotonic())
+    )
+    try:
+        return await with_deadline(
+            create_streaming_completion(token=token, stage=stage, **kwargs),
+            seconds,
+            token,
+            stage,
+        )
+    except (APITimeoutError, httpx.TimeoutException) as timeout_error:
+        phase_error = getattr(timeout_error, "__cause__", None)
+        if not isinstance(phase_error, httpx.TimeoutException):
+            phase_error = timeout_error
+        if isinstance(phase_error, httpx.ConnectTimeout):
+            phase, phase_seconds = "connect", CONFIG.connect_timeout
+        elif isinstance(phase_error, httpx.ReadTimeout):
+            phase, phase_seconds = "read", CONFIG.idle_timeout
+        else:
+            phase, phase_seconds = "transport", seconds
+        raise StageTimeout(f"{stage}:{phase}", phase_seconds) from timeout_error
+
+
+async def create_streaming_completion(token=None, stage="agent", **kwargs):
+    """Collect a streaming response under transport connect and read-idle bounds."""
+    budget = StageBudget(stage, total=CONFIG.model_stage_timeout, idle=CONFIG.idle_timeout)
+    # HTTPX's phase-specific connect timeout governs DNS/TCP/TLS. Awaiting the
+    # SDK here also includes response headers, which belong to read/total time.
     stream = await client.chat.completions.create(stream=True, **kwargs)
     content_parts = []
     reasoning_parts = []
     tool_buffers = {}
 
-    async for chunk in stream:
+    async for chunk in stream_chunks(stream, budget, token):
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
@@ -992,6 +1130,58 @@ def apply_micro_compaction(messages: list, preserve_recent_tool_steps: int = 2) 
 
     return compressed_messages
 
+DISCORD_CHUNK_MAX_CHARS = 1900
+LOCAL_FALLBACK_MAX_CHUNKS = 3
+LOCAL_FALLBACK_MAX_CHARS = DISCORD_CHUNK_MAX_CHARS * LOCAL_FALLBACK_MAX_CHUNKS
+LOCAL_FALLBACK_OMISSION_MARKER = (
+    "\n\n[중간 상세 내용 생략 — 전체 원장은 내부 상태에 유지됨]\n\n"
+)
+
+
+def bound_local_fallback_output(text: str) -> str:
+    """Bound user-facing fallback without mutating its authoritative sources."""
+    text = str(text or "")
+    if len(text) <= LOCAL_FALLBACK_MAX_CHARS:
+        return text
+    available = LOCAL_FALLBACK_MAX_CHARS - len(LOCAL_FALLBACK_OMISSION_MARKER)
+    head_chars = available // 2
+    tail_chars = available - head_chars
+    return (
+        text[:head_chars]
+        + LOCAL_FALLBACK_OMISSION_MARKER
+        + text[-tail_chars:]
+    )
+
+
+def build_incomplete_report(outcome, ledger, rolling_summary: str, messages_payload: list) -> str:
+    """Render collected state without starting another model stage.
+
+    Cancellation and model-timeout paths cannot safely ask the same backend to
+    synthesize a report: that would start a follow-up stage after stop and can
+    repeat the very hang that ended the run. Keep this deterministic and bounded.
+    """
+    state = ledger.render() if ledger is not None else ""
+    tail = build_rollup_source(messages_payload, max_chars=6000)
+    if outcome.is_completed:
+        closing_section = (
+            "## 결과 안내\n조사는 완료되었습니다. "
+            "위 내용은 완료 시점에 보존된 조사 상태와 실행 기록입니다."
+        )
+    else:
+        closing_section = (
+            "## 다음 단계\n이 보고서는 완료된 조사 결과가 아닙니다. "
+            "미해결 항목을 확인한 뒤 새 요청으로 이어서 진행하세요."
+        )
+    sections = [
+        "## 조사 종료 상태\n- {0}\n- 사유: `{1}`".format(outcome.label, outcome.describe()),
+        "## 권위 있는 조사 상태\n" + (state or "기록된 구조화 상태가 없습니다."),
+        "## 누적 작업 요약\n" + (rolling_summary.strip() if rolling_summary else "누적 요약이 없습니다."),
+        "## 최근 실행 기록\n" + (tail or "보존된 실행 기록이 없습니다."),
+        closing_section,
+    ]
+    return "\n\n".join(sections)
+
+
 def format_full_discord_output(text: str) -> str:
     if not text:
         return ""
@@ -1054,7 +1244,7 @@ async def slash_reset(interaction: discord.Interaction):
     clear_channel_state(interaction.channel_id)
     await interaction.response.send_message("🧹 **대화 기록과 컨텍스트 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
 
-@bot.tree.command(name="stop", description="현재 진행 중인 자율 탐색을 즉시 중단하고 최종 보고서를 합성합니다.")
+@bot.tree.command(name="stop", description="현재 단계를 취소하고 보존된 조사 상태를 보고합니다.")
 async def slash_stop(interaction: discord.Interaction):
     decision = authorize_caller(
         authz.CONTROL, getattr(interaction.user, "id", None), channel_id=interaction.channel_id
@@ -1062,8 +1252,10 @@ async def slash_stop(interaction: discord.Interaction):
     if not decision:
         await deny_interaction(interaction, authz.CONTROL, decision)
         return
-    channel_stop_requested[interaction.channel_id] = True
-    await interaction.response.send_message("🛑 **자율 탐색 중단 요청을 수신했습니다.** 현재까지 수집된 데이터를 바탕으로 즉시 보고서를 작성합니다.", ephemeral=True)
+    if not request_run_cancel(interaction.channel_id):
+        await interaction.response.send_message("진행 중인 자율 탐색이 없습니다.", ephemeral=True)
+        return
+    await interaction.response.send_message("🛑 **중단 요청을 수신했습니다.** 진행 중인 단계를 취소하고 수집된 데이터로 보고서를 작성합니다.", ephemeral=True)
 
 @bot.tree.command(name="clear", description="입력한 개수만큼 최근 메시지와 대화 기록을 한 번에 삭제합니다.")
 async def slash_clear(interaction: discord.Interaction, count: int = 50):
@@ -1150,8 +1342,10 @@ async def on_message(message: discord.Message):
         if not control:
             await message.reply(f"⛔ {control.reason}")
             return
-        channel_stop_requested[message.channel.id] = True
-        await message.reply("🛑 **자율 탐색 중단 요청을 수신했습니다.** 다음 단계에서 즉시 보고서를 종합 작성합니다.")
+        if not request_run_cancel(message.channel.id):
+            await message.reply("진행 중인 자율 탐색이 없습니다.")
+            return
+        await message.reply("🛑 **중단 요청을 수신했습니다.** 진행 중인 단계를 취소하고 수집된 데이터로 보고서를 작성합니다.")
         return
 
     if cmd_name in ["!reset", "!new", "!리셋", "!초기화", "/reset", "/new"]:
@@ -1232,8 +1426,52 @@ async def on_message(message: discord.Message):
         return
 
     start_time = time.time()
-    channel_stop_requested[message.channel.id] = False
+    token = CancelToken()
+    lease = {"token": token, "owner": caller_id, "active": False}
+    channel_run_leases[message.channel.id].append(lease)
+
+    def publish_run_control():
+        leases = channel_run_leases.get(message.channel.id, [])
+        channel_active_runs[message.channel.id] = any(
+            candidate["active"] for candidate in leases
+        )
+        if not leases:
+            channel_run_leases.pop(message.channel.id, None)
+            channel_cancel_token.pop(message.channel.id, None)
+            channel_run_owner.pop(message.channel.id, None)
+            channel_user_queue[message.channel.id].clear()
+            return
+        current = next(
+            (
+                candidate
+                for candidate in reversed(leases)
+                if candidate["active"]
+            ),
+            leases[-1],
+        )
+        channel_cancel_token[message.channel.id] = current["token"]
+        channel_run_owner[message.channel.id] = current["owner"]
+
+    publish_run_control()
     channel_user_queue[message.channel.id].clear()
+
+    def release_run():
+        leases = channel_run_leases.get(message.channel.id, [])
+        if not any(candidate is lease for candidate in leases):
+            return
+        leases[:] = [candidate for candidate in leases if candidate is not lease]
+        publish_run_control()
+
+    async def send_reply_chunks(text, local_fallback=False):
+        if local_fallback:
+            text = bound_local_fallback_output(text)
+        chunks = [
+            text[i:i + DISCORD_CHUNK_MAX_CHARS]
+            for i in range(0, len(text), DISCORD_CHUNK_MAX_CHARS)
+        ]
+        await message.reply(chunks[0])
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
     
     log_session_event(session_file, f"👤 [사용자 목표 요청] {message.author}", content)
     print(f"[Goal Request from {message.author}]: {content}", flush=True)
@@ -1256,27 +1494,72 @@ async def on_message(message: discord.Message):
     direct_call_failed = False
     if wants_direct_response(content):
         try:
-            direct_resp = await create_streaming_completion(
+            direct_resp = await run_completion_stage(
+                token=token,
+                stage="direct",
                 model=MODEL_NAME,
                 messages=[{"role": "system", "content": DIRECT_RESPONSE_PROMPT}, *history],
                 max_tokens=512,
                 temperature=0.3,
                 reasoning_effort="none",
             )
+            token.raise_if_cancelled()
             direct_text = direct_resp.choices[0].message.content or ""
             direct_text = clean_direct_response(direct_text)
+        except RunCancelled as direct_cancelled:
+            direct_outcome = RunOutcome()
+            direct_outcome.settle(outcome_mod.STOPPED, direct_cancelled.reason)
+            direct_report = build_incomplete_report(
+                direct_outcome,
+                channel_ledger[message.channel.id],
+                channel_summary[message.channel.id],
+                history,
+            )
+            try:
+                await send_reply_chunks(
+                    f"**{direct_outcome.label}**\n\n{direct_report}",
+                    local_fallback=True,
+                )
+                log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
+            finally:
+                release_run()
+            return
+        except StageTimeout as direct_timeout:
+            direct_outcome = RunOutcome()
+            direct_outcome.settle(
+                outcome_mod.FAILED,
+                f"마감 초과: {direct_timeout.stage} {direct_timeout.seconds:g}s",
+            )
+            direct_report = build_incomplete_report(
+                direct_outcome,
+                channel_ledger[message.channel.id],
+                channel_summary[message.channel.id],
+                history,
+            )
+            try:
+                await send_reply_chunks(
+                    f"**{direct_outcome.label}**\n\n{direct_report}",
+                    local_fallback=True,
+                )
+                log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
+            finally:
+                release_run()
+            return
+        except asyncio.CancelledError:
+            release_run()
+            raise
         except Exception as direct_error:
             direct_call_failed = True
             print(f"[Direct Reply Fallback]: {direct_error}", file=sys.stderr, flush=True)
         else:
             if direct_text:
-                direct_chunks = [direct_text[i:i + 1900] for i in range(0, len(direct_text), 1900)]
-                await message.reply(direct_chunks[0])
-                for direct_chunk in direct_chunks[1:]:
-                    await message.channel.send(direct_chunk)
-                history.append({"role": "assistant", "content": direct_text})
-                log_session_event(session_file, "💬 [간단 답변 완료]", direct_text)
-                print(f"[Direct Reply to {message.author} finished]: {len(direct_text)} chars", flush=True)
+                try:
+                    await send_reply_chunks(direct_text)
+                    history.append({"role": "assistant", "content": direct_text})
+                    log_session_event(session_file, "💬 [간단 답변 완료]", direct_text)
+                    print(f"[Direct Reply to {message.author} finished]: {len(direct_text)} chars", flush=True)
+                finally:
+                    release_run()
                 return
             direct_call_failed = True
 
@@ -1291,7 +1574,13 @@ async def on_message(message: discord.Message):
     messages_payload = sanitize_messages_for_chat_template(messages_payload)
 
     current_effort = channel_reasoning[message.channel.id]
-    status_msg = await message.reply(f"🚀 **[완전자율 목표 달성 모드]** 모델 초기 추론 및 작업 공간 가동 중... (실시간 지시/개입 가능 / 중단: `!stop`)")
+    try:
+        status_msg = await message.reply(f"🚀 **[완전자율 목표 달성 모드]** 모델 초기 추론 및 작업 공간 가동 중... (실시간 지시/개입 가능 / 중단: `!stop`)")
+    except BaseException:
+        release_run()
+        raise
+    lease["active"] = True
+    publish_run_control()
 
     total_tools_executed = 0
     executed_call_signatures = []
@@ -1306,22 +1595,40 @@ async def on_message(message: discord.Message):
             step_num,
             session_file=session_file,
             ledger=ledger,
+            token=token,
         )
 
     # 상시 타이핑 하트비트 루프 백그라운드 구동
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing_heartbeat(message.channel, stop_typing))
-    channel_active_runs[message.channel.id] = True
-    channel_run_owner[message.channel.id] = caller_id
+
+    final_raw = ""
+    outcome = RunOutcome()
+    refused_companion_calls = []
+    consecutive_no_tool_responses = 0
+
+    def settle_stage_failure(error):
+        if isinstance(error, RunCancelled):
+            outcome.settle(outcome_mod.STOPPED, error.reason)
+        elif isinstance(error, StageTimeout):
+            outcome.settle(
+                outcome_mod.FAILED,
+                f"마감 초과: {error.stage} {error.seconds:g}s",
+            )
+        else:
+            failure = _clip_summary_text(
+                f"{type(error).__name__}: {error}", 500
+            )
+            outcome.settle(
+                outcome_mod.FAILED,
+                f"업스트림 실패: {failure}",
+            )
+        print(f"[Run settled: {outcome.describe()}]", flush=True)
 
     try:
-        final_raw = ""
-        outcome = RunOutcome()
-        refused_companion_calls = []
-        consecutive_no_tool_responses = 0
         for iteration in range(MAX_AGENT_LOOPS):
-            if channel_stop_requested[message.channel.id]:
-                outcome.settle(outcome_mod.STOPPED, outcome_mod.DETAIL_USER_STOP)
+            if token.cancelled:
+                outcome.settle(outcome_mod.STOPPED, token.reason)
                 print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 break
 
@@ -1356,9 +1663,13 @@ async def on_message(message: discord.Message):
                 }
 
             compacted_payload = sanitize_messages_for_chat_template(apply_micro_compaction(messages_payload, preserve_recent_tool_steps=2))
+            model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
 
             try:
-                resp = await create_streaming_completion(
+                resp = await run_completion_stage(
+                    token=token,
+                    stage="agent",
+                    deadline=model_stage_deadline,
                     model=MODEL_NAME,
                     messages=compacted_payload,
                     max_tokens=1024 if iteration == 0 else 4096,
@@ -1366,6 +1677,9 @@ async def on_message(message: discord.Message):
                     **agent_tool_params(),
                     **extra_params
                 )
+            except (RunCancelled, StageTimeout) as stage_error:
+                settle_stage_failure(stage_error)
+                break
             except Exception as api_err:
                 err_str = str(api_err)
                 if "tool_call_id" in err_str or "400" in err_str:
@@ -1385,24 +1699,44 @@ async def on_message(message: discord.Message):
                         else:
                             sanitized_payload.append(p_msg)
 
-                    resp = await create_streaming_completion(
-                        model=MODEL_NAME,
-                        messages=sanitize_messages_for_chat_template(sanitized_payload),
-                        max_tokens=1024 if iteration == 0 else 4096,
-                        temperature=0.7,
-                        **agent_tool_params(),
-                        **extra_params
-                    )
+                    # Never restart a stage after cancellation.
+                    try:
+                        token.raise_if_cancelled()
+                        resp = await run_completion_stage(
+                            token=token,
+                            stage="agent:retry",
+                            deadline=model_stage_deadline,
+                            model=MODEL_NAME,
+                            messages=sanitize_messages_for_chat_template(sanitized_payload),
+                            max_tokens=1024 if iteration == 0 else 4096,
+                            temperature=0.7,
+                            **agent_tool_params(),
+                            **extra_params
+                        )
+                    except (RunCancelled, StageTimeout) as stage_error:
+                        settle_stage_failure(stage_error)
+                        break
+                    except Exception as retry_error:
+                        settle_stage_failure(retry_error)
+                        break
                 else:
-                    raise api_err
+                    settle_stage_failure(api_err)
+                    break
 
+            # A response completed concurrently with !stop must not enable
+            # logging, counters, messages, or tool work after cancellation.
+            try:
+                token.raise_if_cancelled()
+            except RunCancelled as stage_error:
+                settle_stage_failure(stage_error)
+                break
             choice = resp.choices[0]
             msg = choice.message
-            
+
             # [Rapid-MLX / OpenAI Reasoning 필드 추출]
             reasoning_text = (getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) or "")
             content_text = msg.content or ""
-            
+
             if reasoning_text and content_text:
                 full_raw_thought = f"<think>\n{reasoning_text}\n</think>\n\n{content_text}".strip()
             elif reasoning_text:
@@ -1442,6 +1776,14 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
+            # Discord I/O above can yield to !stop after the model-stage check.
+            # Cancellation must win before any terminal decision or dispatch.
+            try:
+                token.raise_if_cancelled()
+            except RunCancelled as stage_error:
+                settle_stage_failure(stage_error)
+                break
+
             tool_calls_to_run = []
             if msg.tool_calls:
                 for tc in msg.tool_calls:
@@ -1454,7 +1796,7 @@ async def on_message(message: discord.Message):
                         "name": tc.function.name,
                         "arguments": args
                     })
-            
+
             if not tool_calls_to_run and content_text:
                 extracted = extract_tool_calls_from_text(content_text)
                 for i, e in enumerate(extracted):
@@ -1492,8 +1834,6 @@ async def on_message(message: discord.Message):
                 break
 
             if tool_calls_to_run:
-                total_tools_executed += len(tool_calls_to_run)
-
                 synthetic_tool_calls = [
                     {
                         "id": tc["id"],
@@ -1505,18 +1845,14 @@ async def on_message(message: discord.Message):
                     }
                     for tc in tool_calls_to_run
                 ]
-                messages_payload.append({
-                    "role": "assistant",
-                    "content": content_text or None,
-                    "tool_calls": synthetic_tool_calls
-                })
 
                 elapsed_live = format_elapsed_time(time.time() - start_time)
                 tools_display = ", ".join([f"`{tc['name']}`" for tc in tool_calls_to_run[:3]])
                 last_th_line = display_thought.splitlines()[-1][:80] if display_thought else "도구 실행 준비"
+                prospective_tool_total = total_tools_executed + len(tool_calls_to_run)
                 tool_live_text = (
                     f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
-                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 총 도구: `{total_tools_executed}개`)\n"
+                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 총 도구: `{prospective_tool_total}개`)\n"
                     f"> 🛠️ **실행 도구**: {tools_display}\n"
                     f"> 💭 **최근 판단**: `{last_th_line}`\n"
                     f"> ⚡ *터미널 및 네트워크 I/O 실행 중... (실시간 지시 가능 / 중단: `!stop`)*"
@@ -1526,11 +1862,32 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
+                try:
+                    token.raise_if_cancelled()
+                except RunCancelled as stage_error:
+                    settle_stage_failure(stage_error)
+                    break
+
+                total_tools_executed = prospective_tool_total
+                messages_payload.append({
+                    "role": "assistant",
+                    "content": content_text or None,
+                    "tool_calls": synthetic_tool_calls
+                })
                 for tc in tool_calls_to_run:
                     print(f"Executing tool {tc['name']} with args {tc['arguments']}", flush=True)
                     log_session_event(session_file, f"🛠️ [Step {iteration+1} 도구 호출] {tc['name']}", json.dumps(tc['arguments'], ensure_ascii=False, indent=2))
 
-                parallel_results = await execute_tools_in_parallel(tool_calls_to_run, step_num=iteration+1, ledger=ledger)
+                try:
+                    parallel_results = await execute_tools_in_parallel(
+                        tool_calls_to_run, step_num=iteration+1, ledger=ledger, token=token
+                    )
+                except (RunCancelled, StageTimeout) as stage_error:
+                    settle_stage_failure(stage_error)
+                    break
+                except Exception as tool_error:
+                    settle_stage_failure(tool_error)
+                    break
 
                 for tc, tool_result in zip(tool_calls_to_run, parallel_results):
                     sig = (tc["name"], json.dumps(tc["arguments"], sort_keys=True))
@@ -1552,7 +1909,7 @@ async def on_message(message: discord.Message):
                     })
 
                 # [옵션 B: 매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
-                if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not channel_stop_requested[message.channel.id]:
+                if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
                     print(f"[Checkpoint {checkpoint_num} Reached at Step {iteration+1} - Generating Intermediate Report]", flush=True)
                     try:
@@ -1587,7 +1944,9 @@ async def on_message(message: discord.Message):
                     checkpoint_ok = False
                     inter_text = ""
                     try:
-                        inter_resp = await create_streaming_completion(
+                        inter_resp = await run_completion_stage(
+                            token=token,
+                            stage="checkpoint",
                             model=MODEL_NAME,
                             messages=inter_payload,
                             max_tokens=2048,
@@ -1637,6 +1996,9 @@ async def on_message(message: discord.Message):
                         log_session_event(session_file, f"📊 [Step {iteration+1} 중간 진행 보고서 제출 & 자동 연장]", inter_text)
                         checkpoint_ok = True
 
+                    except (RunCancelled, StageTimeout) as stage_error:
+                        settle_stage_failure(stage_error)
+                        break
                     except Exception as cp_err:
                         print(f"[Intermediate Report Synthesis Error]: {cp_err}", flush=True)
                         log_session_event(session_file, f"⚠️ [Step {iteration+1} 중간 보고서 실패]", str(cp_err))
@@ -1671,21 +2033,31 @@ async def on_message(message: discord.Message):
 
                 # 마지막 스텝이면 여기서 소진으로 확정한다. 불필요한 롤오버를
                 # 한 번 더 돌리고 나서 루프 경계로 조용히 끝나지 않도록.
+                if token.cancelled:
+                    outcome.settle(outcome_mod.STOPPED, token.reason)
+                    print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
+                    break
                 if iteration + 1 >= MAX_AGENT_LOOPS:
                     outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
                     print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                     break
-                if channel_stop_requested[message.channel.id]:
-                    outcome.settle(outcome_mod.STOPPED, outcome_mod.DETAIL_USER_STOP)
-                    print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
-                    break
 
-                await maybe_roll_context(iteration + 1)
+                try:
+                    await maybe_roll_context(iteration + 1)
+                except (RunCancelled, StageTimeout) as stage_error:
+                    settle_stage_failure(stage_error)
+                    break
                 continue
 
             # [도구 호출 없는 응답] 완료 의사는 문구로 추정하지 않는다.
             # finish_task만이 완료 신호이며, 여기서는 그것을 요구하고 계속 진행한다.
             consecutive_no_tool_responses += 1
+            if token.cancelled:
+                outcome.settle(outcome_mod.STOPPED, token.reason)
+                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
+                final_raw = full_raw_thought or content_text
+                break
+
             if consecutive_no_tool_responses >= MAX_NO_TOOL_RESPONSES:
                 outcome.settle(
                     outcome_mod.EXHAUSTED,
@@ -1697,12 +2069,6 @@ async def on_message(message: discord.Message):
 
             if iteration + 1 >= MAX_AGENT_LOOPS:
                 outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
-                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
-                final_raw = full_raw_thought or content_text
-                break
-
-            if channel_stop_requested[message.channel.id]:
-                outcome.settle(outcome_mod.STOPPED, outcome_mod.DETAIL_USER_STOP)
                 print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 final_raw = full_raw_thought or content_text
                 break
@@ -1726,7 +2092,11 @@ async def on_message(message: discord.Message):
                 await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 루프 가속 진행 중... ▌")
             except Exception:
                 pass
-            await maybe_roll_context(iteration + 1)
+            try:
+                await maybe_roll_context(iteration + 1)
+            except (RunCancelled, StageTimeout) as stage_error:
+                settle_stage_failure(stage_error)
+                break
             continue
 
         # 루프가 break 없이 끝나는 경로도 사유 없이 남지 않게 한다.
@@ -1734,9 +2104,18 @@ async def on_message(message: discord.Message):
 
         cleaned_check = re.sub(r"<think>.*?</think>|</?(function|parameter|tool_call)[^>]*>", "", final_raw, flags=re.DOTALL).strip()
 
-        # [핵심 결론 보장] 합성 여부는 길이 추정이 아니라 종료 사유로 결정한다.
-        # 완료가 아니면 부분 보고서를 합성하고, 완료인데 본문이 없으면 합성한다.
-        needs_synthesis = (not outcome.is_completed) or (not cleaned_check)
+        # 합성 여부는 길이 추정이 아니라 종료 사유로 결정한다.
+        # 취소와 마감 실패는 후속 모델 단계를 시작하지 않는다. 같은 백엔드가
+        # 멈춰 있을 수 있으므로 보존된 상태로 결정적 중간 보고서를 만든다.
+        no_follow_up_stage = outcome.reason in (outcome_mod.STOPPED, outcome_mod.FAILED)
+        uses_local_fallback = no_follow_up_stage
+        if no_follow_up_stage:
+            final_raw = build_incomplete_report(outcome, ledger, rolling_summary, messages_payload)
+            needs_synthesis = False
+        else:
+            # EXHAUSTED는 정상적으로 응답한 모델이 스텝/정체 예산만 소진한 경우라
+            # 한 번의 bounded synthesis가 유용하다. 완료인데 본문이 없을 때도 합성한다.
+            needs_synthesis = (not outcome.is_completed) or (not cleaned_check)
         if outcome.detail == outcome_mod.DETAIL_DIRECT_ANSWER:
             needs_synthesis = False
 
@@ -1780,15 +2159,54 @@ async def on_message(message: discord.Message):
                 {"role": "system", "content": final_report_prompt},
                 {"role": "user", "content": f"{synth_context}\n\n위 결과를 바탕으로 보고서를 마크다운으로 상세히 작성해 주세요."}
             ]
-            synth_resp = await create_streaming_completion(
-                model=MODEL_NAME,
-                messages=synthesis_payload,
-                max_tokens=4096,
-                temperature=0.4,
-                reasoning_effort="none"
-            )
-            final_raw = synth_resp.choices[0].message.content or ""
-            log_session_event(session_file, f"📝 [보고서 합성 - {outcome.describe()}]", final_raw)
+            try:
+                synth_resp = await run_completion_stage(
+                    token=token,
+                    stage="synthesis",
+                    model=MODEL_NAME,
+                    messages=synthesis_payload,
+                    max_tokens=4096,
+                    temperature=0.4,
+                    reasoning_effort="none"
+                )
+                final_raw = synth_resp.choices[0].message.content or ""
+                log_session_event(session_file, f"📝 [보고서 합성 - {outcome.describe()}]", final_raw)
+            except RunCancelled as synthesis_cancelled:
+                uses_local_fallback = True
+                final_raw = build_incomplete_report(
+                    outcome, ledger, rolling_summary, messages_payload
+                )
+                final_raw += (
+                    "\n\n> 보고서 합성 취소: `"
+                    + synthesis_cancelled.reason
+                    + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
+                )
+                log_session_event(session_file, "🛑 [보고서 합성 취소]", final_raw)
+            except StageTimeout as synthesis_timeout:
+                uses_local_fallback = True
+                final_raw = build_incomplete_report(
+                    outcome, ledger, rolling_summary, messages_payload
+                )
+                final_raw += (
+                    "\n\n> 보고서 합성 마감 초과: `"
+                    + str(synthesis_timeout)
+                    + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
+                )
+                log_session_event(session_file, "⏱️ [보고서 합성 마감 초과]", final_raw)
+            except Exception as synthesis_error:
+                uses_local_fallback = True
+                final_raw = build_incomplete_report(
+                    outcome, ledger, rolling_summary, messages_payload
+                )
+                failure = _clip_summary_text(
+                    f"{type(synthesis_error).__name__}: {synthesis_error}", 500
+                )
+                final_raw += (
+                    "\n\n> 보고서 합성 업스트림 실패: `"
+                    + failure
+                    + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
+                )
+                log_session_event(session_file, "⚠️ [보고서 합성 업스트림 실패]", final_raw)
 
         final_text = format_full_discord_output(final_raw)
         if not final_text:
@@ -1826,17 +2244,24 @@ async def on_message(message: discord.Message):
             header_text = "" if outcome.is_completed else f"**{outcome.label}**\n\n"
             final_text_with_footer = header_text + final_text + footer_text
 
-        chunks = []
-        remaining = final_text_with_footer
-        while remaining:
-            if len(remaining) <= 1900:
-                chunks.append(remaining)
-                break
-            split_idx = remaining.rfind("\n", 0, 1900)
-            if split_idx == -1 or split_idx < 1000:
-                split_idx = 1900
-            chunks.append(remaining[:split_idx])
-            remaining = remaining[split_idx:].lstrip("\n")
+        if uses_local_fallback:
+            final_text_with_footer = bound_local_fallback_output(final_text_with_footer)
+            chunks = [
+                final_text_with_footer[i:i + DISCORD_CHUNK_MAX_CHARS]
+                for i in range(0, len(final_text_with_footer), DISCORD_CHUNK_MAX_CHARS)
+            ]
+        else:
+            chunks = []
+            remaining = final_text_with_footer
+            while remaining:
+                if len(remaining) <= DISCORD_CHUNK_MAX_CHARS:
+                    chunks.append(remaining)
+                    break
+                split_idx = remaining.rfind("\n", 0, DISCORD_CHUNK_MAX_CHARS)
+                if split_idx == -1 or split_idx < 1000:
+                    split_idx = DISCORD_CHUNK_MAX_CHARS
+                chunks.append(remaining[:split_idx])
+                remaining = remaining[split_idx:].lstrip("\n")
 
         try:
             await status_msg.delete()
@@ -1873,9 +2298,8 @@ async def on_message(message: discord.Message):
             await typing_task
         except Exception:
             pass
-        channel_active_runs[message.channel.id] = False
-        channel_run_owner.pop(message.channel.id, None)
-        channel_user_queue[message.channel.id].clear()
+        finally:
+            release_run()
 
 async def main():
     async with bot:
