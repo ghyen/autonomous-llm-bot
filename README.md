@@ -10,13 +10,14 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 
 - 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 250 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
 - 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, checkpoint, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves.
-- 🔄 **Rolling Context Compaction (Rollup Architecture)**: Every 10 steps, old execution history is dynamically rolled up and summarized by the LLM, keeping context bounded and preventing out-of-memory context blowups. The rollup budget is spent newest-first, and a summary that drops state markers or echoes the previous one is rejected or corrected.
+- 🏛️ **Hierarchical Trajectory Compaction**: Maintains a 3-tier memory structure across 10-step rollover intervals: (1) Long-term Milestone Index (`## 🏛️ 장기 마일스톤 색인`), (2) Recent Phase Detailed Summary (`## 🔍 직전 구간 상세 요약`), and (3) Discovered Artifacts Index (`## 📁 핵심 발견 및 산출물 색인`). Bounded newest-first budgeting ensures historical decisions and refuted hypotheses remain indexed without blowing up the context window.
+- 🧩 **Workspace Skills & Reusable Tooling**: Dedicated `skills/` workspace directory where the agent can create and persist reusable Python (`.py`) and Shell (`.sh`) scripts via `write_file` and execute them via `bash_exec`. Registered skills are dynamically auto-discovered and rendered into the system prompt with docstrings and usage instructions.
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
 - 🛠️ **Built-in Power Tools**:
   - `bash_exec`: Run arbitrary shell commands (curl, python3, grep, jq, etc.) in a sandbox workspace with output auto-truncation.
   - `read_file`: Inspect local files with line truncation.
-  - `write_file`: Create and modify files in the workspace.
+  - `write_file`: Create and modify files in the workspace (including reusable scripts in `skills/`).
   - `web_search`: Live DuckDuckGo search.
   - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
