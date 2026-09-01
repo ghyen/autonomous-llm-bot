@@ -14,7 +14,7 @@ Two rules are enforced structurally rather than by prompt:
   conclusion marked valid after its premise moved.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 ACTIVE = "active"
@@ -42,6 +42,14 @@ _NOTE_CHARS = 120
 
 class LedgerRefusal(Exception):
     """Raised when an update would violate the state transition rules."""
+
+
+def _required_list(payload, key):
+    """A missing or non-list section is a shape mismatch, not an empty one."""
+    value = payload[key]
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise TypeError("{0} is not a list of objects".format(key))
+    return value
 
 
 def _clip(text, max_chars: int) -> str:
@@ -285,6 +293,67 @@ class ResearchLedger:
 
     def clear(self) -> None:
         self.__init__()
+
+    # --- durable state (issue #6) ---
+
+    def to_dict(self) -> dict:
+        """Serializable form of the whole ledger.
+
+        Conclusion validity is *derived*, so nothing about it is written: the
+        pinned premise revisions plus the hypotheses' own revisions reproduce it
+        exactly, and no restored ledger can claim a validity it cannot derive.
+        """
+        return {
+            "goal": self.goal,
+            "revision": self.revision,
+            "evidence": [asdict(item) for item in self._evidence.values()],
+            "hypotheses": [asdict(item) for item in self._hypotheses.values()],
+            "conclusions": [asdict(item) for item in self._conclusions.values()],
+        }
+
+    @classmethod
+    def from_dict(cls, payload) -> "ResearchLedger":
+        """Rebuild from `to_dict` output.
+
+        A payload that does not match raises. The ledger decides which
+        hypotheses are still true, so a half-read one is discarded by the
+        caller, never migrated into a shape this code did not write.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("원장 스냅샷이 객체가 아닙니다.")
+        revision = payload.get("revision")
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise ValueError("원장 리비전이 0 이상의 정수가 아닙니다.")
+
+        ledger = cls()
+        ledger.goal = str(payload.get("goal") or "")
+        ledger.revision = revision
+        try:
+            for item in _required_list(payload, "evidence"):
+                evidence = Evidence(**item)
+                ledger._evidence[evidence.id] = evidence
+            for item in _required_list(payload, "hypotheses"):
+                item = dict(item)
+                transitions = item.pop("transitions", [])
+                if not isinstance(transitions, list):
+                    raise TypeError("transitions is not a list")
+                hypothesis = Hypothesis(
+                    transitions=[Transition(**entry) for entry in transitions], **item
+                )
+                ledger._hypotheses[hypothesis.id] = hypothesis
+            for item in _required_list(payload, "conclusions"):
+                item = dict(item)
+                premises = item.pop("premises", {})
+                if not isinstance(premises, dict):
+                    raise TypeError("premises is not an object")
+                conclusion = Conclusion(
+                    premises={str(key): int(value) for key, value in premises.items()},
+                    **item,
+                )
+                ledger._conclusions[conclusion.id] = conclusion
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            raise ValueError("원장 스냅샷 형식이 맞지 않습니다: {0}".format(error))
+        return ledger
 
     # --- rendering ---
 
