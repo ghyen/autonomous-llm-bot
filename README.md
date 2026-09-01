@@ -120,6 +120,10 @@ LLM_IDLE_TIMEOUT_SECONDS=120
 MODEL_STAGE_TIMEOUT_SECONDS=600
 TOOL_STAGE_TIMEOUT_SECONDS=120
 BASH_TIMEOUT_SECONDS=60
+LOG_MAX_BYTES=1048576
+LOG_RETENTION_DAYS=14
+LOG_CONTENT_DEBUG=false
+LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 ```
 
 The wait budgets are separate: connection establishment is 15 seconds, the
@@ -137,18 +141,45 @@ Startup fails, loudly, when:
   `BOT_TOOLS_ENABLED=false` to run a tool-free bot without an allowlist.
 - Any ID list contains a non-numeric entry.
 - Any timeout is not a finite number greater than zero.
+- `LOG_MAX_BYTES` is not a whole number greater than zero.
+- `LOG_RETENTION_DAYS` or `LOG_CONTENT_DEBUG_RETENTION_HOURS` is not a finite
+  number greater than zero.
 - `DISCORD_ADMIN_USER_IDS` names someone outside `DISCORD_ALLOWED_USER_IDS`.
 - `LLM_BASE_URL` is non-local without `LLM_ALLOW_REMOTE=true`. Conversation
   content and tool results would leave the machine.
 
-See `.env.example` for the full set. On startup the bot prints a secret-free
-diagnostic block including a fingerprint of the effective policy.
+See `.env.example` for the full set. On startup the bot writes a secret-free
+`startup` record carrying the running commit, dependency versions, and every
+effective policy line.
 
 ### 4. Running the Bot
 
 ```bash
 python bot.py
 ```
+
+---
+
+## 🔒 Log Hygiene and Retention
+
+Every log line and every console line is one JSON object carrying `ts`, `rev`
+(running commit), `pid`, `run`, `step`, and `kind`. The default sink stores
+**metadata only**: event kind, tool name, status, duration, and sizes. Raw
+reasoning, tool arguments, tool results, and user text have no route into it,
+and raw reasoning is not sent to Discord either — progress is reported as a
+bounded status line instead.
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `LOG_MAX_BYTES` | `1048576` | A run log rotates to `<run-id>.1.jsonl` past this size. One previous generation is kept. |
+| `LOG_RETENTION_DAYS` | `14` | Startup deletes run logs and inactive run workspaces older than this. |
+| `LOG_CONTENT_DEBUG` | `false` | Turning this on writes raw reasoning, tool arguments, and tool results to `SYSTEM_LOG_DIR/content-debug/<run-id>.jsonl`. |
+| `LOG_CONTENT_DEBUG_RETENTION_HOURS` | `24` | Retention for that content sink — hours, not days. |
+
+Directories are `0700` and files are `0600` regardless of the umask, and paths
+that predate this are corrected in place. `LOG_CONTENT_DEBUG` is the one setting
+that puts content back on disk, so it is deny-by-default and its state is printed
+in the startup diagnostics.
 
 ---
 
@@ -211,7 +242,7 @@ surface.
 fresh opaque run:
 
 - Workspace: `WORKSPACE_DIR/runs/<random-run-id>/`
-- Log: `SYSTEM_LOG_DIR/runs/<random-run-id>.md`
+- Log: `SYSTEM_LOG_DIR/runs/<random-run-id>.jsonl`
 - Metadata: atomic `run.json` containing owner, channel, lifecycle status, and
   timestamps. Startup changes stale `active` metadata to resumable
   `interrupted`; legacy root files are not migrated or used as a fallback.
@@ -222,7 +253,8 @@ direct-answer fallback into autonomous mode keeps the same run. Cleanup persists
 workspace bytes. `!new`/`!reset` prepare a blank run and keep old bytes; `!stop`
 retains the stopped run; `!resume <run-id>` selects an exact inactive owned run
 with an empty read cache; and `!delete <run-id>` removes an inactive owned
-workspace and log. `!clear` purges Discord first and performs the same reset only
+workspace and log, including rotated log generations. `!clear` purges Discord
+first and performs the same reset only
 on success. A selected run is consumed once, and one run cannot be active twice.
 There is no list/share surface, and admin control authority is not workspace
 read/delete authority: cross-owner IDs return `run not found`.
