@@ -38,6 +38,7 @@ class FakeChannel:
     def __init__(self, channel_id, manage_messages=False, purge_error=None):
         self.id = channel_id
         self.sent = []
+        self.sent_messages = []
         self.purge_calls = 0
         self.manage_messages = manage_messages
         self.purge_error = purge_error
@@ -47,7 +48,11 @@ class FakeChannel:
 
     async def send(self, content):
         self.sent.append(content)
-        return FakeSentMessage()
+        handle = FakeSentMessage()
+        # Retained so tests can read what was later edited into a status message,
+        # such as the error text written when the final reply cannot be delivered.
+        self.sent_messages.append(handle)
+        return handle
 
     def permissions_for(self, user):
         return SimpleNamespace(manage_messages=self.manage_messages)
@@ -79,11 +84,68 @@ class FakeMessage:
         self.author = author or FakeAuthor()
         self.mentions = []
         self.replies = []
+        self.reply_handles = []
         self.reactions = []
 
     async def reply(self, content):
         self.replies.append(content)
-        return FakeSentMessage()
+        handle = FakeSentMessage()
+        # The first reply is the status message the run later edits, so tests need
+        # the handle and not just the text that was originally sent.
+        self.reply_handles.append(handle)
+        return handle
 
     async def add_reaction(self, emoji):
         self.reactions.append(emoji)
+
+
+
+class FakeInteractionResponse:
+    def __init__(self):
+        self.messages = []
+        self.deferred = False
+
+    async def send_message(self, content, ephemeral=False):
+        self.messages.append(content)
+
+    async def defer(self, ephemeral=False):
+        self.deferred = True
+
+
+class FakeFollowup:
+    def __init__(self):
+        self.messages = []
+
+    async def send(self, content, ephemeral=False):
+        self.messages.append(content)
+
+
+class FakeInteraction:
+    """Double for the slash command path.
+
+    Slash commands never looked at `interaction.user`, so they need coverage that
+    is independent of the text command path. `permissions` is the caller's own
+    channel permission, which is what a purge has to be judged on - not the
+    bot's.
+    """
+
+    def __init__(
+        self,
+        channel_id,
+        user_id=TEST_USER_ID,
+        manage_messages=False,
+        purge_error=None,
+    ):
+        self.channel_id = channel_id
+        self.user = FakeAuthor(user_id)
+        self.channel = FakeChannel(
+            channel_id, manage_messages=manage_messages, purge_error=purge_error
+        )
+        self.permissions = SimpleNamespace(manage_messages=manage_messages)
+        self.response = FakeInteractionResponse()
+        self.followup = FakeFollowup()
+
+    @property
+    def replies(self):
+        """Everything the caller was told, whichever channel it arrived on."""
+        return self.response.messages + self.followup.messages

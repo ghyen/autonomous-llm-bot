@@ -84,7 +84,7 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def run_agent(self, responses, request="시스템 상태를 조사해줘", max_loops=6,
                         checkpoint_interval=99, compaction_interval=99, stop_after=None,
-                        tool_result="[stdout]\nok\n[exit code: 0]"):
+                        tool_result="[stdout]\nok\n[exit code: 0]", message=None):
         """Drive on_message with scripted model responses."""
         script = list(responses)
         calls = {"count": 0}
@@ -103,7 +103,7 @@ class TerminalStateTestCase(unittest.IsolatedAsyncioTestCase):
         self.synthesis_calls = []
         # Kept on self so assertions still reach it after the patch is undone.
         self.bash_exec = AsyncMock(return_value=tool_result)
-        message = FakeMessage(request, CHANNEL_ID)
+        message = message if message is not None else FakeMessage(request, CHANNEL_ID)
 
         with tempfile.TemporaryDirectory() as log_dir, \
                 patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
@@ -531,6 +531,42 @@ class FailureTest(TerminalStateTestCase):
         self.assertLessEqual(sum(len(chunk) for chunk in chunks), 5700)
         self.assertLessEqual(max(len(chunk) for chunk in chunks), 1900)
         self.assertEqual(ledger.render(), full_ledger)
+
+
+class DeliveryFailureLabelTest(TerminalStateTestCase):
+    async def test_completed_run_that_fails_delivery_is_not_labelled_complete(self):
+        # Mutation caught: settle() is first-wins, so once a run had settled
+        # COMPLETED the exception handler's settle(FAILED) changed nothing and
+        # outcome.label still read "✅ 조사 완료" on a message whose whole point was
+        # to report that the report never arrived.
+        class BrokenReplyMessage(FakeMessage):
+            async def reply(self, content):
+                handle = await FakeMessage.reply(self, content)
+                if len(self.replies) > 1:
+                    raise RuntimeError("discord unavailable")
+                return handle
+
+        message = BrokenReplyMessage("시스템 상태를 조사해줘", CHANNEL_ID)
+        await self.run_agent(
+            [
+                _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                _response(tool_calls=[_tool_call("c2", "finish_task", {"report": LONG_REPORT})]),
+            ],
+            message=message,
+        )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        notices = [
+            edit
+            for handle in message.reply_handles
+            for edit in handle.edits
+            if edit and "작업 도중 예외 발생" in edit
+        ]
+        self.assertTrue(notices, "예외 메시지가 사용자에게 전달되지 않았습니다")
+        failure_notice = notices[-1]
+        self.assertIn(outcome_mod.LABELS[outcome_mod.FAILED], failure_notice)
+        self.assertNotIn(outcome_mod.LABELS[outcome_mod.COMPLETED], failure_notice)
+        self.assertIn("미완료", failure_notice)
 
 
 if __name__ == "__main__":

@@ -16,12 +16,14 @@ from deadlines import CancelToken
 from test_support import (
     FakeAuthor,
     FakeChannel,
+    FakeInteraction,
     FakeMessage,
     TEST_ADMIN_ID,
     TEST_OUTSIDER_ID,
     TEST_USER_ID,
 )
 
+import authz
 import bot
 
 CHANNEL_ID = 987654500
@@ -660,6 +662,89 @@ class ToolsDisabledTest(GateTestCase):
         self.assertEqual(
             bot.agent_tool_params(), {"tools": bot.TOOLS_SCHEMA, "tool_choice": "auto"}
         )
+
+
+class SlashCommandGateTest(GateTestCase):
+    """The four slash commands had no coverage at all.
+
+    Completion criterion "text and slash commands use the same policy path" was
+    only ever confirmed by reading the code, which is how a doubled ⛔ marker in
+    deny_interaction survived.
+    """
+
+    async def test_outsider_is_refused_by_every_slash_command(self):
+        cases = (
+            ("reset", bot.slash_reset, ()),
+            ("stop", bot.slash_stop, ()),
+            ("clear", bot.slash_clear, (10,)),
+            ("reasoning", bot.slash_reasoning, ("high",)),
+        )
+        for name, command, args in cases:
+            with self.subTest(command=name):
+                interaction = FakeInteraction(
+                    CHANNEL_ID, user_id=TEST_OUTSIDER_ID, manage_messages=True
+                )
+                await command.callback(interaction, *args)
+
+                self.assertEqual(len(interaction.replies), 1)
+                self.assertNotIn("초기화", interaction.replies[0])
+                self.assertEqual(interaction.channel.purge_calls, 0)
+                self.assertNotIn(CHANNEL_ID, bot.channel_reasoning)
+                self.assertNoSideEffects()
+
+    async def test_slash_denial_carries_exactly_one_deny_marker(self):
+        # Mutation caught: prefixing DENY_ACCESS_MESSAGE, which already opens with
+        # ⛔, printed the marker twice on every slash access denial while the text
+        # path printed it once.
+        interaction = FakeInteraction(CHANNEL_ID, user_id=TEST_OUTSIDER_ID)
+        await bot.slash_reasoning.callback(interaction, "high")
+
+        self.assertEqual(interaction.replies, [authz.DENY_ACCESS_MESSAGE])
+        self.assertEqual(interaction.replies[0].count("⛔"), 1)
+
+    async def test_slash_purge_is_judged_on_the_callers_own_permission(self):
+        # The caller is on the allowlist and is an admin, but holds no Manage
+        # Messages permission, so the purge must not happen.
+        interaction = FakeInteraction(
+            CHANNEL_ID, user_id=TEST_ADMIN_ID, manage_messages=False
+        )
+        await bot.slash_clear.callback(interaction, 10)
+
+        self.assertEqual(interaction.channel.purge_calls, 0)
+        self.assertIn("메시지 관리", interaction.replies[0])
+
+    async def test_slash_purge_clears_state_only_after_a_successful_delete(self):
+        bot.channel_history[CHANNEL_ID] = [{"role": "user", "content": "keep me"}]
+        interaction = FakeInteraction(
+            CHANNEL_ID,
+            user_id=TEST_ADMIN_ID,
+            manage_messages=True,
+            purge_error=RuntimeError("rate limited"),
+        )
+        await bot.slash_clear.callback(interaction, 10)
+
+        self.assertEqual(interaction.channel.purge_calls, 1)
+        self.assertEqual(
+            bot.channel_history[CHANNEL_ID], [{"role": "user", "content": "keep me"}]
+        )
+        self.assertIn("유지", interaction.replies[-1])
+
+    async def test_allowed_caller_passes_every_slash_gate(self):
+        reset = FakeInteraction(CHANNEL_ID)
+        await bot.slash_reset.callback(reset)
+        self.assertIn("초기화", reset.replies[0])
+
+        reasoning = FakeInteraction(CHANNEL_ID)
+        await bot.slash_reasoning.callback(reasoning, "high")
+        self.assertEqual(bot.channel_reasoning[CHANNEL_ID], "high")
+
+        purge = FakeInteraction(CHANNEL_ID, user_id=TEST_ADMIN_ID, manage_messages=True)
+        await bot.slash_clear.callback(purge, 3)
+        self.assertEqual(purge.channel.purge_calls, 1)
+
+        stop = FakeInteraction(CHANNEL_ID)
+        await bot.slash_stop.callback(stop)
+        self.assertIn("진행 중인 자율 탐색이 없습니다", stop.replies[0])
 
 
 if __name__ == "__main__":
