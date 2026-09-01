@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_support import FakeMessage
+from test_support import FakeMessage, TEST_USER_ID, run_catalog_patch
 
 import bot
 
@@ -78,7 +78,6 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             bot.channel_cancel_token,
             bot.channel_run_leases,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(CHANNEL_ID, None)
@@ -96,20 +95,20 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         original_bash = bot.tool_bash_exec
         original_dispatch = bot.execute_tools_in_parallel
 
-        async def recording_bash(command):
+        async def recording_bash(workspace, command):
             self.executed_commands.append(command)
             if use_real_bash:
-                return await original_bash(command)
+                return await original_bash(workspace, command)
             if callable(tool_result):
                 return tool_result(command, len(self.executed_commands))
             return tool_result
 
-        async def recording_dispatch(tool_calls, *args, **kwargs):
+        async def recording_dispatch(workspace, tool_calls, *args, **kwargs):
             self.dispatched_batches.append([
                 (call["id"], call["name"], call["arguments"])
                 for call in tool_calls
             ])
-            return await original_dispatch(tool_calls, *args, **kwargs)
+            return await original_dispatch(workspace, tool_calls, *args, **kwargs)
 
         message = FakeMessage("중복 도구 실행을 점검해줘", CHANNEL_ID)
         self.reply_messages = []
@@ -122,9 +121,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         message.reply = recording_reply
         with tempfile.TemporaryDirectory() as log_dir, ExitStack() as stack:
-            stack.enter_context(patch.object(bot, "SYSTEM_LOG_DIR", log_dir))
-            if use_real_bash:
-                stack.enter_context(patch.object(bot, "WORKSPACE_DIR", log_dir))
+            stack.enter_context(run_catalog_patch(bot, log_dir))
             stack.enter_context(patch.object(bot, "MAX_AGENT_LOOPS", len(responses) + 1))
             stack.enter_context(patch.object(bot, "CHECKPOINT_INTERVAL", 99))
             stack.enter_context(patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99))
@@ -517,10 +514,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         script = 'import sys; sys.stdout.write("x" * 5001); raise SystemExit(7)'
         command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
 
-        with tempfile.TemporaryDirectory() as workspace, patch.object(
-            bot, "WORKSPACE_DIR", workspace
+        with tempfile.TemporaryDirectory() as workspace, run_catalog_patch(
+            bot, workspace
         ):
-            result = await bot.tool_bash_exec(command)
+            run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
+            result = await bot.tool_bash_exec(run, command)
 
         self.assertIn("출력 결과가 너무 길어", result)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
@@ -559,6 +557,93 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             "consecutive_failure_limit",
         )
 
+    # Mutation caught: ignoring a producer-owned read_file error envelope lets
+    # the unchanged third missing-file read reach the dispatcher.
+    async def test_missing_read_file_error_blocks_third_attempt_end_to_end(self):
+        arguments = {"path": "missing-for-duplicate-policy.txt"}
+        await self.run_agent([
+            *[
+                _response(tool_calls=[
+                    _tool_call(
+                        f"missing-read-{attempt}", "read_file", arguments
+                    ),
+                ])
+                for attempt in range(1, 4)
+            ],
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["missing-read-1"], ["missing-read-2"]],
+        )
+        for payload_index in (1, 2):
+            result = json.loads(
+                self._tool_messages(
+                    self.model.agent_payloads[payload_index]
+                )[-1]["content"]
+            )
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error"], "not_found")
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[3])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["tool"], "read_file")
+        self.assertEqual(blocked["count"], 2)
+
+    # Mutation caught: treating a producer-owned write_file conflict envelope as
+    # success lets an unchanged third stale canonical write reach the dispatcher.
+    async def test_stale_canonical_write_conflict_blocks_third_attempt_end_to_end(self):
+        stale_arguments = {
+            "path": "plan.md",
+            "content": "stale bytes",
+            "expected_revision": "absent",
+        }
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("seed-plan", "write_file", {
+                    "path": "plan.md",
+                    "content": "original bytes",
+                    "expected_revision": "absent",
+                }),
+            ]),
+            *[
+                _response(tool_calls=[
+                    _tool_call(
+                        f"stale-write-{attempt}",
+                        "write_file",
+                        stale_arguments,
+                    ),
+                ])
+                for attempt in range(1, 4)
+            ],
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["seed-plan"], ["stale-write-1"], ["stale-write-2"]],
+        )
+        for payload_index in (2, 3):
+            result = json.loads(
+                self._tool_messages(
+                    self.model.agent_payloads[payload_index]
+                )[-1]["content"]
+            )
+            self.assertEqual(result["status"], "conflict")
+            self.assertEqual(result["expected_revision"], "absent")
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[4])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["tool"], "write_file")
+        self.assertEqual(blocked["count"], 2)
+
     # Mutation caught: returning successful file bytes without a producer-owned
     # envelope lets content beginning `[Error` forge a failed-read streak.
     async def test_real_read_file_error_like_content_remains_successful(self):
@@ -585,13 +670,19 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             [[call[0] for call in batch] for batch in self.dispatched_batches],
             [["read-success-1"], ["read-success-2"], ["read-success-3"]],
         )
+        first_tool = self._tool_messages(self.model.agent_payloads[1])[-1]
+        first_payload = json.loads(first_tool["content"])
+        self.assertEqual(first_payload["status"], "success")
+        self.assertEqual(
+            first_payload["content"],
+            "[Error: this is file data, not a producer failure]\nbody",
+        )
         latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
         self.assertEqual(latest_tool["tool_call_id"], "read-success-3")
-        self.assertTrue(
-            latest_tool["content"].startswith(
-                "[read_file status: success]\n[Error: this is file data"
-            )
-        )
+        latest_payload = json.loads(latest_tool["content"])
+        self.assertEqual(latest_payload["status"], "unchanged")
+        self.assertEqual(latest_payload["reference"], latest_payload["revision"])
+        self.assertNotIn("content", latest_payload)
 
     # Mutation caught: omitting the producer-owned success status from an
     # accepted record_state report leaves its classification tied to prose.
@@ -979,17 +1070,22 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             [payload_message["tool_call_id"] for payload_message in latest_tool_messages],
             latest_ids,
         )
+        latest_contents = [
+            payload_message["content"] for payload_message in latest_tool_messages
+        ]
         self.assertEqual(
-            [payload_message["content"] for payload_message in latest_tool_messages],
-            [
-                '{"directive":"Provide tool arguments as a valid JSON object.",'
-                '"error":"invalid_tool_arguments","reason":"malformed_json",'
-                '"tool":"bash_exec"}',
-                "[read_file status: success]\n" + file_content,
-                expected_record,
-                SUCCESS_RESULT,
-                SUCCESS_RESULT,
-            ],
+            latest_contents[0],
+            '{"directive":"Provide tool arguments as a valid JSON object.",'
+            '"error":"invalid_tool_arguments","reason":"malformed_json",'
+            '"tool":"bash_exec"}',
+        )
+        read_payload = json.loads(latest_contents[1])
+        self.assertEqual(read_payload["status"], "success")
+        self.assertEqual(read_payload["content"], file_content)
+        self.assertFalse(read_payload["truncated"])
+        self.assertEqual(
+            latest_contents[2:],
+            [expected_record, SUCCESS_RESULT, SUCCESS_RESULT],
         )
         self.assertIn(
             "LATEST_RECORD_PAYLOAD_SENTINEL",

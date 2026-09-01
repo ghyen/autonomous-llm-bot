@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_support import FakeMessage  # sets the required config env before bot imports
+from test_support import FakeMessage, run_catalog_patch  # sets required config env before bot imports
 
 import bot
 
@@ -24,7 +24,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(channel_id)
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "MAX_AGENT_LOOPS", 2), \
                     patch.object(bot, "create_streaming_completion", AsyncMock(return_value=response)) as completion, \
                     patch.object(bot, "execute_tools_in_parallel", AsyncMock()) as execute_tools:
@@ -48,7 +48,6 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_reasoning,
                 bot.channel_cancel_token,
                 bot.channel_active_runs,
-                bot.channel_user_queue,
             ):
                 state.pop(channel_id, None)
 
@@ -65,7 +64,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(channel_id)
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "create_streaming_completion", AsyncMock(return_value=response)) as completion, \
                     patch.object(bot, "execute_tools_in_parallel", AsyncMock()) as execute_tools:
                 await bot.on_message(message)
@@ -88,7 +87,6 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_reasoning,
                 bot.channel_cancel_token,
                 bot.channel_active_runs,
-                bot.channel_user_queue,
             ):
                 state.pop(channel_id, None)
 
@@ -131,7 +129,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(channel_id)
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                     patch.object(bot, "create_streaming_completion", AsyncMock(side_effect=responses)) as completion, \
                     patch.object(bot, "execute_tools_in_parallel", AsyncMock(return_value=["ok"])) as execute_tools:
@@ -148,7 +146,6 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_reasoning,
                 bot.channel_cancel_token,
                 bot.channel_active_runs,
-                bot.channel_user_queue,
             ):
                 state.pop(channel_id, None)
 
@@ -188,7 +185,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(channel_id)
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                     patch.object(bot, "create_streaming_completion", AsyncMock(side_effect=responses)) as completion:
                 await bot.on_message(message)
@@ -205,7 +202,6 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 bot.channel_reasoning,
                 bot.channel_cancel_token,
                 bot.channel_active_runs,
-                bot.channel_user_queue,
             ):
                 state.pop(channel_id, None)
 

@@ -10,14 +10,16 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 
 - 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 250 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
 - 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, checkpoint, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves.
-- 🏛️ **Hierarchical Trajectory Compaction**: Maintains a 3-tier memory structure across 10-step rollover intervals: (1) Long-term Milestone Index (`## 🏛️ 장기 마일스톤 색인`), (2) Recent Phase Detailed Summary (`## 🔍 직전 구간 상세 요약`), and (3) Discovered Artifacts Index (`## 📁 핵심 발견 및 산출물 색인`). Bounded newest-first budgeting ensures historical decisions and refuted hypotheses remain indexed without blowing up the context window.
-- 🧩 **Workspace Skills & Reusable Tooling**: Dedicated `skills/` workspace directory where the agent can create and persist reusable Python (`.py`) and Shell (`.sh`) scripts via `write_file` and execute them via `bash_exec`. Registered skills are dynamically auto-discovered and rendered into the system prompt with docstrings and usage instructions.
+- 📁 **Owner-Bound Run Workspaces**: Every accepted top-level request receives an opaque `runs/<run-id>/` directory and opaque per-run log. Runs never derive paths from Discord IDs; exact owners can resume or delete inactive runs, while admins receive no implicit workspace access.
+- 🔄 **Canonical File Revisions**: Root `plan.md` and `findings.md` use exact-byte `sha256:` revisions, compare-and-swap writes, and atomic replacement. Per-execution read hashes return bounded references for unchanged content.
+- 🏛️ **Hierarchical Trajectory Compaction**: Every 10 steps, old execution history is compacted into a 3-tier memory structure: (1) Long-term Milestone Index (`## 🏛️ 장기 마일스톤 색인`), (2) Recent Phase Detailed Summary (`## 🔍 직전 구간 상세 요약`), and (3) Discovered Artifacts Index (`## 📁 핵심 발견 및 산출물 색인`). Bounded newest-first budgeting keeps historical decisions and refuted hypotheses indexed without exhausting the context window.
+- 🧩 **Run-Local Workspace Skills**: Reusable Python (`.py`), Shell (`.sh`/`.bash`), and Markdown (`.md`) skills are discovered from the current run's `skills/` directory and rendered into its system prompt. They are isolated from other runs and retained only when that exact run is resumed.
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
 - 🛠️ **Built-in Power Tools**:
-  - `bash_exec`: Run arbitrary shell commands (curl, python3, grep, jq, etc.) in a sandbox workspace with output auto-truncation.
-  - `read_file`: Inspect local files with line truncation.
-  - `write_file`: Create and modify files in the workspace (including reusable scripts in `skills/`).
+  - `bash_exec`: Run arbitrary shell commands (curl, python3, grep, jq, etc.) with the current run directory as cwd and output auto-truncation.
+  - `read_file`: Read relative paths from the current run. First or changed reads include a full-byte revision; unchanged reads return a hash reference.
+  - `write_file`: Write ordinary run files, including reusable scripts in `skills/`, directly; root `plan.md` and `findings.md` require an optimistic `expected_revision`.
   - `web_search`: Live DuckDuckGo search.
   - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
@@ -202,6 +204,47 @@ surface.
 
 ---
 
+## 📁 Run Workspace Lifecycle and Integrity
+
+`WORKSPACE_DIR` and `SYSTEM_LOG_DIR` are roots only. Each accepted top-level
+(non-steering) request atomically consumes a prepared/resumed run or creates a
+fresh opaque run:
+
+- Workspace: `WORKSPACE_DIR/runs/<random-run-id>/`
+- Log: `SYSTEM_LOG_DIR/runs/<random-run-id>.md`
+- Metadata: atomic `run.json` containing owner, channel, lifecycle status, and
+  timestamps. Startup changes stale `active` metadata to resumable
+  `interrupted`; legacy root files are not migrated or used as a fallback.
+
+A direct-only answer still owns a run identity and log but executes no tools. A
+direct-answer fallback into autonomous mode keeps the same run. Cleanup persists
+`completed`, `stopped`, `exhausted`, `failed`, or `interrupted` while retaining
+workspace bytes. `!new`/`!reset` prepare a blank run and keep old bytes; `!stop`
+retains the stopped run; `!resume <run-id>` selects an exact inactive owned run
+with an empty read cache; and `!delete <run-id>` removes an inactive owned
+workspace and log. `!clear` purges Discord first and performs the same reset only
+on success. A selected run is consumed once, and one run cannot be active twice.
+There is no list/share surface, and admin control authority is not workspace
+read/delete authority: cross-owner IDs return `run not found`.
+
+Relative tool paths are resolved lexically under the current run and `..` escape
+is rejected. `bash_exec` uses that run as cwd. Absolute paths, shell commands
+that leave cwd, and symlink/host-boundary confinement are deliberately outside
+this feature's security claim.
+
+Only root `plan.md` and `findings.md` are canonical. Their revision is
+`sha256:<64 lowercase hex>` over exact bytes, or `absent` before creation. A
+write must provide the exact last revision; comparison occurs under that file's
+lock, stale writes return `conflict` without changing bytes, and valid writes
+flush/fsync a sibling temporary file before atomic replacement. Concurrent
+writers using the same revision yield one success and one conflict. First or
+changed canonical reads return complete content and revision; unchanged reads
+return only a hash reference. Ordinary changed reads retain the 4,000-character
+display cap. Every read hashes full bytes, successful writes seed the cache, and
+the per-execution LRU holds at most 128 entries; resume begins empty.
+
+---
+
 ## 🔐 Access Control
 
 The agent runs shell commands and reads and writes files on the host, so every
@@ -215,7 +258,8 @@ message came from, never who sent it. Identity is `DISCORD_ALLOWED_USER_IDS`.
 | Action | Who |
 | :--- | :--- |
 | Talk to the bot at all | On `DISCORD_ALLOWED_USER_IDS` |
-| `!stop`, `!reset`, mid-flight steering | The owner of the active run, or a `DISCORD_ADMIN_USER_IDS` admin. With no run in flight, any allowed caller. |
+| `!stop`, `!reset`, `!new`, mid-flight steering | The owner of the active run, or a `DISCORD_ADMIN_USER_IDS` admin. With no run in flight, any allowed caller. |
+| `!resume <run-id>` / `!delete <run-id>` | Exact run owner only after normal caller authorization; admin status does not grant workspace access. |
 | `!clear` / `/clear` (bulk delete) | An admin **and** the caller's own Discord "Manage Messages" permission. The bot's permission is not the caller's. |
 
 Text commands and slash commands share the same policy path. Deletion is
@@ -228,9 +272,12 @@ leaves your history intact and is reported as a failure.
 
 | Command | Description |
 | :--- | :--- |
-| `!stop` / `/stop` | Cancels and reaps the in-flight stage, then sends a deterministic partial report from collected data. Run owner or admin. |
-| `!reset` / `/reset` | Clears conversation history, context cache, and the channel's research ledger. Run owner or admin. |
-| `!clear [count]` / `/clear` | Purges recent channel messages, then resets context and the research ledger. Admin with Manage Messages. |
+| `!stop` / `/stop` | Cancels and reaps the in-flight stage, then sends a deterministic partial report. The stopped run remains resumable. |
+| `!reset` / `/reset` | Clears channel memory and prepares a blank run for the next goal; rejects while the caller/channel owns an active run. |
+| `!new` / `/new` | Alias of reset with the same authorization and active-run preflight. |
+| `!resume <run-id>` / `/resume` | Selects the exact inactive run for its owner; the next accepted goal consumes it with an empty read cache. |
+| `!delete <run-id>` / `/delete` | Deletes an exact-owner inactive workspace and its run log. Active runs are rejected; cross-owner IDs are not disclosed. |
+| `!clear [count]` / `/clear` | Preflights active state, purges recent Discord messages, then prepares a blank run and clears channel memory. Failure changes nothing. |
 | `/reasoning [level]` | Changes reasoning effort (`none`, `low`, `medium`, `high`). Any allowed caller. |
 
 ---
@@ -239,8 +286,8 @@ leaves your history intact and is reported as a failure.
 
 ```bash
 ./venv/bin/python -m unittest discover -v
-./venv/bin/python -m compileall -q bot.py config.py authz.py outcome.py ledger.py deadlines.py
-./venv/bin/python tools/check_no_credential_defaults.py bot.py config.py ledger.py authz.py outcome.py deadlines.py tools
+./venv/bin/python -m compileall -q bot.py run_workspace.py config.py authz.py outcome.py ledger.py deadlines.py
+./venv/bin/python tools/check_no_credential_defaults.py bot.py run_workspace.py config.py ledger.py authz.py outcome.py deadlines.py tools
 ```
 
 `test_config.py` covers configuration loading and deadline defaults,
@@ -252,9 +299,12 @@ its placement ahead of every side effect, `test_outcome.py` and
 `test_terminal_state.py` cover the terminal state machine and end-of-run
 scenarios, `test_ledger.py` covers the state transition rules,
 `test_state_flow.py` proves state markers survive micro compaction, checkpoints,
-rollover, a following run, and final synthesis, and `test_bot.py` covers request
-routing. `test_support.py` holds the shared bootstrap and Discord doubles; every
-identifier in tests is synthetic.
+rollover, a following run, and final synthesis, `test_workspace_integrity.py`
+covers opaque identity, lifecycle/privacy, lexical paths, canonical CAS, bounded
+hash caching, per-run prompt/log/dispatcher wiring, and concurrent isolation,
+and `test_bot.py` covers request routing. `test_support.py` holds the shared
+bootstrap, temporary catalog helper, and Discord doubles; every identifier in
+tests is synthetic.
 
 All three commands also run in CI (`.github/workflows/ci.yml`) on Python 3.10 and
 3.12.

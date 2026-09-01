@@ -21,6 +21,7 @@ from test_support import (
     TEST_ADMIN_ID,
     TEST_OUTSIDER_ID,
     TEST_USER_ID,
+    run_catalog_patch,
 )
 
 import authz
@@ -34,7 +35,7 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(CHANNEL_ID)
         self._log_dir = tempfile.TemporaryDirectory()
         self._patches = [
-            patch.object(bot, "SYSTEM_LOG_DIR", self._log_dir.name),
+            run_catalog_patch(bot, self._log_dir.name),
             patch.object(bot, "create_streaming_completion", AsyncMock()),
             patch.object(bot, "execute_tools_in_parallel", AsyncMock(return_value=[])),
         ]
@@ -55,8 +56,8 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
             bot.channel_summary,
             bot.channel_reasoning,
             bot.channel_cancel_token,
+            bot.channel_run_leases,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(CHANNEL_ID, None)
@@ -67,8 +68,8 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
         self.execute_tools.assert_not_awaited()
         self.assertEqual(bot.channel_history[CHANNEL_ID], [])
         self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
-        self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
-        self.assertEqual(os.listdir(self._log_dir.name), [])
+        self.assertEqual(list(bot.RUN_CATALOG.runs_root.iterdir()), [])
+        self.assertEqual(list(bot.RUN_CATALOG.logs_root.iterdir()), [])
 
 
 class DeniedRequestTest(GateTestCase):
@@ -89,7 +90,8 @@ class DeniedRequestTest(GateTestCase):
 
         self.completion.assert_not_awaited()
         self.execute_tools.assert_not_awaited()
-        self.assertEqual(os.listdir(self._log_dir.name), [])
+        self.assertEqual(list(bot.RUN_CATALOG.runs_root.iterdir()), [])
+        self.assertEqual(list(bot.RUN_CATALOG.logs_root.iterdir()), [])
         self.assertIn("권한이 없습니다", message.replies[-1])
 
     async def test_mentioning_the_bot_does_not_authenticate_an_outsider(self):
@@ -468,6 +470,11 @@ class PendingDirectOwnershipTest(GateTestCase):
         state = await self._start_active_run_with_newer_pending_direct(
             TEST_USER_ID, pending_owner_id
         )
+        active_lease = next(
+            lease
+            for lease in bot.channel_run_leases[CHANNEL_ID]
+            if lease["active"]
+        )
 
         try:
             pending_steering = FakeMessage(
@@ -477,7 +484,7 @@ class PendingDirectOwnershipTest(GateTestCase):
             )
             await bot.on_message(pending_steering)
             self.assertIn("시작한 사용자", pending_steering.replies[-1])
-            self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
+            self.assertEqual(active_lease["steering"], [])
 
             active_steering = FakeMessage(
                 "활성 소유자의 지시",
@@ -487,7 +494,7 @@ class PendingDirectOwnershipTest(GateTestCase):
             await bot.on_message(active_steering)
             self.assertEqual(active_steering.reactions, ["📥"])
             self.assertEqual(
-                bot.channel_user_queue[CHANNEL_ID],
+                active_lease["steering"],
                 [("active-owner", "활성 소유자의 지시")],
             )
 
@@ -576,6 +583,159 @@ class PendingDirectOwnershipTest(GateTestCase):
         self.assertFalse(bot.channel_active_runs[CHANNEL_ID])
 
 
+    # Mutation caught: a channel-global steering queue lets the older of two
+    # active fallback loops drain guidance selected and logged for the newer run.
+    async def test_overlapping_active_runs_keep_steering_on_newer_lease(self):
+        newer_owner_id = 333333333333333333
+        steering_text = "새 실행에만 반영할 결정적 지시"
+        bot.ALLOWED_USER_IDS.add(newer_owner_id)
+        first_direct_started = asyncio.Event()
+        second_direct_started = asyncio.Event()
+        first_direct_release = asyncio.Event()
+        second_direct_release = asyncio.Event()
+        older_first_agent_started = asyncio.Event()
+        newer_first_agent_started = asyncio.Event()
+        older_first_agent_release = asyncio.Event()
+        newer_first_agent_release = asyncio.Event()
+        older_second_agent_started = asyncio.Event()
+        newer_second_agent_started = asyncio.Event()
+        captured_payloads = {}
+        direct_calls = 0
+        agent_calls = 0
+
+        def response(content="", finish_id=None):
+            tool_calls = []
+            if finish_id is not None:
+                tool_calls.append(SimpleNamespace(
+                    id=finish_id,
+                    function=SimpleNamespace(
+                        name="finish_task",
+                        arguments='{"report":"steering isolation complete"}',
+                    ),
+                ))
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=content,
+                    reasoning_content="",
+                    reasoning="",
+                    tool_calls=tool_calls,
+                ),
+            )])
+
+        async def model(**kwargs):
+            nonlocal direct_calls, agent_calls
+            if kwargs.get("stage") == "direct":
+                direct_calls += 1
+                if direct_calls == 1:
+                    first_direct_started.set()
+                    await first_direct_release.wait()
+                else:
+                    second_direct_started.set()
+                    await second_direct_release.wait()
+                return response()
+
+            self.assertEqual(kwargs.get("stage"), "agent")
+            agent_calls += 1
+            if agent_calls == 1:
+                older_first_agent_started.set()
+                await older_first_agent_release.wait()
+                return response("older continues")
+            if agent_calls == 2:
+                newer_first_agent_started.set()
+                await newer_first_agent_release.wait()
+                return response("newer continues")
+            if agent_calls == 3:
+                captured_payloads["older"] = list(kwargs["messages"])
+                older_second_agent_started.set()
+                return response(finish_id="finish-older")
+            if agent_calls == 4:
+                captured_payloads["newer"] = list(kwargs["messages"])
+                newer_second_agent_started.set()
+                return response(finish_id="finish-newer")
+            self.fail(f"unexpected agent call {agent_calls}")
+
+        self.completion.side_effect = model
+        older_run = None
+        newer_run = None
+        try:
+            older_run = asyncio.create_task(bot.on_message(FakeMessage(
+                "간단히 답해줘",
+                CHANNEL_ID,
+                author=FakeAuthor(TEST_USER_ID, "older-owner"),
+            )))
+            await asyncio.wait_for(first_direct_started.wait(), timeout=1)
+
+            newer_run = asyncio.create_task(bot.on_message(FakeMessage(
+                "간단히 답해줘",
+                CHANNEL_ID,
+                author=FakeAuthor(newer_owner_id, "newer-owner"),
+            )))
+            await asyncio.wait_for(second_direct_started.wait(), timeout=1)
+
+            first_direct_release.set()
+            await asyncio.wait_for(older_first_agent_started.wait(), timeout=1)
+            second_direct_release.set()
+            await asyncio.wait_for(newer_first_agent_started.wait(), timeout=1)
+
+            leases = bot.channel_run_leases[CHANNEL_ID]
+            self.assertEqual(len(leases), 2)
+            older_lease, newer_lease = leases
+            self.assertTrue(older_lease["active"])
+            self.assertTrue(newer_lease["active"])
+
+            steering = FakeMessage(
+                steering_text,
+                CHANNEL_ID,
+                author=FakeAuthor(newer_owner_id, "newer-owner"),
+            )
+            await bot.on_message(steering)
+            self.assertEqual(steering.reactions, ["📥"])
+
+            older_first_agent_release.set()
+            await asyncio.wait_for(older_second_agent_started.wait(), timeout=1)
+            newer_first_agent_release.set()
+            await asyncio.wait_for(newer_second_agent_started.wait(), timeout=1)
+            await asyncio.wait_for(
+                asyncio.gather(older_run, newer_run), timeout=1
+            )
+
+            older_prompt = "\n".join(
+                str(bot._msg_content(item) or "")
+                for item in captured_payloads["older"]
+            )
+            newer_prompt = "\n".join(
+                str(bot._msg_content(item) or "")
+                for item in captured_payloads["newer"]
+            )
+            self.assertNotIn(steering_text, older_prompt)
+            self.assertEqual(newer_prompt.count(steering_text), 1)
+
+            older_log = older_lease["workspace"].log_path.read_text(
+                encoding="utf-8"
+            )
+            newer_log = newer_lease["workspace"].log_path.read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(steering_text, older_log)
+            self.assertIn(steering_text, newer_log)
+        finally:
+            bot.ALLOWED_USER_IDS.discard(newer_owner_id)
+            for event in (
+                first_direct_release,
+                second_direct_release,
+                older_first_agent_release,
+                newer_first_agent_release,
+            ):
+                event.set()
+            for run in (older_run, newer_run):
+                if run is not None:
+                    run.cancel()
+            await asyncio.gather(
+                *(run for run in (older_run, newer_run) if run is not None),
+                return_exceptions=True,
+            )
+
+
 class PurgeTest(GateTestCase):
     async def test_outsider_purge_never_reaches_discord(self):
         message = FakeMessage("!clear 50", CHANNEL_ID, author=FakeAuthor(TEST_OUTSIDER_ID, "outsider"), manage_messages=True)
@@ -633,25 +793,39 @@ class PurgeTest(GateTestCase):
 
 
 class SteeringTest(GateTestCase):
-    async def test_non_owner_steering_is_refused_and_not_queued(self):
+    def start_active_run(self, owner_id):
+        workspace = bot.RUN_CATALOG.acquire(owner_id, CHANNEL_ID)
+        token = CancelToken()
+        lease = {
+            "token": token,
+            "owner": owner_id,
+            "active": True,
+            "workspace": workspace,
+            "steering": [],
+        }
+        bot.channel_run_leases[CHANNEL_ID].append(lease)
         bot.channel_active_runs[CHANNEL_ID] = True
-        bot.channel_run_owner[CHANNEL_ID] = TEST_ADMIN_ID
+        bot.channel_run_owner[CHANNEL_ID] = owner_id
+        return lease
+
+    async def test_non_owner_steering_is_refused_and_not_queued(self):
+        lease = self.start_active_run(TEST_ADMIN_ID)
         message = FakeMessage("이 방향으로 바꿔줘", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
 
         await bot.on_message(message)
 
-        self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
-        self.assertEqual(os.listdir(self._log_dir.name), [])
+        self.assertEqual(lease["steering"], [])
+        self.assertEqual(len(list(bot.RUN_CATALOG.runs_root.iterdir())), 1)
+        self.assertEqual(list(bot.RUN_CATALOG.logs_root.iterdir()), [])
         self.assertIn("시작한 사용자", message.replies[-1])
 
     async def test_owner_steering_is_queued(self):
-        bot.channel_active_runs[CHANNEL_ID] = True
-        bot.channel_run_owner[CHANNEL_ID] = TEST_USER_ID
+        lease = self.start_active_run(TEST_USER_ID)
         message = FakeMessage("이 방향으로 바꿔줘", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
 
         await bot.on_message(message)
 
-        self.assertEqual(len(bot.channel_user_queue[CHANNEL_ID]), 1)
+        self.assertEqual(len(lease["steering"]), 1)
 
 
 class ToolsDisabledTest(GateTestCase):

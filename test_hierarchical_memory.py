@@ -1,9 +1,11 @@
-import os
+import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from test_support import FakeMessage
+from test_support import FakeMessage  # sets required config env before bot imports
 import bot
+from deadlines import StageTimeout
 from ledger import ResearchLedger
 
 
@@ -59,15 +61,24 @@ class HierarchicalMemoryTest(unittest.TestCase):
         self.assertIn("2단계 조사", parsed["recent_summary"])
         self.assertIn("skills/check_auth.py", "\n".join(parsed["discoveries"]))
 
+    def test_summary_clipping_reserves_space_for_omission_marker(self):
+        summary = bot._clip_summary_text(
+            "x" * (bot.ROLLING_SUMMARY_MAX_CHARS + 1),
+            bot.ROLLING_SUMMARY_MAX_CHARS,
+        )
+
+        self.assertLessEqual(len(summary), bot.ROLLING_SUMMARY_MAX_CHARS)
+        self.assertTrue(summary.endswith(" ...[생략]"))
+
 
 class RolloverHierarchicalIntegrationTest(unittest.IsolatedAsyncioTestCase):
-    def _make_payload(self):
+    def _make_payload(self, workspace):
         ledger = ResearchLedger()
         ledger.set_goal("보안 취약점 조사")
         ledger.add_evidence("E_AUTH", "인증 토큰 누락", "log://auth")
         ledger.declare_hypothesis("H_AUTH", "인증 모듈 결함", "active", "E_AUTH")
 
-        payload = [{"role": "system", "content": bot.build_system_content(bot.SYSTEM_PROMPT, ledger)}]
+        payload = [{"role": "system", "content": bot.build_system_content(workspace, ledger)}]
         for step in range(12):
             payload.append({
                 "role": "assistant",
@@ -87,10 +98,17 @@ class RolloverHierarchicalIntegrationTest(unittest.IsolatedAsyncioTestCase):
         return ledger, payload
 
     async def test_rollover_produces_hierarchical_summary_in_system_prompt(self):
-        ledger, payload = self._make_payload()
-        rolled, summary = await bot.rollover_agent_context(
-            payload, existing_summary="", step_num=10, ledger=ledger
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(root=temp_dir)
+            ledger, payload = self._make_payload(workspace)
+            with patch.object(
+                bot,
+                "run_completion_stage",
+                AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
+            ):
+                rolled, summary = await bot.rollover_agent_context(
+                    workspace, payload, existing_summary="", step_num=10, ledger=ledger
+                )
 
         self.assertIn("## 🏛️ 장기 마일스톤 색인", summary)
         self.assertIn("## 🔍 직전 구간 상세 요약", summary)
