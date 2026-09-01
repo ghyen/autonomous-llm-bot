@@ -114,14 +114,23 @@ class RunWorkspace:
     def resolve(self, path):
         raw_path = os.fspath(path)
         if os.path.isabs(raw_path):
-            return Path(os.path.normpath(raw_path))
-        target = Path(os.path.normpath(os.path.join(str(self.root), raw_path)))
-        try:
-            inside = os.path.commonpath((str(self.root), str(target))) == str(self.root)
-        except ValueError:
-            inside = False
-        if not inside:
-            raise ValueError("relative path escapes the current run workspace")
+            target = Path(os.path.normpath(raw_path))
+        else:
+            target = Path(os.path.normpath(os.path.join(str(self.root), raw_path)))
+            try:
+                inside = (
+                    os.path.commonpath((str(self.root), str(target)))
+                    == str(self.root)
+                )
+            except ValueError:
+                inside = False
+            if not inside:
+                raise ValueError("relative path escapes the current run workspace")
+        if (
+            target.parent == self.root
+            and target.name.casefold() in CANONICAL_NAMES
+        ):
+            return self.root / target.name.casefold()
         return target
 
     def _is_canonical(self, target):
@@ -250,6 +259,7 @@ class RunCatalog:
         self._scan()
 
     def _scan(self):
+        prepared = []
         for root in self.runs_root.iterdir():
             if not root.is_dir() or root.name.startswith("."):
                 continue
@@ -287,6 +297,16 @@ class RunCatalog:
                 workspace.status = "interrupted"
                 workspace.updated_at = _now()
                 workspace.persist()
+            elif status == "prepared":
+                prepared.append(workspace)
+
+        for workspace in sorted(
+            prepared,
+            key=lambda item: (
+                str(item.updated_at), str(item.created_at), item.run_id
+            ),
+        ):
+            self._select_prepared(workspace)
 
     def _create(self, owner_id, channel_id, status):
         while True:
@@ -308,6 +328,21 @@ class RunCatalog:
         workspace.persist()
         self._runs[run_id] = workspace
         return workspace
+
+    def _select_prepared(self, workspace):
+        for key, selected_id in tuple(self._selected.items()):
+            if selected_id == workspace.run_id:
+                self._selected.pop(key, None)
+
+        key = (workspace.owner_id, workspace.channel_id)
+        displaced_id = self._selected.get(key)
+        if displaced_id is not None and displaced_id != workspace.run_id:
+            displaced = self._runs.get(displaced_id)
+            if displaced is not None and displaced.status == "prepared":
+                displaced.status = "interrupted"
+                displaced.updated_at = _now()
+                displaced.persist()
+        self._selected[key] = workspace.run_id
 
     def lookup_owned(self, owner_id, run_id):
         with self._lock:
@@ -356,7 +391,7 @@ class RunCatalog:
                 raise RunActiveError("clear reservation is not active")
             try:
                 workspace = self._create(owner_id, channel_id, "prepared")
-                self._selected[key] = workspace.run_id
+                self._select_prepared(workspace)
                 return workspace
             finally:
                 self._reset_reservations.pop(key, None)
@@ -381,7 +416,7 @@ class RunCatalog:
         with self._lock:
             self.ensure_reset_allowed(owner_id, channel_id)
             workspace = self._create(owner_id, channel_id, "prepared")
-            self._selected[(owner_id, channel_id)] = workspace.run_id
+            self._select_prepared(workspace)
             return workspace
 
     def resume(self, owner_id, channel_id, run_id):
@@ -394,10 +429,7 @@ class RunCatalog:
             workspace.updated_at = _now()
             workspace.clear_read_cache()
             workspace.persist()
-            for key, selected_id in tuple(self._selected.items()):
-                if selected_id == workspace.run_id:
-                    self._selected.pop(key, None)
-            self._selected[(owner_id, channel_id)] = workspace.run_id
+            self._select_prepared(workspace)
             return workspace
 
     def finish(self, workspace, status):

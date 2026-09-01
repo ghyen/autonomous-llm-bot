@@ -78,7 +78,6 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             bot.channel_cancel_token,
             bot.channel_run_leases,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(CHANNEL_ID, None)
@@ -557,6 +556,93 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             json.loads(latest_tool["content"])["reason"],
             "consecutive_failure_limit",
         )
+
+    # Mutation caught: ignoring a producer-owned read_file error envelope lets
+    # the unchanged third missing-file read reach the dispatcher.
+    async def test_missing_read_file_error_blocks_third_attempt_end_to_end(self):
+        arguments = {"path": "missing-for-duplicate-policy.txt"}
+        await self.run_agent([
+            *[
+                _response(tool_calls=[
+                    _tool_call(
+                        f"missing-read-{attempt}", "read_file", arguments
+                    ),
+                ])
+                for attempt in range(1, 4)
+            ],
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["missing-read-1"], ["missing-read-2"]],
+        )
+        for payload_index in (1, 2):
+            result = json.loads(
+                self._tool_messages(
+                    self.model.agent_payloads[payload_index]
+                )[-1]["content"]
+            )
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error"], "not_found")
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[3])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["tool"], "read_file")
+        self.assertEqual(blocked["count"], 2)
+
+    # Mutation caught: treating a producer-owned write_file conflict envelope as
+    # success lets an unchanged third stale canonical write reach the dispatcher.
+    async def test_stale_canonical_write_conflict_blocks_third_attempt_end_to_end(self):
+        stale_arguments = {
+            "path": "plan.md",
+            "content": "stale bytes",
+            "expected_revision": "absent",
+        }
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("seed-plan", "write_file", {
+                    "path": "plan.md",
+                    "content": "original bytes",
+                    "expected_revision": "absent",
+                }),
+            ]),
+            *[
+                _response(tool_calls=[
+                    _tool_call(
+                        f"stale-write-{attempt}",
+                        "write_file",
+                        stale_arguments,
+                    ),
+                ])
+                for attempt in range(1, 4)
+            ],
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["seed-plan"], ["stale-write-1"], ["stale-write-2"]],
+        )
+        for payload_index in (2, 3):
+            result = json.loads(
+                self._tool_messages(
+                    self.model.agent_payloads[payload_index]
+                )[-1]["content"]
+            )
+            self.assertEqual(result["status"], "conflict")
+            self.assertEqual(result["expected_revision"], "absent")
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[4])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["tool"], "write_file")
+        self.assertEqual(blocked["count"], 2)
 
     # Mutation caught: returning successful file bytes without a producer-owned
     # envelope lets content beginning `[Error` forge a failed-read streak.

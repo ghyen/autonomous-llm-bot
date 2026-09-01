@@ -258,7 +258,6 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
             bot.channel_reasoning,
             bot.channel_cancel_token,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(self.CHANNEL_ID, None)
@@ -424,7 +423,6 @@ class CheckpointFailureTest(unittest.IsolatedAsyncioTestCase):
             bot.channel_reasoning,
             bot.channel_cancel_token,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(self.CHANNEL_ID, None)

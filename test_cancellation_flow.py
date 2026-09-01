@@ -103,7 +103,6 @@ class CancellationTestCase(unittest.IsolatedAsyncioTestCase):
             bot.channel_summary,
             bot.channel_reasoning,
             bot.channel_active_runs,
-            bot.channel_user_queue,
             bot.channel_ledger,
         ):
             state.pop(CHANNEL_ID, None)
