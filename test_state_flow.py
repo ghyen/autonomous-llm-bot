@@ -282,7 +282,10 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
                     "hypotheses": [{"id": "H_A", "status": "rejected", "evidence_id": "E_NEG"}],
                 }),
             ]),
-            _response(tool_calls=[_tool_call("c4", "finish_task", {"report": "조사 완료."})]),
+            # finish_task with an empty report: the run completes but there is no
+            # text to send, so final synthesis runs. (Report length no longer
+            # decides this - see outcome.py.)
+            _response(tool_calls=[_tool_call("c4", "finish_task", {"report": ""})]),
         ]
         stub = ModelStub(first_run)
 
