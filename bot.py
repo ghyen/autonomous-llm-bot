@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 from duckduckgo_search import DDGS
 from types import SimpleNamespace
 
+import authz
 from ledger import ResearchLedger
 from config import ConfigError, load_config, startup_diagnostics
 
@@ -305,6 +306,51 @@ channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
 channel_user_queue = defaultdict(list)
+channel_run_owner = {}
+
+
+def caller_can_manage_messages(channel, user) -> bool:
+    """The caller's own Discord permission - not the bot's.
+
+    DM channels have no permission model, so this is False there and purging in
+    a DM is refused.
+    """
+    permissions_for = getattr(channel, "permissions_for", None)
+    if permissions_for is None:
+        return False
+    try:
+        return bool(getattr(permissions_for(user), "manage_messages", False))
+    except Exception:
+        return False
+
+
+def authorize_caller(action, user_id, channel_id=None, caller_can_manage_messages=False):
+    """Every entry point - text command, slash command, steering - lands here."""
+    return authz.authorize(
+        action,
+        user_id,
+        allowed_user_ids=ALLOWED_USER_IDS,
+        admin_user_ids=ADMIN_USER_IDS,
+        tools_enabled=TOOLS_ENABLED,
+        run_owner_id=channel_run_owner.get(channel_id),
+        caller_can_manage_messages=caller_can_manage_messages,
+    )
+
+
+def agent_tool_params() -> dict:
+    """Honor BOT_TOOLS_ENABLED. With tools off the model is never offered any."""
+    if not TOOLS_ENABLED:
+        return {}
+    return {"tools": TOOLS_SCHEMA, "tool_choice": "auto"}
+
+
+def clear_channel_state(channel_id) -> None:
+    channel_history[channel_id].clear()
+    channel_summary[channel_id] = ""
+    channel_ledger[channel_id].clear()
+    channel_stop_requested[channel_id] = False
+    channel_user_queue[channel_id].clear()
+
 
 MAX_RECENT_TURNS = 8
 CHECKPOINT_INTERVAL = 10
@@ -974,40 +1020,82 @@ async def on_ready():
     await bot.change_presence(activity=discord.Game(name="Qwen 27B + Auto-Extension"), status=discord.Status.online)
 
 # --- Slash Commands ---
+# 슬래시 명령도 텍스트 명령과 동일한 정책 경로(authorize_caller)를 사용한다.
+
+async def deny_interaction(interaction: discord.Interaction, action: str, decision) -> None:
+    print(
+        f"[Access Denied] user={getattr(interaction.user, 'id', None)} "
+        f"channel={interaction.channel_id} action={action} reason={decision.reason}",
+        flush=True,
+    )
+    message = decision.reason if action != authz.ACCESS else authz.DENY_ACCESS_MESSAGE
+    await interaction.response.send_message(f"⛔ {message}", ephemeral=True)
+
+
+def interaction_can_manage_messages(interaction: discord.Interaction) -> bool:
+    permissions = getattr(interaction, "permissions", None)
+    if permissions is not None and hasattr(permissions, "manage_messages"):
+        return bool(permissions.manage_messages)
+    return caller_can_manage_messages(interaction.channel, interaction.user)
+
 
 @bot.tree.command(name="reset", description="대화 기록 및 캐시를 초기화합니다.")
 async def slash_reset(interaction: discord.Interaction):
-    channel_history[interaction.channel_id].clear()
-    channel_summary[interaction.channel_id] = ""
-    channel_ledger[interaction.channel_id].clear()
-    channel_stop_requested[interaction.channel_id] = False
-    channel_user_queue[interaction.channel_id].clear()
+    decision = authorize_caller(
+        authz.CONTROL, getattr(interaction.user, "id", None), channel_id=interaction.channel_id
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.CONTROL, decision)
+        return
+    clear_channel_state(interaction.channel_id)
     await interaction.response.send_message("🧹 **대화 기록과 컨텍스트 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
 
 @bot.tree.command(name="stop", description="현재 진행 중인 자율 탐색을 즉시 중단하고 최종 보고서를 합성합니다.")
 async def slash_stop(interaction: discord.Interaction):
+    decision = authorize_caller(
+        authz.CONTROL, getattr(interaction.user, "id", None), channel_id=interaction.channel_id
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.CONTROL, decision)
+        return
     channel_stop_requested[interaction.channel_id] = True
     await interaction.response.send_message("🛑 **자율 탐색 중단 요청을 수신했습니다.** 현재까지 수집된 데이터를 바탕으로 즉시 보고서를 작성합니다.", ephemeral=True)
 
 @bot.tree.command(name="clear", description="입력한 개수만큼 최근 메시지와 대화 기록을 한 번에 삭제합니다.")
 async def slash_clear(interaction: discord.Interaction, count: int = 50):
+    decision = authorize_caller(
+        authz.PURGE,
+        getattr(interaction.user, "id", None),
+        channel_id=interaction.channel_id,
+        caller_can_manage_messages=interaction_can_manage_messages(interaction),
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.PURGE, decision)
+        return
+
+    amt = min(max(1, count), 100)
+    await interaction.response.defer(ephemeral=True)
+    # 삭제 성공 이후에만 대화 상태를 지운다.
     try:
-        channel_history[interaction.channel_id].clear()
-        channel_summary[interaction.channel_id] = ""
-        channel_ledger[interaction.channel_id].clear()
-        channel_stop_requested[interaction.channel_id] = False
-        channel_user_queue[interaction.channel_id].clear()
-        amt = min(max(1, count), 100)
-        await interaction.response.defer(ephemeral=True)
         deleted = await interaction.channel.purge(limit=amt)
-        await interaction.followup.send(f"🧹 **최근 메시지 {len(deleted)}개와 봇 대화 기록을 모두 삭제했습니다.**", ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send("⚠️ **권한 부족**: 봇에게 채널의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다.", ephemeral=True)
+        await interaction.followup.send("⚠️ **권한 부족**: 봇에게 채널의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다. 대화 기록은 유지되었습니다.", ephemeral=True)
+        return
     except Exception as e:
-        await interaction.followup.send(f"⚠️ 메시지 삭제 중 오류 발생: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"⚠️ 메시지 삭제 중 오류 발생: `{e}` 대화 기록은 유지되었습니다.", ephemeral=True)
+        return
+
+    clear_channel_state(interaction.channel_id)
+    await interaction.followup.send(f"🧹 **최근 메시지 {len(deleted)}개와 봇 대화 기록을 모두 삭제했습니다.**", ephemeral=True)
 
 @bot.tree.command(name="reasoning", description="추론 레벨을 변경합니다 (none, low, medium, high)")
 async def slash_reasoning(interaction: discord.Interaction, level: str):
+    decision = authorize_caller(
+        authz.ACCESS, getattr(interaction.user, "id", None), channel_id=interaction.channel_id
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.ACCESS, decision)
+        return
     lvl = level.lower().strip()
     if lvl not in ["none", "low", "medium", "high"]:
         await interaction.response.send_message("⚠️ 유효한 레벨은 `none`, `low`, `medium`, `high` 입니다.", ephemeral=True)
@@ -1029,56 +1117,89 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
-    parts = content.split()
-    cmd_name = parts[0].lower()
-
-    if cmd_name in ["!stop", "!중단", "!멈춰", "/stop"]:
-        channel_stop_requested[message.channel.id] = True
-        await message.reply("🛑 **자율 탐색 중단 요청을 수신했습니다.** 다음 단계에서 즉시 보고서를 종합 작성합니다.")
-        return
-
-    if cmd_name in ["!reset", "!new", "!리셋", "!초기화", "/reset", "/new"]:
-        channel_history[message.channel.id].clear()
-        channel_summary[message.channel.id] = ""
-        channel_ledger[message.channel.id].clear()
-        channel_stop_requested[message.channel.id] = False
-        channel_user_queue[message.channel.id].clear()
-        await message.reply("🧹 **대화 기록과 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
-        return
-
-    if cmd_name in ["!clear", "!purge", "!삭제", "!청소"]:
-        amount = 50
-        if len(parts) > 1 and parts[1].isdigit():
-            amount = int(parts[1])
-        amount = min(max(1, amount), 100)
-
-        channel_history[message.channel.id].clear()
-        channel_summary[message.channel.id] = ""
-        channel_ledger[message.channel.id].clear()
-        channel_stop_requested[message.channel.id] = False
-        channel_user_queue[message.channel.id].clear()
-        print(f"[Clear Command]: Purging {amount} messages in channel {message.channel.id}", flush=True)
-
-        try:
-            deleted = await message.channel.purge(limit=amount + 1)
-            del_count = max(0, len(deleted) - 1)
-            notice = await message.channel.send(f"🧹 **최근 메시지 {del_count}개와 봇 대화 기록을 모두 삭제했습니다.**")
-            await asyncio.sleep(3)
-            try:
-                await notice.delete()
-            except Exception:
-                pass
-        except discord.Forbidden:
-            await message.channel.send("⚠️ **권한 부족**: 봇에게 서버의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다.")
-        except Exception as e:
-            await message.channel.send(f"⚠️ 메시지 삭제 실패: `{e}`")
-        return
-
+    # [라우팅 판정] DM·멘션·허용 채널은 "어디서 왔는가"만 말한다. 신원이 아니다.
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_free_channel = (message.channel.id in FREE_RESPONSE_CHANNEL_IDS)
     is_mentioned = bot.user in message.mentions
 
     if not (is_dm or is_free_channel or is_mentioned):
+        return
+
+    # [신원 게이트] 로그 기록·상태 변경·큐 적재·purge·모델 호출·도구 실행보다 먼저.
+    # 제어 명령도 이 뒤에서만 처리된다.
+    caller_id = getattr(message.author, "id", None)
+    access = authorize_caller(authz.ACCESS, caller_id, channel_id=message.channel.id)
+    if not access:
+        print(
+            f"[Access Denied] user={caller_id} channel={message.channel.id} action=access "
+            f"reason={access.reason}",
+            flush=True,
+        )
+        await message.reply(authz.DENY_ACCESS_MESSAGE)
+        return
+
+    parts = content.split()
+    cmd_name = parts[0].lower()
+
+    if cmd_name in ["!stop", "!중단", "!멈춰", "/stop"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        channel_stop_requested[message.channel.id] = True
+        await message.reply("🛑 **자율 탐색 중단 요청을 수신했습니다.** 다음 단계에서 즉시 보고서를 종합 작성합니다.")
+        return
+
+    if cmd_name in ["!reset", "!new", "!리셋", "!초기화", "/reset", "/new"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        clear_channel_state(message.channel.id)
+        await message.reply("🧹 **대화 기록과 캐시가 초기화되었습니다.** 새로운 목표를 입력하세요!")
+        return
+
+    if cmd_name in ["!clear", "!purge", "!삭제", "!청소"]:
+        purge = authorize_caller(
+            authz.PURGE,
+            caller_id,
+            channel_id=message.channel.id,
+            caller_can_manage_messages=caller_can_manage_messages(message.channel, message.author),
+        )
+        if not purge:
+            print(
+                f"[Purge Denied] user={caller_id} channel={message.channel.id} reason={purge.reason}",
+                flush=True,
+            )
+            await message.reply(f"⛔ {purge.reason}")
+            return
+
+        amount = 50
+        if len(parts) > 1 and parts[1].isdigit():
+            amount = int(parts[1])
+        amount = min(max(1, amount), 100)
+
+        print(f"[Clear Command]: Purging {amount} messages in channel {message.channel.id}", flush=True)
+
+        # 삭제를 먼저 시도하고, 성공한 뒤에만 대화 상태를 지운다. 예전에는 순서가
+        # 반대여서 권한이 없어 삭제가 실패해도 기록은 이미 사라져 있었다.
+        try:
+            deleted = await message.channel.purge(limit=amount + 1)
+        except discord.Forbidden:
+            await message.channel.send("⚠️ **권한 부족**: 봇에게 서버의 **'메시지 관리 (Manage Messages)'** 권한이 필요합니다. 대화 기록은 유지되었습니다.")
+            return
+        except Exception as e:
+            await message.channel.send(f"⚠️ 메시지 삭제 실패: `{e}` 대화 기록은 유지되었습니다.")
+            return
+
+        clear_channel_state(message.channel.id)
+        del_count = max(0, len(deleted) - 1)
+        notice = await message.channel.send(f"🧹 **최근 메시지 {del_count}개와 봇 대화 기록을 모두 삭제했습니다.**")
+        await asyncio.sleep(3)
+        try:
+            await notice.delete()
+        except Exception:
+            pass
         return
 
     if content.startswith("!"):
@@ -1089,10 +1210,14 @@ async def on_message(message: discord.Message):
 
     # [실시간 동적 개입 큐 주입]
     if channel_active_runs[message.channel.id]:
+        steering = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not steering:
+            await message.reply(f"⛔ {steering.reason}")
+            return
         channel_user_queue[message.channel.id].append((str(message.author), content))
         log_session_event(session_file, f"💬 [사용자 실시간 중간 개입] {message.author}", content)
         print(f"[Mid-Flight User Steering Queued from {message.author}]: {content}", flush=True)
-        
+
         try:
             await message.add_reaction("📥")
         except Exception:
@@ -1183,6 +1308,7 @@ async def on_message(message: discord.Message):
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing_heartbeat(message.channel, stop_typing))
     channel_active_runs[message.channel.id] = True
+    channel_run_owner[message.channel.id] = caller_id
 
     try:
         final_raw = ""
@@ -1228,10 +1354,9 @@ async def on_message(message: discord.Message):
                 resp = await create_streaming_completion(
                     model=MODEL_NAME,
                     messages=compacted_payload,
-                    tools=TOOLS_SCHEMA,
-                    tool_choice="auto",
                     max_tokens=1024 if iteration == 0 else 4096,
                     temperature=0.7,
+                    **agent_tool_params(),
                     **extra_params
                 )
             except Exception as api_err:
@@ -1256,10 +1381,9 @@ async def on_message(message: discord.Message):
                     resp = await create_streaming_completion(
                         model=MODEL_NAME,
                         messages=sanitize_messages_for_chat_template(sanitized_payload),
-                        tools=TOOLS_SCHEMA,
-                        tool_choice="auto",
                         max_tokens=1024 if iteration == 0 else 4096,
                         temperature=0.7,
+                        **agent_tool_params(),
                         **extra_params
                     )
                 else:
@@ -1656,6 +1780,7 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
         channel_active_runs[message.channel.id] = False
+        channel_run_owner.pop(message.channel.id, None)
         channel_user_queue[message.channel.id].clear()
 
 async def main():
