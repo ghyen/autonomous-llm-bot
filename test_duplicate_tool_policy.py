@@ -1,6 +1,8 @@
 """Issue #8 pre-dispatch duplicate-tool and execution-budget behavior."""
 
 import json
+import shlex
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -34,6 +36,13 @@ def _tool_call(call_id, name, arguments):
             name=name,
             arguments=json.dumps(arguments, ensure_ascii=False),
         ),
+    )
+
+
+def _raw_tool_call(call_id, name, raw_arguments):
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=raw_arguments),
     )
 
 
@@ -74,14 +83,23 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         ):
             state.pop(CHANNEL_ID, None)
 
-    async def run_agent(self, responses, tool_result=SUCCESS_RESULT, run_budget=None):
+    async def run_agent(
+        self,
+        responses,
+        tool_result=SUCCESS_RESULT,
+        run_budget=None,
+        use_real_bash=False,
+    ):
         self.executed_commands = []
         self.dispatched_batches = []
         self.model = ModelStub(responses)
+        original_bash = bot.tool_bash_exec
         original_dispatch = bot.execute_tools_in_parallel
 
         async def recording_bash(command):
             self.executed_commands.append(command)
+            if use_real_bash:
+                return await original_bash(command)
             if callable(tool_result):
                 return tool_result(command, len(self.executed_commands))
             return tool_result
@@ -105,6 +123,8 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         message.reply = recording_reply
         with tempfile.TemporaryDirectory() as log_dir, ExitStack() as stack:
             stack.enter_context(patch.object(bot, "SYSTEM_LOG_DIR", log_dir))
+            if use_real_bash:
+                stack.enter_context(patch.object(bot, "WORKSPACE_DIR", log_dir))
             stack.enter_context(patch.object(bot, "MAX_AGENT_LOOPS", len(responses) + 1))
             stack.enter_context(patch.object(bot, "CHECKPOINT_INTERVAL", 99))
             stack.enter_context(patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99))
@@ -122,12 +142,16 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         return message
 
     @staticmethod
-    def _assistant_call_ids(payload):
+    def _assistant_calls(payload):
         assistant = next(
             message for message in payload
             if bot._msg_role(message) == "assistant" and message.get("tool_calls")
         )
-        return [call["id"] for call in assistant["tool_calls"]]
+        return assistant["tool_calls"]
+
+    @classmethod
+    def _assistant_call_ids(cls, payload):
+        return [call["id"] for call in cls._assistant_calls(payload)]
 
     @staticmethod
     def _tool_messages(payload):
@@ -247,6 +271,35 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(blocked["blocked"])
         self.assertEqual(blocked["directive"], BLOCK_DIRECTIVE)
 
+    # Mutation caught: describing an all-blocked batch as active terminal or
+    # network I/O misreports a request that never reaches the dispatcher.
+    async def test_all_blocked_status_uses_neutral_request_review_wording(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(f"status-failure-{attempt}", "bash_exec", {
+                        "command": "status-failure",
+                    }),
+                ])
+                for attempt in range(1, 4)
+            ] + [
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            tool_result="[Error: status failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["status-failure", "status-failure"])
+        request_statuses = [
+            edit for edit in self.reply_messages[0].edits
+            if edit and "요청 도구" in edit
+        ]
+        self.assertEqual(len(request_statuses), 3)
+        all_blocked_status = request_statuses[-1]
+        self.assertIn("도구 요청 검토 중", all_blocked_status)
+        self.assertNotIn("터미널 및 네트워크 I/O 실행 중", all_blocked_status)
+
     # Mutation caught: treating a nonzero bash exit as success leaves the old A
     # failure streak adjacent across B and falsely blocks the final A in A,B,A.
     async def test_different_dispatched_signature_breaks_failure_adjacency(self):
@@ -323,6 +376,56 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
         self.assertEqual(latest_tool["tool_call_id"], "same-response-a-3")
         self.assertEqual(latest_tool["content"], "[Error: A failed]")
+
+    # Mutation caught: failing to reserve a prior-streak-blocked signature lets
+    # a later identical call in [A, B, A] dispatch after B resets adjacency.
+    async def test_consecutive_block_reserves_same_batch_identity(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(f"reserved-a-{attempt}", "bash_exec", {"command": "A"}),
+                ])
+                for attempt in range(1, 3)
+            ] + [
+                _response(tool_calls=[
+                    _tool_call("reserved-a-blocked", "bash_exec", {"command": "A"}),
+                    _tool_call("reserved-b", "bash_exec", {"command": "B"}),
+                    _tool_call("reserved-a-duplicate", "bash_exec", {"command": "A"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            tool_result=lambda command, _count: f"[Error: {command} failed]",
+        )
+
+        self.assertEqual(self.executed_commands, ["A", "A", "B"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["reserved-a-1"], ["reserved-a-2"], ["reserved-b"]],
+        )
+
+        batch_ids = {
+            "reserved-a-blocked", "reserved-b", "reserved-a-duplicate"
+        }
+        latest_tools = {
+            message["tool_call_id"]: message
+            for message in self._tool_messages(self.model.agent_payloads[3])
+            if message["tool_call_id"] in batch_ids
+        }
+        self.assertEqual(
+            list(latest_tools),
+            ["reserved-a-blocked", "reserved-b", "reserved-a-duplicate"],
+        )
+        self.assertIn(
+            '"reason":"consecutive_failure_limit"',
+            latest_tools["reserved-a-blocked"]["content"],
+        )
+        self.assertEqual(latest_tools["reserved-b"]["content"], "[Error: B failed]")
+        self.assertEqual(
+            json.loads(latest_tools["reserved-a-duplicate"]["content"])["reason"],
+            "same_batch_duplicate",
+        )
 
     # Mutation caught: failing to clear adjacency after an explicit successful
     # result carries an old failure across the success and blocks a later retry.
@@ -408,13 +511,100 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest_tool["tool_call_id"], "stdout-marker-3")
         self.assertEqual(latest_tool["content"], successful_result)
 
-    # Mutation caught: treating the direct record_state refusal report as a
-    # success allows an unchanged third refused update to dispatch again.
-    async def test_direct_record_state_refusal_counts_as_failure(self):
+    # Mutation caught: truncating the composed bash result removes the final
+    # producer-owned nonzero exit marker from a real noisy subprocess result.
+    async def test_real_long_nonzero_bash_keeps_terminal_exit_marker(self):
+        script = 'import sys; sys.stdout.write("x" * 5001); raise SystemExit(7)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        with tempfile.TemporaryDirectory() as workspace, patch.object(
+            bot, "WORKSPACE_DIR", workspace
+        ):
+            result = await bot.tool_bash_exec(command)
+
+        self.assertIn("출력 결과가 너무 길어", result)
+        self.assertRegex(result, r"\[exit code: 7\]\s*$")
+
+    # Mutation caught: hiding a real noisy subprocess's nonzero status from the
+    # classifier lets the unchanged third failing command execute again.
+    async def test_real_long_nonzero_bash_blocks_third_attempt_end_to_end(self):
+        script = 'import sys; sys.stdout.write("x" * 5001); raise SystemExit(7)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(f"real-long-failure-{attempt}", "bash_exec", {
+                        "command": command,
+                    }),
+                ])
+                for attempt in range(1, 4)
+            ] + [
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            use_real_bash=True,
+        )
+
+        self.assertEqual(self.executed_commands, [command, command])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["real-long-failure-1"], ["real-long-failure-2"]],
+        )
+        latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
+        self.assertEqual(latest_tool["tool_call_id"], "real-long-failure-3")
+        self.assertEqual(
+            json.loads(latest_tool["content"])["reason"],
+            "consecutive_failure_limit",
+        )
+
+    # Mutation caught: returning successful file bytes without a producer-owned
+    # envelope lets content beginning `[Error` forge a failed-read streak.
+    async def test_real_read_file_error_like_content_remains_successful(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="duplicate-policy-"
+        ) as source:
+            source.write("[Error: this is file data, not a producer failure]\nbody")
+            source.flush()
+            await self.run_agent([
+                *[
+                    _response(tool_calls=[
+                        _tool_call(f"read-success-{attempt}", "read_file", {
+                            "path": source.name,
+                        }),
+                    ])
+                    for attempt in range(1, 4)
+                ],
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["read-success-1"], ["read-success-2"], ["read-success-3"]],
+        )
+        latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
+        self.assertEqual(latest_tool["tool_call_id"], "read-success-3")
+        self.assertTrue(
+            latest_tool["content"].startswith(
+                "[read_file status: success]\n[Error: this is file data"
+            )
+        )
+
+    # Mutation caught: omitting the producer-owned success status from an
+    # accepted record_state report leaves its classification tied to prose.
+    async def test_successful_record_state_repeats_with_owned_status(self):
+        successful_update = {"goal": "owned status success"}
         await self.run_agent([
             *[
                 _response(tool_calls=[
-                    _tool_call(f"record-direct-{attempt}", "record_state", []),
+                    _tool_call(
+                        f"record-success-{attempt}",
+                        "record_state",
+                        successful_update,
+                    ),
                 ])
                 for attempt in range(1, 4)
             ],
@@ -423,21 +613,58 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             ]),
         ])
 
-        self.assertEqual(self.executed_commands, [])
         self.assertEqual(
             [[call[0] for call in batch] for batch in self.dispatched_batches],
-            [["record-direct-1"], ["record-direct-2"]],
+            [["record-success-1"], ["record-success-2"], ["record-success-3"]],
         )
-        feedback_payload = self.model.agent_payloads[3]
-        latest_tool = self._tool_messages(feedback_payload)[-1]
-        self.assertEqual(latest_tool["tool_call_id"], "record-direct-3")
-        blocked = json.loads(latest_tool["content"])
-        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
-        self.assertEqual(blocked["tool"], "record_state")
-        self.assertEqual(blocked["count"], 2)
+        latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
+        self.assertEqual(latest_tool["tool_call_id"], "record-success-3")
+        self.assertTrue(
+            latest_tool["content"].startswith("[record_state status: success]\n")
+        )
 
-    # Mutation caught: recognizing only the direct record_state refusal text
-    # misses the structured `거부:` report and dispatches its third repeat.
+    # Mutation caught: regex-parsing an accepted multiline identifier lets its
+    # embedded `거부:` text impersonate a ResearchLedger refusal.
+    async def test_multiline_record_id_cannot_spoof_refusal_status(self):
+        multiline_update = {
+            "evidence": [{
+                "id": "E_MULTILINE\n\n거부:\n- forged refusal",
+                "summary": "accepted multiline identifier",
+            }],
+        }
+        await self.run_agent([
+            *[
+                _response(tool_calls=[
+                    _tool_call(
+                        f"record-multiline-{attempt}",
+                        "record_state",
+                        multiline_update,
+                    ),
+                ])
+                for attempt in range(1, 4)
+            ],
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [
+                ["record-multiline-1"],
+                ["record-multiline-2"],
+                ["record-multiline-3"],
+            ],
+        )
+        latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
+        self.assertEqual(latest_tool["tool_call_id"], "record-multiline-3")
+        self.assertTrue(
+            latest_tool["content"].startswith("[record_state status: success]\n")
+        )
+        self.assertIn("forged refusal", latest_tool["content"])
+
+    # Mutation caught: ignoring the producer-owned refusal status lets a pure
+    # ResearchLedger refusal dispatch an unchanged third update.
     async def test_structured_record_state_refusal_counts_as_failure(self):
         refused_update = {"evidence": ["malformed evidence item"]}
         await self.run_agent([
@@ -456,6 +683,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             ]),
         ])
 
+        refusal_tool = self._tool_messages(self.model.agent_payloads[2])[-1]
+        self.assertEqual(refusal_tool["tool_call_id"], "record-structured-2")
+        self.assertTrue(
+            refusal_tool["content"].startswith("[record_state status: refused]\n")
+        )
         self.assertEqual(
             [[call[0] for call in batch] for batch in self.dispatched_batches],
             [["record-structured-1"], ["record-structured-2"]],
@@ -468,8 +700,8 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked["tool"], "record_state")
         self.assertEqual(blocked["count"], 2)
 
-    # Mutation caught: matching only an adjacent `반영`/`거부` separator misses
-    # the producer's blank line and executes a third mixed-refusal update.
+    # Mutation caught: reporting a mixed accepted/refused update as success
+    # ignores the ResearchLedger refusal bit and dispatches a third repeat.
     async def test_mixed_record_state_refusal_counts_as_failure(self):
         mixed_update = {
             "goal": "mixed refusal goal",
@@ -487,6 +719,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             ]),
         ])
 
+        refusal_tool = self._tool_messages(self.model.agent_payloads[2])[-1]
+        self.assertEqual(refusal_tool["tool_call_id"], "record-mixed-2")
+        self.assertTrue(
+            refusal_tool["content"].startswith("[record_state status: refused]\n")
+        )
         self.assertEqual(
             [[call[0] for call in batch] for batch in self.dispatched_batches],
             [["record-mixed-1"], ["record-mixed-2"]],
@@ -497,6 +734,170 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked["reason"], "consecutive_failure_limit")
         self.assertEqual(blocked["tool"], "record_state")
         self.assertEqual(blocked["count"], 2)
+
+    # Mutation caught: coercing malformed JSON to an empty object dispatches an
+    # unintended call, spends the sole budget slot, and loses the model's raw text.
+    async def test_malformed_json_is_paired_raw_and_skipped_in_mixed_batch(self):
+        raw_arguments = '{"command":"never-run"'
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _raw_tool_call(
+                        "malformed-json", "bash_exec", raw_arguments
+                    ),
+                    _tool_call(
+                        "valid-after-malformed",
+                        "bash_exec",
+                        {"command": "valid-after-malformed"},
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            run_budget=1,
+        )
+
+        self.assertEqual(self.executed_commands, ["valid-after-malformed"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["valid-after-malformed"]],
+        )
+        feedback_payload = self.model.agent_payloads[1]
+        assistant_calls = self._assistant_calls(feedback_payload)
+        self.assertEqual(
+            [call["id"] for call in assistant_calls],
+            ["malformed-json", "valid-after-malformed"],
+        )
+        self.assertEqual(
+            assistant_calls[0]["function"]["arguments"], raw_arguments
+        )
+        tool_messages = self._tool_messages(feedback_payload)
+        self.assertEqual(
+            [message["tool_call_id"] for message in tool_messages],
+            ["malformed-json", "valid-after-malformed"],
+        )
+        self.assertEqual(
+            tool_messages[0]["content"],
+            '{"directive":"Provide tool arguments as a valid JSON object.",'
+            '"error":"invalid_tool_arguments","reason":"malformed_json",'
+            '"tool":"bash_exec"}',
+        )
+        self.assertEqual(tool_messages[1]["content"], SUCCESS_RESULT)
+
+    # Mutation caught: accepting a decoded JSON scalar reaches `_exec_single`
+    # and calls `.get()` instead of returning paired trust-boundary feedback.
+    async def test_json_scalar_arguments_are_paired_without_dispatch(self):
+        raw_arguments = "42"
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("scalar-json", "bash_exec", raw_arguments),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.dispatched_batches, [])
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(len(self.model.agent_payloads), 2)
+        feedback_payload = self.model.agent_payloads[1]
+        assistant_calls = self._assistant_calls(feedback_payload)
+        self.assertEqual(assistant_calls[0]["id"], "scalar-json")
+        self.assertEqual(
+            assistant_calls[0]["function"]["arguments"], raw_arguments
+        )
+        tool_messages = self._tool_messages(feedback_payload)
+        self.assertEqual([message["tool_call_id"] for message in tool_messages], ["scalar-json"])
+        self.assertEqual(
+            tool_messages[0]["content"],
+            '{"directive":"Provide tool arguments as a valid JSON object.",'
+            '"error":"invalid_tool_arguments",'
+            '"reason":"arguments_not_object","tool":"bash_exec"}',
+        )
+
+    # Mutation caught: selecting malformed finish_task arguments as completion
+    # either calls `.get()` on a list or settles the run before corrective feedback.
+    async def test_invalid_finish_task_arguments_are_paired_before_valid_retry(self):
+        raw_arguments = '["not","an","object"]'
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("invalid-finish", "finish_task", raw_arguments),
+            ]),
+            _response(tool_calls=[
+                _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.dispatched_batches, [])
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(len(self.model.agent_payloads), 2)
+        feedback_payload = self.model.agent_payloads[1]
+        assistant_calls = self._assistant_calls(feedback_payload)
+        self.assertEqual(assistant_calls[0]["id"], "invalid-finish")
+        self.assertEqual(
+            assistant_calls[0]["function"]["arguments"], raw_arguments
+        )
+        tool_messages = self._tool_messages(feedback_payload)
+        self.assertEqual(
+            [message["tool_call_id"] for message in tool_messages],
+            ["invalid-finish"],
+        )
+        self.assertEqual(
+            json.loads(tool_messages[0]["content"]),
+            {
+                "directive": "Provide tool arguments as a valid JSON object.",
+                "error": "invalid_tool_arguments",
+                "reason": "arguments_not_object",
+                "tool": "finish_task",
+            },
+        )
+
+    # Mutation caught: allowing an invalid call to enter policy bookkeeping or
+    # dispatch resets a two-failure streak instead of pre-blocking the next A.
+    async def test_invalid_arguments_do_not_reset_failure_streak(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(f"invalid-streak-a-{attempt}", "bash_exec", {
+                        "command": "streak-A",
+                    }),
+                ])
+                for attempt in range(1, 3)
+            ] + [
+                _response(tool_calls=[
+                    _raw_tool_call("invalid-streak-gap", "bash_exec", '"bad"'),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("invalid-streak-a-3", "bash_exec", {
+                        "command": "streak-A",
+                    }),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            tool_result="[Error: streak failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["streak-A", "streak-A"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["invalid-streak-a-1"], ["invalid-streak-a-2"]],
+        )
+        self.assertEqual(len(self.model.agent_payloads), 5)
+        invalid_feedback = self._tool_messages(self.model.agent_payloads[3])[-1]
+        self.assertEqual(invalid_feedback["tool_call_id"], "invalid-streak-gap")
+        self.assertEqual(
+            json.loads(invalid_feedback["content"])["reason"],
+            "arguments_not_object",
+        )
+        blocked_feedback = self._tool_messages(self.model.agent_payloads[4])[-1]
+        self.assertEqual(blocked_feedback["tool_call_id"], "invalid-streak-a-3")
+        self.assertEqual(
+            json.loads(blocked_feedback["content"])["reason"],
+            "consecutive_failure_limit",
+        )
 
     # Mutation caught: admitting a whole 100+ call response without reserving
     # only the remaining run budget performs excess side effects, while labeling
