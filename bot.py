@@ -382,8 +382,42 @@ def clear_channel_state(channel_id) -> None:
 MAX_RECENT_TURNS = 8
 CHECKPOINT_INTERVAL = 10
 MAX_AGENT_LOOPS = 250
+MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
+MAX_TOOL_EXECUTIONS_PER_RUN = 250
 
 MAX_NO_TOOL_RESPONSES = 6
+
+
+def _blocked_tool_result(reason: str, tool_name: str, limit: int, count: int) -> str:
+    return json.dumps(
+        {
+            "blocked": True,
+            "reason": reason,
+            "tool": tool_name,
+            "limit": limit,
+            "count": count,
+            "directive": (
+                "Change the arguments or use a different approach before retrying."
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _tool_result_failed(tool_name: str, result: str) -> bool:
+    if result.startswith("[Error"):
+        return True
+    if tool_name == "bash_exec":
+        exit_code = re.search(r"\[exit code: (-?\d+)\]\s*$", result)
+        return bool(exit_code and int(exit_code.group(1)) != 0)
+    if tool_name == "record_state":
+        return result.startswith("상태 갱신을 거부했습니다:") or bool(re.match(
+            r"^(?:반영: [^\n]+\n\n)?거부:\n- ", result
+        ))
+    return False
+
 
 ROLLING_COMPACTION_INTERVAL = 10
 KEEP_RECENT_TOOL_MESSAGES = 8
@@ -1583,7 +1617,8 @@ async def on_message(message: discord.Message):
     publish_run_control()
 
     total_tools_executed = 0
-    executed_call_signatures = []
+    last_failed_signature = None
+    consecutive_failed_tool_calls = 0
 
     async def maybe_roll_context(step_num: int):
         nonlocal messages_payload, rolling_summary
@@ -1849,11 +1884,10 @@ async def on_message(message: discord.Message):
                 elapsed_live = format_elapsed_time(time.time() - start_time)
                 tools_display = ", ".join([f"`{tc['name']}`" for tc in tool_calls_to_run[:3]])
                 last_th_line = display_thought.splitlines()[-1][:80] if display_thought else "도구 실행 준비"
-                prospective_tool_total = total_tools_executed + len(tool_calls_to_run)
                 tool_live_text = (
                     f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
-                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 총 도구: `{prospective_tool_total}개`)\n"
-                    f"> 🛠️ **실행 도구**: {tools_display}\n"
+                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 현재까지 실행: `{total_tools_executed}개`)\n"
+                    f"> 🛠️ **요청 도구**: {tools_display}\n"
                     f"> 💭 **최근 판단**: `{last_th_line}`\n"
                     f"> ⚡ *터미널 및 네트워크 I/O 실행 중... (실시간 지시 가능 / 중단: `!stop`)*"
                 )
@@ -1868,37 +1902,98 @@ async def on_message(message: discord.Message):
                     settle_stage_failure(stage_error)
                     break
 
-                total_tools_executed = prospective_tool_total
+                batch_signatures = set()
+                allowed_calls = []
+                allowed_indexes = []
+                allowed_signatures = []
+                merged_results = [None] * len(tool_calls_to_run)
+                for call_index, tc in enumerate(tool_calls_to_run):
+                    signature = (
+                        tc["name"],
+                        json.dumps(
+                            tc["arguments"],
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    )
+                    if signature in batch_signatures:
+                        merged_results[call_index] = _blocked_tool_result(
+                            "same_batch_duplicate", tc["name"], 1, 1
+                        )
+                        continue
+                    if (
+                        signature == last_failed_signature
+                        and consecutive_failed_tool_calls
+                        >= MAX_CONSECUTIVE_FAILED_TOOL_CALLS
+                    ):
+                        merged_results[call_index] = _blocked_tool_result(
+                            "consecutive_failure_limit",
+                            tc["name"],
+                            MAX_CONSECUTIVE_FAILED_TOOL_CALLS,
+                            consecutive_failed_tool_calls,
+                        )
+                        continue
+                    if (
+                        total_tools_executed + len(allowed_calls)
+                        >= MAX_TOOL_EXECUTIONS_PER_RUN
+                    ):
+                        merged_results[call_index] = _blocked_tool_result(
+                            "run_tool_budget_exhausted",
+                            tc["name"],
+                            MAX_TOOL_EXECUTIONS_PER_RUN,
+                            total_tools_executed + len(allowed_calls),
+                        )
+                        continue
+                    batch_signatures.add(signature)
+                    allowed_calls.append(tc)
+                    allowed_indexes.append(call_index)
+                    allowed_signatures.append(signature)
+                    if (
+                        last_failed_signature is not None
+                        and signature != last_failed_signature
+                    ):
+                        last_failed_signature = None
+                        consecutive_failed_tool_calls = 0
+
+                total_tools_executed += len(allowed_calls)
                 messages_payload.append({
                     "role": "assistant",
                     "content": content_text or None,
                     "tool_calls": synthetic_tool_calls
                 })
-                for tc in tool_calls_to_run:
+                for tc in allowed_calls:
                     print(f"Executing tool {tc['name']} with args {tc['arguments']}", flush=True)
                     log_session_event(session_file, f"🛠️ [Step {iteration+1} 도구 호출] {tc['name']}", json.dumps(tc['arguments'], ensure_ascii=False, indent=2))
 
-                try:
-                    parallel_results = await execute_tools_in_parallel(
-                        tool_calls_to_run, step_num=iteration+1, ledger=ledger, token=token
-                    )
-                except (RunCancelled, StageTimeout) as stage_error:
-                    settle_stage_failure(stage_error)
-                    break
-                except Exception as tool_error:
-                    settle_stage_failure(tool_error)
-                    break
-
-                for tc, tool_result in zip(tool_calls_to_run, parallel_results):
-                    sig = (tc["name"], json.dumps(tc["arguments"], sort_keys=True))
-                    executed_call_signatures.append(sig)
-                    if executed_call_signatures.count(sig) >= 2:
-                        tool_result += (
-                            "\n\n[⚠️ 시스템 알림: 동일한 도구 호출이 2회 이상 연속 발생했습니다. "
-                            "기존 도구 결과에서 원하는 정보를 얻지 못했다면 다른 검색어, 소스코드 직접 분석, "
-                            "또는 Python 스크립트 작성 등 다른 접근 방식을 시도하세요.]"
+                parallel_results = []
+                if allowed_calls:
+                    try:
+                        parallel_results = await execute_tools_in_parallel(
+                            allowed_calls, step_num=iteration+1, ledger=ledger, token=token
                         )
+                    except (RunCancelled, StageTimeout) as stage_error:
+                        settle_stage_failure(stage_error)
+                        break
+                    except Exception as tool_error:
+                        settle_stage_failure(tool_error)
+                        break
 
+                for call_index, tc, signature, tool_result in zip(
+                    allowed_indexes, allowed_calls, allowed_signatures, parallel_results
+                ):
+                    merged_results[call_index] = tool_result
+                    if _tool_result_failed(tc["name"], tool_result):
+                        if signature == last_failed_signature:
+                            consecutive_failed_tool_calls += 1
+                        else:
+                            last_failed_signature = signature
+                            consecutive_failed_tool_calls = 1
+                    else:
+                        last_failed_signature = None
+                        consecutive_failed_tool_calls = 0
+
+                for tc, tool_result in zip(tool_calls_to_run, merged_results):
                     log_session_event(session_file, f"📥 [Step {iteration+1} 도구 실행 결과] {tc['name']}", tool_result)
 
                     messages_payload.append({
