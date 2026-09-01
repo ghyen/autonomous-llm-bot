@@ -439,15 +439,20 @@ class CanonicalIntegrityTest(WorkspaceTestCase):
 class ToolIntegrationTest(WorkspaceTestCase):
     async def test_relative_paths_and_bash_use_the_run_root_without_broadening_scope(self):
         # Production mutation caught: retaining the global cwd/path join permits
-        # run overlap, while realpath confinement would broaden Issue #7 scope.
+        # run overlap, while accepting any absolute path lets one line of model
+        # output address the whole host filesystem. Every resolved path, however
+        # it was spelled, must be a realpath under this run's root.
         workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
         self.assertEqual(workspace.resolve("nested/file.txt"), workspace.root / "nested/file.txt")
         with self.assertRaises(ValueError):
             workspace.resolve("../escape.txt")
         with self.assertRaises(ValueError):
             workspace.resolve("nested/../../escape.txt")
-        absolute = Path(self.temp_dir.name) / "absolute.txt"
-        self.assertEqual(workspace.resolve(str(absolute)), absolute)
+        outside = Path(self.temp_dir.name) / "absolute.txt"
+        with self.assertRaises(ValueError):
+            workspace.resolve(str(outside))
+        inside = workspace.root / "nested" / "absolute.txt"
+        self.assertEqual(workspace.resolve(str(inside)), inside)
 
         bash_result = await bot.tool_bash_exec(workspace, "pwd")
         self.assertIn(str(workspace.root), bash_result)
@@ -464,6 +469,116 @@ class ToolIntegrationTest(WorkspaceTestCase):
             "inside",
         )
         self.assertEqual(escaped["status"], "error")
+
+    async def test_absolute_and_symlink_paths_cannot_touch_bytes_outside_the_run(self):
+        # Production mutation caught: dropping realpath containment (lexical
+        # normpath, or an `isabs` fast path) lets `/etc/passwd`-shaped absolute
+        # paths and a symlink planted by bash_exec read and overwrite host bytes.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        canary = Path(self.temp_dir.name) / "canary.txt"
+        canary.write_text("canary-original", encoding="utf-8")
+
+        link_result = await bot.tool_bash_exec(
+            workspace, f"ln -s '{self.temp_dir.name}' escape_link"
+        )
+        self.assertIn("[exit code: 0]", link_result)
+        self.assertTrue((workspace.root / "escape_link").is_symlink())
+
+        attempts = (
+            str(canary),
+            "escape_link/canary.txt",
+            "./escape_link/../escape_link/canary.txt",
+            "../canary.txt",
+        )
+        for attempt in attempts:
+            with self.subTest(path=attempt):
+                with self.assertRaises(ValueError):
+                    workspace.resolve(attempt)
+                read_result = json.loads(await bot.tool_read_file(workspace, attempt))
+                write_result = json.loads(await bot.tool_write_file(
+                    workspace, attempt, "overwritten", None
+                ))
+                self.assertEqual(read_result["status"], "error")
+                self.assertNotIn("content", read_result)
+                self.assertEqual(write_result["status"], "error")
+        self.assertEqual(canary.read_text(encoding="utf-8"), "canary-original")
+
+        # The schema must not advertise the capability the tools now refuse.
+        read_schema = next(
+            item["function"] for item in bot.TOOLS_SCHEMA
+            if item["function"]["name"] == "read_file"
+        )
+        write_schema = next(
+            item["function"] for item in bot.TOOLS_SCHEMA
+            if item["function"]["name"] == "write_file"
+        )
+        self.assertNotIn(
+            "절대경로", read_schema["parameters"]["properties"]["path"]["description"]
+        )
+        self.assertNotIn(
+            "절대경로", write_schema["parameters"]["properties"]["path"]["description"]
+        )
+
+    async def test_session_log_bytes_are_unreachable_from_the_file_tools(self):
+        # Production mutation caught: putting the session log back under the run
+        # root, or relaxing containment, re-injects every past event header into
+        # the current context through one read_file call.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        sentinel = "SESSION-LOG-SENTINEL-4f1c"
+        workspace.log_path.write_text(f"# log\n{sentinel}\n", encoding="utf-8")
+        self.assertFalse(
+            str(os.path.realpath(str(workspace.log_path))).startswith(
+                str(os.path.realpath(str(workspace.root))) + os.sep
+            )
+        )
+
+        await bot.tool_bash_exec(
+            workspace, f"ln -s '{workspace.log_path.parent}' log_link"
+        )
+        relative_to_log = os.path.relpath(
+            str(workspace.log_path), str(workspace.root)
+        )
+        attempts = (
+            str(workspace.log_path),
+            relative_to_log,
+            f"log_link/{workspace.log_path.name}",
+        )
+        for attempt in attempts:
+            with self.subTest(path=attempt):
+                with self.assertRaises(ValueError):
+                    workspace.resolve(attempt)
+                read_result = await bot.tool_read_file(workspace, attempt)
+                self.assertEqual(json.loads(read_result)["status"], "error")
+                self.assertNotIn(sentinel, read_result)
+                write_result = await bot.tool_write_file(
+                    workspace, attempt, "clobber", None
+                )
+                self.assertEqual(json.loads(write_result)["status"], "error")
+        self.assertEqual(
+            workspace.log_path.read_text(encoding="utf-8"), f"# log\n{sentinel}\n"
+        )
+
+    async def test_bash_exec_child_env_is_an_allowlist_without_bot_credentials(self):
+        # Production mutation caught: omitting `env=` makes the shell inherit the
+        # bot process environment, so a single `env` call returns the Discord and
+        # LLM credentials config.py read at startup.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        canary = "FAKE-CREDENTIAL-CANARY-9b2e"
+        with patch.dict(
+            os.environ,
+            {"DISCORD_BOT_TOKEN": canary, "OPENAI_API_KEY": canary},
+        ):
+            printed = await bot.tool_bash_exec(workspace, "env; echo HOME=$HOME")
+
+        self.assertNotIn(canary, printed)
+        self.assertNotIn("DISCORD_BOT_TOKEN", printed)
+        self.assertNotIn("OPENAI_API_KEY", printed)
+        # An allowlist, not a denylist: an unrelated parent variable is dropped too.
+        self.assertNotIn("LLM_BASE_URL", printed)
+        # PATH still reaches the shell, otherwise the tool would be useless, and
+        # HOME points at the run so `~/.netrc`-style lookups stay inside it.
+        self.assertIn("PATH=", printed)
+        self.assertIn(f"HOME={workspace.root}", printed)
 
     async def test_prompt_schema_and_dispatcher_receive_explicit_run_context(self):
         # Production mutation caught: a global/default context makes overlapping

@@ -160,13 +160,13 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "파일의 내용을 읽어옵니다.",
+            "description": "현재 실행 작업 공간 안의 파일 내용을 읽어옵니다. 작업 공간 밖 경로는 거부됩니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "읽을 파일 경로 (절대경로 또는 현재 실행 작업 공간 기준 상대경로)"
+                        "description": "읽을 파일 경로 (현재 실행 작업 공간 기준 상대경로)"
                     }
                 },
                 "required": ["path"]
@@ -183,7 +183,7 @@ TOOLS_SCHEMA = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "작성할 파일 경로"
+                        "description": "작성할 파일 경로 (현재 실행 작업 공간 기준 상대경로)"
                     },
                     "content": {
                         "type": "string",
@@ -532,6 +532,23 @@ async def _terminate_process_tree(proc, process_group_id: int) -> None:
     except Exception:
         pass
 
+def _bash_child_env(workspace) -> Dict[str, str]:
+    """도구 셸에 넘길 환경 변수 허용 목록.
+
+    봇 프로세스 환경에는 config.py가 읽은 Discord 토큰과 LLM 자격 증명이 들어
+    있어서, 자식이 환경을 그대로 상속하면 `env` 한 번으로 전부 노출된다. 그래서
+    명령 실행에 실제로 필요한 변수만 명시적으로 전달한다. HOME/TMPDIR을 런 루트로
+    고정하는 이유는 셸이 `~/.netrc`, `~/.aws/credentials` 같은 홈 자격 증명 파일을
+    조회하지 못하게 하려는 것이다(파일 권한 자체를 막지는 못한다).
+    """
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "HOME": str(workspace.root),
+        "TMPDIR": str(workspace.root),
+    }
+
+
 async def tool_bash_exec(workspace, command: str) -> str:
     proc = None
     process_group_id = None
@@ -545,6 +562,7 @@ async def tool_bash_exec(workspace, command: str) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            env=_bash_child_env(workspace),
         )
         process_group_id = proc.pid
         try:

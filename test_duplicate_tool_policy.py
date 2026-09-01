@@ -1,6 +1,7 @@
 """Issue #8 pre-dispatch duplicate-tool and execution-budget behavior."""
 
 import json
+import os
 import shlex
 import sys
 import tempfile
@@ -88,6 +89,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         tool_result=SUCCESS_RESULT,
         run_budget=None,
         use_real_bash=False,
+        seed_files=None,
     ):
         self.executed_commands = []
         self.dispatched_batches = []
@@ -104,6 +106,14 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             return tool_result
 
         async def recording_dispatch(workspace, tool_calls, *args, **kwargs):
+            # The run root only exists once the handler has acquired it, and file
+            # tools refuse paths outside that root, so real read_file coverage has
+            # to plant its fixture bytes here rather than in a host temp file.
+            for name, text in (seed_files or {}).items():
+                with open(
+                    os.path.join(str(workspace.root), name), "w", encoding="utf-8"
+                ) as handle:
+                    handle.write(text)
             self.dispatched_batches.append([
                 (call["id"], call["name"], call["arguments"])
                 for call in tool_calls
@@ -647,16 +657,13 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
     # Mutation caught: returning successful file bytes without a producer-owned
     # envelope lets content beginning `[Error` forge a failed-read streak.
     async def test_real_read_file_error_like_content_remains_successful(self):
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", prefix="duplicate-policy-"
-        ) as source:
-            source.write("[Error: this is file data, not a producer failure]\nbody")
-            source.flush()
-            await self.run_agent([
+        error_like = "[Error: this is file data, not a producer failure]\nbody"
+        await self.run_agent(
+            [
                 *[
                     _response(tool_calls=[
                         _tool_call(f"read-success-{attempt}", "read_file", {
-                            "path": source.name,
+                            "path": "error_like.txt",
                         }),
                     ])
                     for attempt in range(1, 4)
@@ -664,7 +671,9 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
                 _response(tool_calls=[
                     _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
                 ]),
-            ])
+            ],
+            seed_files={"error_like.txt": error_like},
+        )
 
         self.assertEqual(
             [[call[0] for call in batch] for batch in self.dispatched_batches],
@@ -673,10 +682,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         first_tool = self._tool_messages(self.model.agent_payloads[1])[-1]
         first_payload = json.loads(first_tool["content"])
         self.assertEqual(first_payload["status"], "success")
-        self.assertEqual(
-            first_payload["content"],
-            "[Error: this is file data, not a producer failure]\nbody",
-        )
+        self.assertEqual(first_payload["content"], error_like)
         latest_tool = self._tool_messages(self.model.agent_payloads[3])[-1]
         self.assertEqual(latest_tool["tool_call_id"], "read-success-3")
         latest_payload = json.loads(latest_tool["content"])
@@ -1003,26 +1009,20 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             bot.ResearchLedger(), record_update
         )
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", prefix="latest-group-"
-        ) as source:
-            source.write(file_content)
-            source.flush()
-            latest_calls = [
-                _raw_tool_call("latest-malformed", "bash_exec", raw_arguments),
-                _tool_call("latest-read", "read_file", {"path": source.name}),
-                _tool_call("latest-record", "record_state", record_update),
-                _tool_call(
-                    "latest-bash-1", "bash_exec", {"command": "latest-command-1"}
-                ),
-                _tool_call(
-                    "latest-bash-2", "bash_exec", {"command": "latest-command-2"}
-                ),
-            ]
-            expected_arguments = [
-                call.function.arguments for call in latest_calls
-            ]
-            await self.run_agent([
+        latest_calls = [
+            _raw_tool_call("latest-malformed", "bash_exec", raw_arguments),
+            _tool_call("latest-read", "read_file", {"path": "latest_group.txt"}),
+            _tool_call("latest-record", "record_state", record_update),
+            _tool_call(
+                "latest-bash-1", "bash_exec", {"command": "latest-command-1"}
+            ),
+            _tool_call(
+                "latest-bash-2", "bash_exec", {"command": "latest-command-2"}
+            ),
+        ]
+        expected_arguments = [call.function.arguments for call in latest_calls]
+        await self.run_agent(
+            [
                 _response(tool_calls=[
                     _tool_call(
                         "older-call", "bash_exec", {"command": "older-command"}
@@ -1032,7 +1032,9 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
                 _response(tool_calls=[
                     _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
                 ]),
-            ])
+            ],
+            seed_files={"latest_group.txt": file_content},
+        )
 
         feedback_payload = self.model.agent_payloads[2]
         latest_ids = [call.id for call in latest_calls]
