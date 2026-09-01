@@ -3,7 +3,7 @@
 Discord LLM Bot - Auto-Extension Goal-Driven Autonomous Agent
 Integrated with:
 - User's Streaming Completion & Rolling Compaction (Rollup) Architecture
-- Chat Template Multi-System Message Sanitizer (400 Error Immunity)
+- Pre-Send Tool Payload Validator (tool_call 상관관계 + chat template)
 - Continuous Keep-Alive Typing Heartbeat Loop (7s Interval)
 - Live Updating Real-Time Dashboard Card (message.edit)
 - 10-Step Periodic Checkpoints & Instant Feedback Loop
@@ -780,34 +780,241 @@ def _tool_call_summary(call) -> str:
         arguments = getattr(function, "arguments", "") if function else ""
     return f"{name}({_clip_summary_text(arguments, 700)})"
 
-# --- Chat Template Sanitizer (400 Error Immunity) ---
+# --- Pre-Send Payload Validator (tool 상관관계 + chat template) ---
 
-def sanitize_messages_for_chat_template(messages: list) -> list:
-    """Qwen chat template의 'System message must be at the beginning' 에러를 100% 원천 차단"""
-    if not messages:
-        return messages
+TOOL_PAYLOAD_MISSING_RESULT = "[Error: 도구 결과가 기록되지 않았습니다]"
+TOOL_CORRELATION_ERROR_MARKERS = ("tool_call_id", "tool_calls", "tool call")
 
-    sanitized = []
-    first_system_found = False
 
-    for msg in messages:
-        role = _msg_role(msg)
-        content = _msg_content(msg)
+def _call_parts(call):
+    """(id, name, arguments). payload의 tool_call은 dict지만 객체 형태도 받는다."""
+    if isinstance(call, dict):
+        call_id = call.get("id")
+        function = call.get("function") or {}
+    else:
+        call_id = getattr(call, "id", None)
+        function = getattr(call, "function", None) or {}
+    if isinstance(function, dict):
+        return call_id, function.get("name"), function.get("arguments")
+    return call_id, getattr(function, "name", None), getattr(function, "arguments", None)
 
-        if role == "system":
-            if not first_system_found and len(sanitized) == 0:
-                sanitized.append(msg)
-                first_system_found = True
-            else:
-                # 0번째가 아닌 위치의 system 메시지는 user 역할로 안전하게 전환
-                sanitized.append({
-                    "role": "user",
-                    "content": f"[시스템 참고 정보]: {content}"
-                })
+
+def _tool_result_id(message):
+    if isinstance(message, dict):
+        return message.get("tool_call_id")
+    return getattr(message, "tool_call_id", None)
+
+
+def _payload_fingerprint(messages: list) -> str:
+    """역할과 도구 id 시퀀스만 남긴 마스킹 구조 지문.
+
+    실패를 서버·템플릿 문제와 클라이언트 payload 문제로 가르려면 구조가 필요하다.
+    내용과 실제 id는 남기지 않는다.
+    """
+    aliases = {}
+
+    def alias(call_id):
+        if not isinstance(call_id, str) or not call_id:
+            return "t?"
+        return aliases.setdefault(call_id, "t{0}".format(len(aliases) + 1))
+
+    parts = []
+    for message in messages:
+        role = _msg_role(message) or "?"
+        calls = _msg_tool_calls(message)
+        if role == "assistant" and calls:
+            parts.append(
+                "assistant[" + ",".join(alias(_call_parts(call)[0]) for call in calls) + "]"
+            )
+        elif role == "tool":
+            parts.append("tool:" + alias(_tool_result_id(message)))
         else:
-            sanitized.append(msg)
+            parts.append(role)
+    return "|".join(parts)
 
-    return sanitized
+
+def validate_chat_payload(messages: list) -> SimpleNamespace:
+    """전송 직전 payload의 구조를 검증하고, 결함을 제거한 payload를 함께 돌려준다.
+
+    호출 수와 결과 수가 같다는 것은 유효성 근거가 되지 못한다. 같은 id를 두 번
+    알리거나 알리지 않은 id에 답하는 payload도 개수는 맞는다. 그래서 id 유일성,
+    호출-결과 1:1, 그룹 인접성, system 위치를 한 곳에서 함께 본다. 결함이 없으면
+    메시지를 그대로 두므로 정상 이력은 복구가 건드리지 않는다.
+    """
+    if not messages:
+        return SimpleNamespace(messages=list(messages), defects=(), ok=True)
+
+    defects = set()
+
+    # 1) 알림 수집. id는 비어 있지 않은 문자열이고 payload 전체에서 유일해야 한다.
+    announced = {}
+    kept_calls = {}
+    for position, message in enumerate(messages):
+        if _msg_role(message) != "assistant":
+            continue
+        calls = _msg_tool_calls(message)
+        if not calls:
+            continue
+        surviving = []
+        for call in calls:
+            call_id, name, arguments = _call_parts(call)
+            if not isinstance(call_id, str) or not call_id:
+                defects.add("tool_call_id_missing")
+                continue
+            if call_id in announced:
+                defects.add("tool_call_id_duplicate")
+                continue
+            if not isinstance(name, str) or not name:
+                defects.add("tool_name_missing")
+                continue
+            if not isinstance(arguments, str):
+                defects.add("tool_arguments_not_string")
+                try:
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                except Exception:
+                    arguments = str(arguments)
+            announced[call_id] = position
+            surviving.append({
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        kept_calls[position] = surviving
+
+    # 2) 결과 수집. 알린 id 하나에 결과 하나. 고아 결과는 본문을 잃지 않도록
+    #    user 메시지로 내리고, 내용이 문자열이 아닌 결과는 문자열로 채운다.
+    answers = {}
+    answer_positions = {}
+    demoted_orphans = {}
+    for position, message in enumerate(messages):
+        if _msg_role(message) != "tool":
+            continue
+        call_id = _tool_result_id(message)
+        if not isinstance(call_id, str) or call_id not in announced:
+            defects.add("tool_result_orphan")
+            demoted_orphans[position] = {
+                "role": "user",
+                "content": "[도구 실행 결과: {0}]\n{1}".format(
+                    _msg_name(message), _msg_content(message)
+                ),
+            }
+            continue
+        if call_id in answers:
+            defects.add("tool_result_duplicate")
+            continue
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+        if not isinstance(content, str):
+            defects.add("tool_content_missing")
+            repaired_result = dict(message) if isinstance(message, dict) else {
+                "role": "tool", "tool_call_id": call_id, "name": _msg_name(message)
+            }
+            repaired_result["content"] = TOOL_PAYLOAD_MISSING_RESULT
+            answers[call_id] = repaired_result
+        else:
+            answers[call_id] = message
+        answer_positions[call_id] = position
+
+    # 3) 재조립. 결과는 자기 assistant 알림 바로 뒤에, 알린 순서대로만 놓인다.
+    repaired = []
+    for position, message in enumerate(messages):
+        role = _msg_role(message)
+        if role == "tool":
+            if position in demoted_orphans:
+                repaired.append(demoted_orphans[position])
+            continue
+        if role == "system" and repaired:
+            # 0번이 아닌 system은 chat template이 거부하므로 user로 내린다.
+            defects.add("system_position")
+            repaired.append({
+                "role": "user",
+                "content": "[시스템 참고 정보]: {0}".format(_msg_content(message)),
+            })
+            continue
+        calls = kept_calls.get(position)
+        if calls is None:
+            repaired.append(message)
+            continue
+        if calls == list(_msg_tool_calls(message)):
+            repaired.append(message)
+        elif calls:
+            repaired.append({
+                "role": "assistant",
+                "content": _msg_content(message) or None,
+                "tool_calls": calls,
+            })
+        else:
+            repaired.append({
+                "role": "assistant",
+                "content": _msg_content(message) or "[도구 실행 지시]",
+            })
+
+        group_positions = [
+            answer_positions[call["id"]]
+            for call in calls
+            if call["id"] in answer_positions
+        ]
+        if group_positions and (
+            group_positions != sorted(group_positions)
+            or set(range(position + 1, max(group_positions) + 1)) - set(group_positions)
+        ):
+            defects.add("tool_group_split")
+        for call in calls:
+            answer = answers.get(call["id"])
+            if answer is None:
+                defects.add("tool_call_unanswered")
+                answer = {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "content": TOOL_PAYLOAD_MISSING_RESULT,
+                }
+            repaired.append(answer)
+
+    if not defects:
+        # 결함이 없으면 메시지는 그대로 두고 목록만 새로 만든다. 호출자가 받은
+        # payload가 이후에 append되는 살아 있는 이력과 같은 객체이면 안 된다.
+        return SimpleNamespace(messages=list(messages), defects=(), ok=True)
+    return SimpleNamespace(messages=repaired, defects=tuple(sorted(defects)), ok=False)
+
+
+def is_tool_correlation_error(error) -> bool:
+    """도구 호출-결과 상관관계 오류인지 판정한다.
+
+    예외 문자열에 400이 있다는 사실만으로는 원인이 되지 못한다. 문맥 길이 초과와
+    파라미터 오류도 같은 상태 코드를 쓰므로, 그런 실패까지 도구 프로토콜 제거로
+    처리하면 근거 없이 대화의 도구 이력을 지운다.
+    """
+    text = str(error).lower()
+    return any(marker in text for marker in TOOL_CORRELATION_ERROR_MARKERS)
+
+
+def flatten_tool_protocol(messages: list) -> list:
+    """도구 프로토콜을 지운 payload.
+
+    로컬 검증을 통과한 payload에도 서버가 상관관계 오류를 낼 때 남는 마지막
+    수단이다. 결과 본문은 user 메시지로 옮겨 정보를 잃지 않는다.
+    """
+    flattened = []
+    for message in messages:
+        role = _msg_role(message)
+        if role == "tool":
+            flattened.append({
+                "role": "user",
+                "content": "[도구 실행 결과: {0}]\n{1}".format(
+                    _msg_name(message), _msg_content(message)
+                ),
+            })
+        elif role == "assistant" and _msg_tool_calls(message):
+            flattened.append({
+                "role": "assistant",
+                "content": _msg_content(message) or "[도구 실행 지시]",
+            })
+        else:
+            flattened.append(message)
+    return flattened
 
 # --- Workspace Skills & Reusable Tools Architecture ---
 
@@ -1266,7 +1473,7 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         },
     ]
     replaced_messages.extend(recent_messages)
-    replaced_messages = sanitize_messages_for_chat_template(replaced_messages)
+    replaced_messages = validate_chat_payload(replaced_messages).messages
 
     before_chars = sum(len(_msg_content(msg)) for msg in messages)
     after_chars = sum(len(_msg_content(msg)) for msg in replaced_messages)
@@ -1288,6 +1495,18 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
     return replaced_messages, new_summary
 
 # --- User's Streaming Completion Collector ---
+
+# 대체 id는 completion 하나가 아니라 대화 전체에서 유일해야 한다. completion마다
+# 0으로 되돌아가는 카운터는 서로 다른 스텝에서 같은 call_stream_0을 만들고, 그
+# 둘이 한 payload에 같이 실리면 tool_call_id가 중복된다.
+_fallback_call_serial = 0
+
+
+def _next_fallback_call_id() -> str:
+    global _fallback_call_serial
+    _fallback_call_serial += 1
+    return "call_stream_{0}".format(_fallback_call_serial)
+
 
 async def run_completion_stage(token=None, stage="agent", deadline=None, **kwargs):
     """Run any completion implementation under the stage's total budget.
@@ -1331,7 +1550,9 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
     stream = await client.chat.completions.create(stream=True, **kwargs)
     content_parts = []
     reasoning_parts = []
-    tool_buffers = {}
+    tool_buffers = []
+    buffers_by_index = {}
+    current = None
 
     async for chunk in stream_chunks(stream, stage, CONFIG.idle_timeout, token):
         choices = getattr(chunk, "choices", None) or []
@@ -1355,31 +1576,55 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
 
         for partial in getattr(delta, "tool_calls", None) or []:
             index = getattr(partial, "index", None)
-            if index is None:
-                index = len(tool_buffers)
-            buf = tool_buffers.setdefault(
-                index, {"id": "", "name": "", "arguments": ""}
-            )
             call_id = getattr(partial, "id", None)
-            if call_id:
-                buf["id"] = call_id
             function = getattr(partial, "function", None)
-            if function is not None:
-                name = getattr(function, "name", None)
-                arguments = getattr(function, "arguments", None)
-                if name:
-                    buf["name"] += name
-                if arguments:
-                    buf["arguments"] += (
-                        arguments if isinstance(arguments, str) else str(arguments)
-                    )
+            name = getattr(function, "name", None) if function is not None else None
+            arguments = getattr(function, "arguments", None) if function is not None else None
+
+            if index is not None:
+                # int 0과 "0"을 같은 호출로 본다. 정렬 대신 도착 순서를 유지하므로
+                # 백엔드가 두 표기를 섞어도 순서 비교가 필요 없다.
+                buf = buffers_by_index.get(str(index))
+                if buf is None:
+                    buf = {"id": "", "name": "", "arguments": ""}
+                    buffers_by_index[str(index)] = buf
+                    tool_buffers.append(buf)
+                current = buf
+            elif current is None or (call_id and name):
+                # ponytail: index 없는 스트림의 호출 경계는 "id와 이름을 함께 들고
+                # 온 조각이 새 호출"이라는 규칙 하나로만 잡는다(천장). id와 이름을
+                # 서로 다른 조각으로 나눠 보내는 백엔드는 앞 호출에 병합되고, 그
+                # 결과는 인자 파싱에서 걸려 실행 전에 거부된다. 그런 백엔드가
+                # 생기면 index를 요구하는 쪽으로 올린다.
+                current = {"id": "", "name": "", "arguments": ""}
+                tool_buffers.append(current)
+
+            # 조각난 id는 이어 붙여야 한다. 매 조각에 전체 id를 다시 보내는
+            # 백엔드에서 같은 값을 두 번 붙이지 않도록 꼬리 중복만 건너뛴다.
+            if call_id and not current["id"].endswith(call_id):
+                current["id"] += call_id
+            if name:
+                current["name"] += name
+            if arguments:
+                current["arguments"] += (
+                    arguments if isinstance(arguments, str) else str(arguments)
+                )
 
     tool_calls = []
-    for index in sorted(tool_buffers):
-        buf = tool_buffers[index]
+    for buf in tool_buffers:
+        if not buf["name"]:
+            # 이름 없는 버퍼는 재구성 실패다. 어떤 도구를 부르려 했는지 알 수 없어
+            # 모델에 돌려줄 정정 근거도 없으므로 도구 실행 전에 거부한다.
+            # (파싱 불가한 인자는 호출 직전 argument_error 경로가 이미 거부한다.)
+            print(
+                "[Streaming tool call refused: 이름 없는 조각]",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         tool_calls.append(
             SimpleNamespace(
-                id=buf["id"] or f"call_stream_{index}",
+                id=buf["id"] or _next_fallback_call_id(),
                 function=SimpleNamespace(
                     name=buf["name"], arguments=buf["arguments"]
                 ),
@@ -2103,7 +2348,7 @@ async def on_message(message: discord.Message):
         {"role": "system", "content": build_system_content(workspace, ledger, rolling_summary)}
     ]
     messages_payload.extend(history)
-    messages_payload = sanitize_messages_for_chat_template(messages_payload)
+    messages_payload = validate_chat_payload(messages_payload).messages
 
     current_effort = channel_reasoning[message.channel.id]
     try:
@@ -2196,11 +2441,27 @@ async def on_message(message: discord.Message):
                     "content": build_system_content(workspace, ledger, rolling_summary),
                 }
 
-            compacted_payload = sanitize_messages_for_chat_template(
+            # 구조 결함은 이번 요청만의 문제가 아니다. 복구 결과를 messages_payload에
+            # 되돌려야 다음 스텝이 같은 결함을 다시 만들어 같은 400을 반복하지 않는다.
+            base_verdict = validate_chat_payload(messages_payload)
+            if not base_verdict.ok:
+                messages_payload = base_verdict.messages
+                log_session_event(
+                    session_file,
+                    f"🧷 [Step {iteration+1} 전송 payload 구조 복구]",
+                    f"revision={ledger.revision} defects={','.join(base_verdict.defects)}\n"
+                    f"{_payload_fingerprint(messages_payload)}",
+                )
+                print(
+                    f"[Payload repaired at Step {iteration+1}]: {','.join(base_verdict.defects)}",
+                    flush=True,
+                )
+
+            compacted_payload = validate_chat_payload(
                 apply_micro_compaction(
                     messages_payload, preserve_recent_tool_groups=1
                 )
-            )
+            ).messages
             model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
 
             try:
@@ -2219,46 +2480,53 @@ async def on_message(message: discord.Message):
                 settle_stage_failure(stage_error)
                 break
             except Exception as api_err:
-                err_str = str(api_err)
-                if "tool_call_id" in err_str or "400" in err_str:
-                    print(f"[API 400 Auto-Recovery Triggered]: {err_str}", flush=True)
-                    sanitized_payload = []
-                    for p_msg in compacted_payload:
-                        if _msg_role(p_msg) == "tool":
-                            sanitized_payload.append({
-                                "role": "user",
-                                "content": f"[도구 실행 결과: {_msg_name(p_msg)}]\n{_msg_content(p_msg)}"
-                            })
-                        elif _msg_role(p_msg) == "assistant" and isinstance(p_msg, dict) and "tool_calls" in p_msg:
-                            sanitized_payload.append({
-                                "role": "assistant",
-                                "content": _msg_content(p_msg) or "[도구 실행 지시]"
-                            })
-                        else:
-                            sanitized_payload.append(p_msg)
-
-                    # Never restart a stage after cancellation.
-                    try:
-                        token.raise_if_cancelled()
-                        resp = await run_completion_stage(
-                            token=token,
-                            stage="agent:retry",
-                            deadline=model_stage_deadline,
-                            model=MODEL_NAME,
-                            messages=sanitize_messages_for_chat_template(sanitized_payload),
-                            max_tokens=1024 if iteration == 0 else 4096,
-                            temperature=0.7,
-                            **agent_tool_params(),
-                            **extra_params
-                        )
-                    except (RunCancelled, StageTimeout) as stage_error:
-                        settle_stage_failure(stage_error)
-                        break
-                    except Exception as retry_error:
-                        settle_stage_failure(retry_error)
-                        break
-                else:
+                # 실패 원인을 구조로 남긴다. 마스킹된 역할/id 시퀀스와 실행 리비전이
+                # 있어야 서버·템플릿 문제와 클라이언트 payload 문제를 구분할 수 있다.
+                correlation = is_tool_correlation_error(api_err)
+                log_session_event(
+                    session_file,
+                    f"🧷 [Step {iteration+1} 모델 단계 실패 구조 지문]",
+                    f"revision={ledger.revision} "
+                    f"error={type(api_err).__name__} "
+                    f"class={'tool_correlation' if correlation else 'other'} "
+                    f"cause={'client' if base_verdict.defects else 'server'} "
+                    f"defects={','.join(base_verdict.defects) or 'none'}\n"
+                    f"{_payload_fingerprint(compacted_payload)}",
+                )
+                if not correlation:
                     settle_stage_failure(api_err)
+                    break
+
+                print(f"[Tool Correlation Recovery Triggered]: {api_err}", flush=True)
+                # 로컬 검증을 통과한 payload에도 상관관계 오류가 나면 남는 수단은
+                # 도구 프로토콜 제거뿐이다. 이 결과도 messages_payload에 남긴다.
+                messages_payload = flatten_tool_protocol(messages_payload)
+                retry_payload = validate_chat_payload(
+                    apply_micro_compaction(
+                        messages_payload, preserve_recent_tool_groups=1
+                    )
+                ).messages
+
+                # Never restart a stage after cancellation.
+                try:
+                    token.raise_if_cancelled()
+                    # 도구 이력을 지운 payload에 도구를 다시 제시하면 모델이 같은
+                    # 오류로 되돌아간다. 재시도는 한 번, 도구 없이 한다.
+                    resp = await run_completion_stage(
+                        token=token,
+                        stage="agent:retry",
+                        deadline=model_stage_deadline,
+                        model=MODEL_NAME,
+                        messages=retry_payload,
+                        max_tokens=1024 if iteration == 0 else 4096,
+                        temperature=0.7,
+                        **extra_params
+                    )
+                except (RunCancelled, StageTimeout) as stage_error:
+                    settle_stage_failure(stage_error)
+                    break
+                except Exception as retry_error:
+                    settle_stage_failure(retry_error)
                     break
 
             # A response completed concurrently with !stop must not enable
