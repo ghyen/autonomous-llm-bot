@@ -21,6 +21,7 @@ from test_support import (
     TEST_ADMIN_ID,
     TEST_OUTSIDER_ID,
     TEST_USER_ID,
+    run_catalog_patch,
 )
 
 import authz
@@ -34,7 +35,7 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(CHANNEL_ID)
         self._log_dir = tempfile.TemporaryDirectory()
         self._patches = [
-            patch.object(bot, "SYSTEM_LOG_DIR", self._log_dir.name),
+            run_catalog_patch(bot, self._log_dir.name),
             patch.object(bot, "create_streaming_completion", AsyncMock()),
             patch.object(bot, "execute_tools_in_parallel", AsyncMock(return_value=[])),
         ]
@@ -55,6 +56,7 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
             bot.channel_summary,
             bot.channel_reasoning,
             bot.channel_cancel_token,
+            bot.channel_run_leases,
             bot.channel_active_runs,
             bot.channel_user_queue,
             bot.channel_ledger,
@@ -68,7 +70,8 @@ class GateTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.channel_history[CHANNEL_ID], [])
         self.assertNotIn(CHANNEL_ID, bot.channel_cancel_token)
         self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
-        self.assertEqual(os.listdir(self._log_dir.name), [])
+        self.assertEqual(list(bot.RUN_CATALOG.runs_root.iterdir()), [])
+        self.assertEqual(list(bot.RUN_CATALOG.logs_root.iterdir()), [])
 
 
 class DeniedRequestTest(GateTestCase):
@@ -89,7 +92,8 @@ class DeniedRequestTest(GateTestCase):
 
         self.completion.assert_not_awaited()
         self.execute_tools.assert_not_awaited()
-        self.assertEqual(os.listdir(self._log_dir.name), [])
+        self.assertEqual(list(bot.RUN_CATALOG.runs_root.iterdir()), [])
+        self.assertEqual(list(bot.RUN_CATALOG.logs_root.iterdir()), [])
         self.assertIn("권한이 없습니다", message.replies[-1])
 
     async def test_mentioning_the_bot_does_not_authenticate_an_outsider(self):
@@ -633,20 +637,31 @@ class PurgeTest(GateTestCase):
 
 
 class SteeringTest(GateTestCase):
-    async def test_non_owner_steering_is_refused_and_not_queued(self):
+    def start_active_run(self, owner_id):
+        workspace = bot.RUN_CATALOG.acquire(owner_id, CHANNEL_ID)
+        token = CancelToken()
+        bot.channel_run_leases[CHANNEL_ID].append({
+            "token": token,
+            "owner": owner_id,
+            "active": True,
+            "workspace": workspace,
+        })
         bot.channel_active_runs[CHANNEL_ID] = True
-        bot.channel_run_owner[CHANNEL_ID] = TEST_ADMIN_ID
+        bot.channel_run_owner[CHANNEL_ID] = owner_id
+
+    async def test_non_owner_steering_is_refused_and_not_queued(self):
+        self.start_active_run(TEST_ADMIN_ID)
         message = FakeMessage("이 방향으로 바꿔줘", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
 
         await bot.on_message(message)
 
         self.assertEqual(bot.channel_user_queue[CHANNEL_ID], [])
-        self.assertEqual(os.listdir(self._log_dir.name), [])
+        self.assertEqual(len(list(bot.RUN_CATALOG.runs_root.iterdir())), 1)
+        self.assertEqual(list(bot.RUN_CATALOG.logs_root.iterdir()), [])
         self.assertIn("시작한 사용자", message.replies[-1])
 
     async def test_owner_steering_is_queued(self):
-        bot.channel_active_runs[CHANNEL_ID] = True
-        bot.channel_run_owner[CHANNEL_ID] = TEST_USER_ID
+        self.start_active_run(TEST_USER_ID)
         message = FakeMessage("이 방향으로 바꿔줘", CHANNEL_ID, author=FakeAuthor(TEST_USER_ID))
 
         await bot.on_message(message)

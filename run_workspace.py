@@ -1,0 +1,440 @@
+"""Opaque owner-bound run workspaces and canonical-file integrity."""
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import tempfile
+import threading
+from collections import OrderedDict
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+CANONICAL_NAMES = frozenset(("plan.md", "findings.md"))
+READ_HASH_LIMIT = 128
+TERMINAL_STATUSES = frozenset(
+    ("completed", "stopped", "exhausted", "failed", "interrupted")
+)
+REVISION_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+
+class RunWorkspaceError(Exception):
+    """Base error for catalog lifecycle operations."""
+
+
+class RunNotFoundError(RunWorkspaceError):
+    """The caller cannot see the requested run."""
+
+
+class RunActiveError(RunWorkspaceError):
+    """The requested lifecycle operation conflicts with an active run."""
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _revision(data):
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _atomic_write(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".{0}.".format(path.name), dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+class RunWorkspace:
+    """One execution's filesystem, log, canonical locks, and read-hash LRU."""
+
+    def __init__(
+        self,
+        run_id,
+        owner_id,
+        channel_id,
+        root,
+        log_path,
+        status,
+        created_at,
+        updated_at,
+    ):
+        self.run_id = run_id
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+        self.root = Path(root)
+        self.log_path = Path(log_path)
+        self.status = status
+        self.created_at = created_at
+        self.updated_at = updated_at
+        self._canonical_locks = {
+            name: asyncio.Lock() for name in CANONICAL_NAMES
+        }
+        self._read_hashes = OrderedDict()
+
+    @property
+    def metadata_path(self):
+        return self.root / "run.json"
+
+    def _metadata(self):
+        return {
+            "run_id": self.run_id,
+            "owner_id": self.owner_id,
+            "channel_id": self.channel_id,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    def persist(self):
+        payload = json.dumps(
+            self._metadata(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        _atomic_write(self.metadata_path, payload)
+
+    def clear_read_cache(self):
+        self._read_hashes.clear()
+
+    def resolve(self, path):
+        raw_path = os.fspath(path)
+        if os.path.isabs(raw_path):
+            return Path(os.path.normpath(raw_path))
+        target = Path(os.path.normpath(os.path.join(str(self.root), raw_path)))
+        try:
+            inside = os.path.commonpath((str(self.root), str(target))) == str(self.root)
+        except ValueError:
+            inside = False
+        if not inside:
+            raise ValueError("relative path escapes the current run workspace")
+        return target
+
+    def _is_canonical(self, target):
+        return any(target == self.root / name for name in CANONICAL_NAMES)
+
+    def _remember(self, target, revision):
+        key = str(target)
+        self._read_hashes[key] = revision
+        self._read_hashes.move_to_end(key)
+        while len(self._read_hashes) > READ_HASH_LIMIT:
+            self._read_hashes.popitem(last=False)
+
+    def read(self, path):
+        display_path = os.fspath(path)
+        target = self.resolve(path)
+        try:
+            data = target.read_bytes()
+        except FileNotFoundError:
+            return {"status": "error", "path": display_path, "error": "not_found"}
+        except (IsADirectoryError, PermissionError, OSError) as error:
+            return {
+                "status": "error",
+                "path": display_path,
+                "error": type(error).__name__,
+            }
+
+        revision = _revision(data)
+        key = str(target)
+        if self._read_hashes.get(key) == revision:
+            self._read_hashes.move_to_end(key)
+            return {
+                "status": "unchanged",
+                "path": display_path,
+                "revision": revision,
+                "reference": revision,
+            }
+
+        self._remember(target, revision)
+        content = data.decode("utf-8", errors="replace")
+        truncated = False
+        if not self._is_canonical(target) and len(content) > 4000:
+            content = content[:4000]
+            truncated = True
+        return {
+            "status": "success",
+            "path": display_path,
+            "revision": revision,
+            "content": content,
+            "truncated": truncated,
+        }
+
+    async def write(self, path, content, expected_revision):
+        display_path = os.fspath(path)
+        target = self.resolve(path)
+        data = str(content).encode("utf-8")
+        if not self._is_canonical(target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            revision = _revision(data)
+            self._remember(target, revision)
+            return {
+                "status": "success",
+                "path": display_path,
+                "revision": revision,
+            }
+
+        if expected_revision is None:
+            return {
+                "status": "error",
+                "path": display_path,
+                "error": "expected_revision_required",
+            }
+        if expected_revision != "absent" and not REVISION_PATTERN.fullmatch(
+            str(expected_revision)
+        ):
+            return {
+                "status": "error",
+                "path": display_path,
+                "error": "invalid_expected_revision",
+            }
+
+        lock = self._canonical_locks[target.name]
+        async with lock:
+            try:
+                current_bytes = target.read_bytes()
+            except FileNotFoundError:
+                current_revision = "absent"
+            else:
+                current_revision = _revision(current_bytes)
+            if expected_revision != current_revision:
+                return {
+                    "status": "conflict",
+                    "path": display_path,
+                    "expected_revision": expected_revision,
+                    "current_revision": current_revision,
+                }
+
+            _atomic_write(target, data)
+            revision = _revision(data)
+            self._remember(target, revision)
+            return {
+                "status": "success",
+                "path": display_path,
+                "revision": revision,
+            }
+
+
+class RunCatalog:
+    """Small filesystem catalog for run creation, selection, and lifecycle."""
+
+    def __init__(self, workspace_root, log_root):
+        self.workspace_root = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(workspace_root)))
+        )
+        self.log_root = Path(
+            os.path.abspath(os.path.expanduser(os.fspath(log_root)))
+        )
+        self.runs_root = self.workspace_root / "runs"
+        self.logs_root = self.log_root / "runs"
+        self.runs_root.mkdir(parents=True, exist_ok=True)
+        self.logs_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._runs = {}
+        self._selected = {}
+        self._reset_reservations = {}
+        self._scan()
+
+    def _scan(self):
+        for root in self.runs_root.iterdir():
+            if not root.is_dir() or root.name.startswith("."):
+                continue
+            metadata_path = root / "run.json"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                run_id = metadata["run_id"]
+                owner_id = metadata["owner_id"]
+                channel_id = metadata["channel_id"]
+                status = metadata["status"]
+                created_at = metadata["created_at"]
+                updated_at = metadata["updated_at"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if (
+                run_id != root.name
+                or not re.fullmatch(r"[0-9a-f]{32}", str(run_id))
+                or not isinstance(owner_id, int)
+                or not isinstance(channel_id, int)
+                or not isinstance(status, str)
+            ):
+                continue
+            workspace = RunWorkspace(
+                run_id,
+                owner_id,
+                channel_id,
+                root,
+                self.logs_root / (run_id + ".md"),
+                status,
+                created_at,
+                updated_at,
+            )
+            self._runs[run_id] = workspace
+            if status == "active":
+                workspace.status = "interrupted"
+                workspace.updated_at = _now()
+                workspace.persist()
+
+    def _create(self, owner_id, channel_id, status):
+        while True:
+            run_id = secrets.token_hex(16)
+            if run_id not in self._runs and not (self.runs_root / run_id).exists():
+                break
+        timestamp = _now()
+        workspace = RunWorkspace(
+            run_id,
+            owner_id,
+            channel_id,
+            self.runs_root / run_id,
+            self.logs_root / (run_id + ".md"),
+            status,
+            timestamp,
+            timestamp,
+        )
+        workspace.root.mkdir()
+        workspace.persist()
+        self._runs[run_id] = workspace
+        return workspace
+
+    def lookup_owned(self, owner_id, run_id):
+        with self._lock:
+            workspace = self._runs.get(str(run_id))
+            if workspace is None or workspace.owner_id != owner_id:
+                raise RunNotFoundError("run not found")
+            return workspace
+
+    def _reset_conflicts(self, owner_id, channel_id):
+        return any(
+            reserved_owner == owner_id or reserved_channel == channel_id
+            for reserved_owner, reserved_channel in self._reset_reservations
+        )
+
+    def ensure_reset_allowed(self, owner_id, channel_id):
+        with self._lock:
+            if self._reset_conflicts(owner_id, channel_id):
+                raise RunActiveError("reset/clear is already in progress")
+            if any(
+                workspace.status == "active"
+                and (
+                    workspace.owner_id == owner_id
+                    or workspace.channel_id == channel_id
+                )
+                for workspace in self._runs.values()
+            ):
+                raise RunActiveError("an active run must stop before reset/new/clear")
+
+    def reserve_reset(self, owner_id, channel_id):
+        with self._lock:
+            self.ensure_reset_allowed(owner_id, channel_id)
+            token = object()
+            self._reset_reservations[(owner_id, channel_id)] = token
+            return token
+
+    def cancel_reset(self, owner_id, channel_id, token):
+        with self._lock:
+            key = (owner_id, channel_id)
+            if self._reset_reservations.get(key) is token:
+                self._reset_reservations.pop(key, None)
+
+    def prepare_reserved(self, owner_id, channel_id, token):
+        with self._lock:
+            key = (owner_id, channel_id)
+            if self._reset_reservations.get(key) is not token:
+                raise RunActiveError("clear reservation is not active")
+            try:
+                workspace = self._create(owner_id, channel_id, "prepared")
+                self._selected[key] = workspace.run_id
+                return workspace
+            finally:
+                self._reset_reservations.pop(key, None)
+
+    def acquire(self, owner_id, channel_id):
+        with self._lock:
+            if self._reset_conflicts(owner_id, channel_id):
+                raise RunActiveError("reset/clear is in progress")
+            selected_id = self._selected.pop((owner_id, channel_id), None)
+            workspace = self._runs.get(selected_id) if selected_id else None
+            if workspace is None or workspace.status != "prepared":
+                workspace = self._create(owner_id, channel_id, "active")
+            else:
+                workspace.channel_id = channel_id
+                workspace.status = "active"
+                workspace.updated_at = _now()
+                workspace.clear_read_cache()
+                workspace.persist()
+            return workspace
+
+    def prepare(self, owner_id, channel_id):
+        with self._lock:
+            self.ensure_reset_allowed(owner_id, channel_id)
+            workspace = self._create(owner_id, channel_id, "prepared")
+            self._selected[(owner_id, channel_id)] = workspace.run_id
+            return workspace
+
+    def resume(self, owner_id, channel_id, run_id):
+        with self._lock:
+            workspace = self.lookup_owned(owner_id, run_id)
+            if workspace.status == "active":
+                raise RunActiveError("run is active")
+            workspace.channel_id = channel_id
+            workspace.status = "prepared"
+            workspace.updated_at = _now()
+            workspace.clear_read_cache()
+            workspace.persist()
+            for key, selected_id in tuple(self._selected.items()):
+                if selected_id == workspace.run_id:
+                    self._selected.pop(key, None)
+            self._selected[(owner_id, channel_id)] = workspace.run_id
+            return workspace
+
+    def finish(self, workspace, status):
+        if status not in TERMINAL_STATUSES:
+            raise ValueError("invalid run status: {0}".format(status))
+        with self._lock:
+            current = self._runs.get(workspace.run_id)
+            if current is None or current is not workspace:
+                raise RunNotFoundError("run not found")
+            workspace.status = status
+            workspace.updated_at = _now()
+            workspace.persist()
+
+    def delete(self, owner_id, run_id):
+        with self._lock:
+            workspace = self.lookup_owned(owner_id, run_id)
+            if workspace.status == "active":
+                raise RunActiveError("run is active")
+            selected_keys = [
+                key for key, selected_id in self._selected.items()
+                if selected_id == workspace.run_id
+            ]
+            for key in selected_keys:
+                self._selected.pop(key, None)
+            detached = self.runs_root / (
+                ".deleting-{0}-{1}".format(workspace.run_id, secrets.token_hex(8))
+            )
+            try:
+                os.replace(workspace.root, detached)
+            except BaseException:
+                for key in selected_keys:
+                    self._selected[key] = workspace.run_id
+                raise
+            self._runs.pop(workspace.run_id, None)
+
+        shutil.rmtree(detached)
+        try:
+            workspace.log_path.unlink()
+        except FileNotFoundError:
+            pass

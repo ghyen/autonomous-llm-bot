@@ -16,7 +16,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_support import FakeMessage, FakeSentMessage
+from test_support import (
+    FakeMessage,
+    FakeSentMessage,
+    TEST_USER_ID,
+    run_catalog_patch,
+)
 
 import bot
 import outcome as outcome_mod
@@ -26,6 +31,7 @@ CHANNEL_ID = 987654700
 STOP_LATENCY_BUDGET = 2.0
 
 LONG_REPORT = "정리. " + ("확인됨. " * 80)
+TEST_WORKSPACE = SimpleNamespace(root="/tmp/run-fedcba9876543210fedcba9876543210")
 
 
 def _response(content="", tool_calls=()):
@@ -113,14 +119,15 @@ class CancellationTestCase(unittest.IsolatedAsyncioTestCase):
     @contextlib.contextmanager
     def one_step_run(self, model):
         """The patch set seven of these tests were repeating verbatim."""
-        with tempfile.TemporaryDirectory() as log_dir, patch.multiple(
-            bot,
-            SYSTEM_LOG_DIR=log_dir,
-            MAX_AGENT_LOOPS=1,
-            CHECKPOINT_INTERVAL=99,
-            ROLLING_COMPACTION_INTERVAL=99,
-            create_streaming_completion=model,
-        ):
+        with tempfile.TemporaryDirectory() as log_dir, \
+                run_catalog_patch(bot, log_dir), \
+                patch.multiple(
+                    bot,
+                    MAX_AGENT_LOOPS=1,
+                    CHECKPOINT_INTERVAL=99,
+                    ROLLING_COMPACTION_INTERVAL=99,
+                    create_streaming_completion=model,
+                ):
             yield
 
 
@@ -138,7 +145,7 @@ class StopLatencyTest(CancellationTestCase):
             patches.append(patch.object(bot, "tool_bash_exec", tool_exec))
 
         with tempfile.TemporaryDirectory() as log_dir:
-            patches.append(patch.object(bot, "SYSTEM_LOG_DIR", log_dir))
+            patches.append(run_catalog_patch(bot, log_dir))
             for item in patches:
                 item.start()
             try:
@@ -180,7 +187,7 @@ class StopLatencyTest(CancellationTestCase):
                 return _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "wedged"})])
             return _response(content="계속")
 
-        async def wedged_tool(command):
+        async def wedged_tool(workspace, command):
             self.stage_started.set()
             await asyncio.sleep(60)
             return "never"
@@ -212,7 +219,7 @@ class StopLatencyTest(CancellationTestCase):
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -248,13 +255,13 @@ class NoStageAfterCancellationTest(CancellationTestCase):
             await asyncio.sleep(60)
             return _response(content="never")
 
-        async def tool(command):
+        async def tool(workspace, command):
             tool_calls.append(command)
             return "ok"
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 8), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 1), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 1), \
@@ -283,7 +290,7 @@ class NoStageAfterCancellationTest(CancellationTestCase):
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -398,7 +405,7 @@ class RolloverBoundaryTest(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
         ):
             rolled, summary = await bot.rollover_agent_context(
-                messages, "기존 요약", 10
+                TEST_WORKSPACE, messages, "기존 요약", 10
             )
 
         self.assertIn("기존 요약", summary)
@@ -414,7 +421,9 @@ class RolloverBoundaryTest(unittest.IsolatedAsyncioTestCase):
         token.cancel("롤오버 전 중단")
 
         with self.assertRaises(RunCancelled):
-            await bot.rollover_agent_context([], "", 1, token=token)
+            await bot.rollover_agent_context(
+                TEST_WORKSPACE, [], "", 1, token=token
+            )
 
 
 class CheckpointBoundaryTest(CancellationTestCase):
@@ -437,7 +446,7 @@ class CheckpointBoundaryTest(CancellationTestCase):
 
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 3), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 1), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
@@ -659,7 +668,7 @@ class StageDeadlineTest(CancellationTestCase):
 
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "CONFIG", tight), \
                     patch.object(bot, "client", test_client), \
                     patch.object(bot, "MAX_AGENT_LOOPS", 2), \
@@ -727,7 +736,7 @@ class StageDeadlineTest(CancellationTestCase):
 
         try:
             with tempfile.TemporaryDirectory() as log_dir, \
-                    patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                    run_catalog_patch(bot, log_dir), \
                     patch.object(bot, "CONFIG", tight), \
                     patch.object(bot, "client", test_client), \
                     patch.object(bot, "MAX_AGENT_LOOPS", 2), \
@@ -839,7 +848,7 @@ class StageDeadlineTest(CancellationTestCase):
             )
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "CONFIG", tight), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "create_streaming_completion", guarded):
@@ -869,7 +878,7 @@ class StageDeadlineTest(CancellationTestCase):
         message = FakeMessage("시스템 상태를 조사해줘", CHANNEL_ID)
 
         with tempfile.TemporaryDirectory() as log_dir, \
-                patch.object(bot, "SYSTEM_LOG_DIR", log_dir), \
+                run_catalog_patch(bot, log_dir), \
                 patch.object(bot, "CONFIG", tight), \
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 99), \
@@ -894,7 +903,7 @@ class ToolBatchCleanupTest(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         expected = AttributeError("tool failed")
 
-        async def tool(command):
+        async def tool(workspace, command):
             if command == "fail":
                 await sibling_started.wait()
                 raise expected
@@ -912,7 +921,7 @@ class ToolBatchCleanupTest(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(bot, "tool_bash_exec", tool):
                 with self.assertRaises(AttributeError) as caught:
-                    await bot.execute_tools_in_parallel(calls)
+                    await bot.execute_tools_in_parallel(TEST_WORKSPACE, calls)
 
             self.assertIs(caught.exception, expected)
             self.assertTrue(sibling_finalized.is_set())
@@ -989,12 +998,14 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
             return proc
 
         with tempfile.TemporaryDirectory() as workspace, \
+                run_catalog_patch(bot, workspace), \
                 patch.object(bot, "CONFIG", tight), \
-                patch.object(bot, "WORKSPACE_DIR", workspace), \
                 patch.object(bot.asyncio, "create_subprocess_shell", capture_spawn):
-            child_pid_path = os.path.join(workspace, "child.pid")
+            run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
+            child_pid_path = os.path.join(run.root, "child.pid")
             task = asyncio.create_task(
                 bot.tool_bash_exec(
+                    run,
                     "sh -c 'echo $$ > child.pid; sleep 40' p2ach-leader-exit-timeout &"
                 )
             )
@@ -1024,11 +1035,13 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
             return proc
 
         with tempfile.TemporaryDirectory() as workspace, \
-                patch.object(bot, "WORKSPACE_DIR", workspace), \
+                run_catalog_patch(bot, workspace), \
                 patch.object(bot.asyncio, "create_subprocess_shell", capture_spawn):
-            child_pid_path = os.path.join(workspace, "child.pid")
+            run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
+            child_pid_path = os.path.join(run.root, "child.pid")
             task = asyncio.create_task(
                 bot.tool_bash_exec(
+                    run,
                     "sh -c 'echo $$ > child.pid; sleep 40' p2ach-leader-exit-cancel &"
                 )
             )
@@ -1052,10 +1065,11 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
         tight = dataclasses.replace(bot.CONFIG, bash_timeout=0.3)
 
         with tempfile.TemporaryDirectory() as workspace, \
-                patch.object(bot, "CONFIG", tight), \
-                patch.object(bot, "WORKSPACE_DIR", workspace):
+                run_catalog_patch(bot, workspace), \
+                patch.object(bot, "CONFIG", tight):
+            run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
             result = await bot.tool_bash_exec(
-                f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}"
+                run, f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}"
             )
 
         self.assertIn("timed out", result)
@@ -1067,10 +1081,14 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_reclaims_the_whole_process_tree(self):
         marker = "p2ach-cancel-probe-31574"
 
-        with tempfile.TemporaryDirectory() as workspace, \
-                patch.object(bot, "WORKSPACE_DIR", workspace):
+        with tempfile.TemporaryDirectory() as workspace, run_catalog_patch(
+            bot, workspace
+        ):
+            run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
             task = asyncio.ensure_future(
-                bot.tool_bash_exec(f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}")
+                bot.tool_bash_exec(
+                    run, f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}"
+                )
             )
             await asyncio.sleep(0.4)
             task.cancel()

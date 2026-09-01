@@ -8,7 +8,11 @@ All identifiers below are synthetic. No production ids or tokens.
 """
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from run_workspace import RunCatalog
 
 TEST_USER_ID = 111111111111111111
 TEST_ADMIN_ID = 222222222222222222
@@ -20,6 +24,13 @@ os.environ.setdefault(
 )
 os.environ.setdefault("DISCORD_ADMIN_USER_IDS", str(TEST_ADMIN_ID))
 os.environ.setdefault("LLM_BASE_URL", "http://127.0.0.1:18080/v1")
+
+
+def run_catalog_patch(bot_module, root):
+    """Patch the bot with a real isolated catalog rooted in a test temp dir."""
+    root = Path(root)
+    catalog = RunCatalog(root / "workspace", root / "logs")
+    return patch.object(bot_module, "RUN_CATALOG", catalog)
 
 
 class FakeSentMessage:
