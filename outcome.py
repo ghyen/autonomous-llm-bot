@@ -1,16 +1,10 @@
 """Terminal state for a run: one transition decides everything after it.
 
-Whether a run had finished, and whether it had succeeded, used to be inferred
-from the *wording* of the last model response - it counted as final if the text
-contained 최종/보고서/결론 and ran past 400 characters. So a short, correct
-completion or correction was ignored and the loop was forced onward, while a run
-that ended by user interrupt or by burning all 250 steps was dressed up with a
-completion label and a 완료 시간 footer.
-
-Completion intent is now a structured signal (`finish_task`) and nothing else.
-`RunOutcome` records exactly one reason; later attempts are kept for the log but
-change nothing. Everything downstream - nudges, tool dispatch, checkpoints,
-rollover, the synthesis prompt, the user-facing label - reads that one value.
+Completion used to be inferred from the wording and length of the last model
+response, which both forced the loop past short correct answers and dressed up
+interrupted runs as finished ones. Completion intent is now a structured signal
+(`finish_task`) and nothing else. `RunOutcome` records exactly one reason and
+everything downstream reads that one value.
 """
 
 from typing import List, Optional, Tuple
@@ -46,10 +40,6 @@ class RunOutcome:
         self._reason: Optional[str] = None
         self._detail: str = ""
         self.ignored_attempts: List[Tuple[str, str]] = []
-
-    @property
-    def settled(self) -> bool:
-        return self._reason is not None
 
     @property
     def reason(self) -> Optional[str]:
