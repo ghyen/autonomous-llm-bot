@@ -113,19 +113,30 @@ class RunWorkspace:
 
     def resolve(self, path):
         raw_path = os.fspath(path)
-        if os.path.isabs(raw_path):
-            target = Path(os.path.normpath(raw_path))
-        else:
-            target = Path(os.path.normpath(os.path.join(str(self.root), raw_path)))
-            try:
-                inside = (
-                    os.path.commonpath((str(self.root), str(target)))
-                    == str(self.root)
-                )
-            except ValueError:
-                inside = False
-            if not inside:
-                raise ValueError("relative path escapes the current run workspace")
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.join(str(self.root), raw_path)
+        # Lexical normalization cannot see a symlink that this run's bash_exec
+        # planted inside the root, and an absolute path only looks contained
+        # until it is resolved, so both sides are realpath'd before comparison.
+        # realpath resolves the existing ancestors and keeps the missing tail, so
+        # a not-yet-created write target is judged on its real parent.
+        real_root = os.path.realpath(str(self.root))
+        real_target = os.path.realpath(raw_path)
+        try:
+            inside = os.path.commonpath((real_root, real_target)) == real_root
+        except ValueError:
+            inside = False
+        if not inside:
+            raise ValueError("path escapes the current run workspace")
+        # ponytail: resolution and use are two steps, so a symlink planted between
+        # them can still redirect a write (TOCTOU). Accepted ceiling: the same
+        # run's bash_exec already writes wherever the process can. Upgrade path is
+        # component-wise openat/O_NOFOLLOW resolution held open across the write.
+        relative = os.path.relpath(real_target, real_root)
+        target = self.root if relative == os.curdir else self.root / relative
+        # Re-expressing every contained target under the run root leaves one
+        # spelling per file, so an absolute or symlinked alias of a canonical file
+        # cannot present itself as an ordinary path and skip CAS.
         if (
             target.parent == self.root
             and target.name.casefold() in CANONICAL_NAMES
