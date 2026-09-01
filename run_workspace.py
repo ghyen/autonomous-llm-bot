@@ -54,7 +54,12 @@ def _revision(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _atomic_write(path, data):
+def atomic_write(path, data):
+    """Temp file → flush → fsync → replace, so an interrupt cannot truncate.
+
+    Public because run state (`run_state.py`) needs the same guarantee for the
+    same reason: a half-written record is worse than no record at all.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
@@ -118,7 +123,7 @@ class RunWorkspace:
         payload = json.dumps(
             self._metadata(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        _atomic_write(self.metadata_path, payload)
+        atomic_write(self.metadata_path, payload)
 
     def clear_read_cache(self):
         self._read_hashes.clear()
@@ -199,8 +204,10 @@ class RunWorkspace:
         target = self.resolve(path)
         data = str(content).encode("utf-8")
         if not self._is_canonical(target):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            # Ordinary files replace atomically too: an interrupt mid-write used
+            # to leave a truncated file behind, and the agent's own scripts and
+            # findings live here (issue #6).
+            atomic_write(target, data)
             revision = _revision(data)
             self._remember(target, revision)
             return {
@@ -240,7 +247,7 @@ class RunWorkspace:
                     "current_revision": current_revision,
                 }
 
-            _atomic_write(target, data)
+            atomic_write(target, data)
             revision = _revision(data)
             self._remember(target, revision)
             return {
@@ -368,6 +375,20 @@ class RunCatalog:
             if workspace is None or workspace.owner_id != owner_id:
                 raise RunNotFoundError("run not found")
             return workspace
+
+    def workspaces(self, channel_id=None):
+        """Known runs, optionally narrowed to one channel.
+
+        A read accessor, not a lifecycle operation. Startup recovery and
+        `!reset` both need to find a channel's runs to settle their durable
+        state, and neither should be reaching into the catalog's internals.
+        """
+        with self._lock:
+            return [
+                workspace
+                for workspace in self._runs.values()
+                if channel_id is None or workspace.channel_id == channel_id
+            ]
 
     def _reset_conflicts(self, owner_id, channel_id):
         return any(
