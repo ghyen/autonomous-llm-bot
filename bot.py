@@ -32,7 +32,6 @@ import outcome as outcome_mod
 from deadlines import (
     CancelToken,
     RunCancelled,
-    StageBudget,
     StageTimeout,
     _reap,
     stream_chunks,
@@ -1049,7 +1048,6 @@ async def run_completion_stage(token=None, stage="agent", deadline=None, **kwarg
 
 async def create_streaming_completion(token=None, stage="agent", **kwargs):
     """Collect a streaming response under transport connect and read-idle bounds."""
-    budget = StageBudget(stage, total=CONFIG.model_stage_timeout, idle=CONFIG.idle_timeout)
     # HTTPX's phase-specific connect timeout governs DNS/TCP/TLS. Awaiting the
     # SDK here also includes response headers, which belong to read/total time.
     stream = await client.chat.completions.create(stream=True, **kwargs)
@@ -1057,7 +1055,7 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
     reasoning_parts = []
     tool_buffers = {}
 
-    async for chunk in stream_chunks(stream, budget, token):
+    async for chunk in stream_chunks(stream, stage, CONFIG.idle_timeout, token):
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
@@ -1280,15 +1278,20 @@ async def deny_interaction(interaction: discord.Interaction, action: str, decisi
         f"channel={interaction.channel_id} action={action} reason={decision.reason}",
         flush=True,
     )
-    message = decision.reason if action != authz.ACCESS else authz.DENY_ACCESS_MESSAGE
-    await interaction.response.send_message(f"⛔ {message}", ephemeral=True)
+    # DENY_ACCESS_MESSAGE already carries the ⛔ marker; the per-decision reasons do
+    # not. Prefixing both, as this used to, double-marked every access denial. The
+    # text command path at the bottom of on_message follows the same split.
+    if action == authz.ACCESS:
+        message = authz.DENY_ACCESS_MESSAGE
+    else:
+        message = f"⛔ {decision.reason}"
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 def interaction_can_manage_messages(interaction: discord.Interaction) -> bool:
-    permissions = getattr(interaction, "permissions", None)
-    if permissions is not None and hasattr(permissions, "manage_messages"):
-        return bool(permissions.manage_messages)
-    return caller_can_manage_messages(interaction.channel, interaction.user)
+    # Interaction.permissions is the caller's own resolved channel permission and
+    # has existed since discord.py 2.0, below the floor requirements.txt sets.
+    return bool(interaction.permissions.manage_messages)
 
 
 @bot.tree.command(name="reset", description="대화 기록 및 캐시를 초기화합니다.")
@@ -2445,7 +2448,11 @@ async def on_message(message: discord.Message):
 
     except Exception as e:
         outcome.settle(outcome_mod.FAILED, f"예외: {type(e).__name__}")
-        err_msg = f"⚠️ **{outcome.label}** — 작업 도중 예외 발생: `{e}`\n📁 현재까지의 추론/도구 실행 기록은 시스템 로그에 저장되었습니다."
+        # The run may already have settled COMPLETED before the exception - a failed
+        # Discord delivery is the common case. settle() is first-wins, so outcome.label
+        # would still read "조사 완료" on a message that reports a failure. Whatever the
+        # earlier reason was, this path did not deliver a finished investigation.
+        err_msg = f"⚠️ **{outcome_mod.LABELS[outcome_mod.FAILED]}** — 작업 도중 예외 발생: `{e}`\n📁 현재까지의 추론/도구 실행 기록은 시스템 로그에 저장되었습니다."
         print(f"[Run settled: {outcome.describe()}] {e}", file=sys.stderr, flush=True)
         log_session_event(session_file, f"⚠️ [종료: {outcome.describe()}]", str(e))
         try:
