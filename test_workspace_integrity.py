@@ -191,7 +191,132 @@ class CatalogIsolationTest(WorkspaceTestCase):
         catalog.finish(latest_channel, "completed")
 
 
+    async def test_prepared_selection_survives_restart_once_with_empty_read_cache(self):
+        # Production mutation caught: keeping reset/new selection only in memory
+        # strands the prepared run after restart and silently creates a new run.
+        catalog = self.catalog()
+        prepared = catalog.prepare(TEST_USER_ID, CHANNEL_A)
+        await prepared.write("prepared.txt", "prepared bytes", None)
+        self.assertEqual(prepared.read("prepared.txt")["status"], "unchanged")
+
+        restarted = run_workspace.RunCatalog(self.workspace_root, self.log_root)
+        selected = restarted.acquire(TEST_USER_ID, CHANNEL_A)
+        following = restarted.acquire(TEST_USER_ID, CHANNEL_A)
+
+        self.assertEqual(selected.run_id, prepared.run_id)
+        self.assertEqual(selected.read("prepared.txt")["status"], "success")
+        self.assertNotEqual(following.run_id, prepared.run_id)
+
+    async def test_resumed_selection_survives_restart_once_with_empty_read_cache(self):
+        # Production mutation caught: restart discards an explicitly resumed run
+        # even though its prepared owner/channel selection is persisted in run.json.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        await workspace.write("resumed.txt", "resumed bytes", None)
+        catalog.finish(workspace, "stopped")
+        catalog.resume(TEST_USER_ID, CHANNEL_B, workspace.run_id)
+        self.assertEqual(workspace.read("resumed.txt")["status"], "success")
+        self.assertEqual(workspace.read("resumed.txt")["status"], "unchanged")
+
+        restarted = run_workspace.RunCatalog(self.workspace_root, self.log_root)
+        selected = restarted.acquire(TEST_USER_ID, CHANNEL_B)
+        following = restarted.acquire(TEST_USER_ID, CHANNEL_B)
+
+        self.assertEqual(selected.run_id, workspace.run_id)
+        self.assertEqual(selected.channel_id, CHANNEL_B)
+        self.assertEqual(selected.read("resumed.txt")["status"], "success")
+        self.assertNotEqual(following.run_id, workspace.run_id)
+
+    async def test_restart_deterministically_retires_duplicate_prepared_selections(self):
+        # Production mutation caught: directory iteration order selecting duplicate
+        # prepared metadata can resurrect an older loser on a later restart.
+        catalog = self.catalog()
+        first = catalog.prepare(TEST_USER_ID, CHANNEL_A)
+        second = catalog.prepare(TEST_USER_ID, CHANNEL_A)
+        tied_at = "2026-01-01T00:00:00+00:00"
+        for workspace in (first, second):
+            metadata = self.metadata(workspace)
+            metadata.update({
+                "status": "prepared",
+                "created_at": tied_at,
+                "updated_at": tied_at,
+            })
+            workspace.metadata_path.write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+
+        restarted = run_workspace.RunCatalog(self.workspace_root, self.log_root)
+        expected_id = max(first.run_id, second.run_id)
+        loser_id = min(first.run_id, second.run_id)
+        selected = restarted.acquire(TEST_USER_ID, CHANNEL_A)
+
+        self.assertEqual(selected.run_id, expected_id)
+        loser = restarted.lookup_owned(TEST_USER_ID, loser_id)
+        self.assertEqual(loser.status, "interrupted")
+        self.assertEqual(self.metadata(loser)["status"], "interrupted")
+        restarted.finish(selected, "completed")
+
+        restarted_again = run_workspace.RunCatalog(
+            self.workspace_root, self.log_root
+        )
+        following = restarted_again.acquire(TEST_USER_ID, CHANNEL_A)
+        self.assertNotIn(following.run_id, {expected_id, loser_id})
+
+
 class CanonicalIntegrityTest(WorkspaceTestCase):
+    async def test_mixed_case_root_aliases_share_canonical_revision_and_lock(self):
+        # Production mutation caught: exact-case canonical recognition lets a
+        # mixed-case root alias bypass expected_revision and the canonical lock.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+
+        for canonical_name, alias_name in (
+            ("plan.md", "PLAN.MD"),
+            ("findings.md", "FINDINGS.MD"),
+        ):
+            original = f"original-{canonical_name}"
+            created = await workspace.write(
+                canonical_name, original, "absent"
+            )
+            canonical_path = workspace.root / canonical_name
+            original_bytes = canonical_path.read_bytes()
+
+            workspace.clear_read_cache()
+            alias_read = workspace.read(alias_name)
+            self.assertEqual(alias_read["status"], "success")
+            self.assertEqual(alias_read["content"], original)
+            self.assertFalse(alias_read["truncated"])
+
+            for alias in (alias_name, str(workspace.root / alias_name)):
+                missing_revision = await workspace.write(alias, "bypass", None)
+                self.assertEqual(missing_revision["status"], "error")
+                self.assertEqual(
+                    missing_revision["error"], "expected_revision_required"
+                )
+                self.assertEqual(canonical_path.read_bytes(), original_bytes)
+
+                conflict = await workspace.write(alias, "stale", "absent")
+                self.assertEqual(conflict["status"], "conflict")
+                self.assertEqual(canonical_path.read_bytes(), original_bytes)
+
+            first, second = await asyncio.gather(
+                workspace.write(
+                    canonical_name, f"lower-{canonical_name}", created["revision"]
+                ),
+                workspace.write(
+                    alias_name, f"alias-{canonical_name}", created["revision"]
+                ),
+            )
+            self.assertEqual(
+                sorted((first["status"], second["status"])),
+                ["conflict", "success"],
+            )
+            self.assertIn(
+                canonical_path.read_text(encoding="utf-8"),
+                (f"lower-{canonical_name}", f"alias-{canonical_name}"),
+            )
+            self.assertNotIn(
+                alias_name, [path.name for path in workspace.root.iterdir()]
+            )
     async def test_canonical_reads_are_complete_hash_aware_and_ordinary_reads_clip(self):
         # Production mutation caught: hashing clipped text, clipping canonical
         # content, or returning unchanged bytes defeats revision-aware research.
@@ -418,7 +543,6 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
                 bot.channel_summary,
                 bot.channel_reasoning,
                 bot.channel_active_runs,
-                bot.channel_user_queue,
                 bot.channel_ledger,
             ):
                 state.pop(channel_id, None)

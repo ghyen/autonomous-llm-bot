@@ -326,7 +326,6 @@ channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
-channel_user_queue = defaultdict(list)
 channel_run_owner = {}
 
 
@@ -379,7 +378,6 @@ def clear_channel_state(channel_id) -> None:
     channel_history[channel_id].clear()
     channel_summary[channel_id] = ""
     channel_ledger[channel_id].clear()
-    channel_user_queue[channel_id].clear()
 
 
 MAX_RECENT_TURNS = 8
@@ -424,6 +422,15 @@ def _invalid_tool_arguments_result(reason: str, tool_name: str) -> str:
 
 
 def _tool_result_failed(tool_name: str, result: str) -> bool:
+    if tool_name in ("read_file", "write_file"):
+        try:
+            envelope = json.loads(result)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(envelope, dict)
+            and envelope.get("status") in ("error", "conflict")
+        )
     if result.startswith("[Error"):
         return True
     if tool_name == "bash_exec":
@@ -1659,7 +1666,7 @@ async def on_message(message: discord.Message):
             if candidate["active"]
         )
         session_file = active_lease["workspace"].log_path
-        channel_user_queue[message.channel.id].append((str(message.author), content))
+        active_lease["steering"].append((str(message.author), content))
         log_session_event(session_file, f"💬 [사용자 실시간 중간 개입] {message.author}", content)
         print(f"[Mid-Flight User Steering Queued from {message.author}]: {content}", flush=True)
 
@@ -1687,6 +1694,7 @@ async def on_message(message: discord.Message):
         "owner": caller_id,
         "active": False,
         "workspace": workspace,
+        "steering": [],
     }
     channel_run_leases[message.channel.id].append(lease)
 
@@ -1699,7 +1707,6 @@ async def on_message(message: discord.Message):
             channel_run_leases.pop(message.channel.id, None)
             channel_cancel_token.pop(message.channel.id, None)
             channel_run_owner.pop(message.channel.id, None)
-            channel_user_queue[message.channel.id].clear()
             return
         current = next(
             (
@@ -1713,7 +1720,6 @@ async def on_message(message: discord.Message):
         channel_run_owner[message.channel.id] = current["owner"]
 
     publish_run_control()
-    channel_user_queue[message.channel.id].clear()
 
     released = False
 
@@ -1908,9 +1914,9 @@ async def on_message(message: discord.Message):
                 break
 
             # [실시간 사용자 동적 개입 주입]
-            if channel_user_queue[message.channel.id]:
-                while channel_user_queue[message.channel.id]:
-                    q_author, q_text = channel_user_queue[message.channel.id].pop(0)
+            if lease["steering"]:
+                while lease["steering"]:
+                    q_author, q_text = lease["steering"].pop(0)
                     steering_block = {
                         "role": "user",
                         "content": f"💬 [사용자({q_author}) 실시간 추가 지침/피드백]:\n{q_text}\n\n(이 지침을 바탕으로 현재 작업 방향을 적절히 조정하거나, 요청받은 내용을 우선 처리하세요.)"
