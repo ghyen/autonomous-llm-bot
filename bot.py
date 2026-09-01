@@ -67,6 +67,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 [운영 환경]
 - 현재 실행 작업 디렉토리: `{workspace_root}`
 - 시스템 파일:
+  - `{workspace_root}/skills/`: 현재 실행 전용 재사용 스크립트 및 도구 저장소 (`.py`, `.sh`, `.bash`, `.md`)
   - `{workspace_root}/plan.md`: 에이전트의 목표 달성 체크리스트 및 실시간 진행 상태
   - `{workspace_root}/findings.md`: 수집된 핵심 데이터, 단서, 팩트, 취약점 및 결론 누적 기록
 - 사용할 수 있는 도구:
@@ -95,9 +96,10 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 [딥리서치 요청에만 적용하는 자율 탐색 지침]
 1. 목표를 달성할 때까지 멈추지 말고 필요한 도구를 연속적으로 실행하세요.
 2. 중간에 추측하지 말고 반드시 도구(`bash_exec`, `web_search` 등)를 통해 사실을 검증하세요.
-3. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
-4. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
-5. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
+3. 반복되거나 복잡한 데이터 파싱, 스크래핑, 쉘 작업은 `write_file`로 `skills/<name>.py` 또는 `skills/<name>.sh`에 스크립트화하여 저장하고 `bash_exec`로 실행하여 재사용하세요.
+4. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
+5. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
+6. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
 """
 
 DIRECT_RESPONSE_PATTERN = re.compile(
@@ -758,9 +760,14 @@ def _msg_tool_calls(m) -> list:
 
 def _clip_summary_text(text: str, max_chars: int) -> str:
     text = str(text or "").strip()
+    if max_chars <= 0:
+        return ""
     if len(text) <= max_chars:
         return text
-    return text[:max_chars].rstrip() + " ...[생략]"
+    omission = " ...[생략]"
+    if max_chars <= len(omission):
+        return text[:max_chars]
+    return text[:max_chars - len(omission)].rstrip() + omission
 
 def _tool_call_summary(call) -> str:
     if isinstance(call, dict):
@@ -802,6 +809,231 @@ def sanitize_messages_for_chat_template(messages: list) -> list:
 
     return sanitized
 
+# --- Workspace Skills & Reusable Tools Architecture ---
+
+def _extract_skill_description(content: str, ext: str) -> str:
+    content = str(content or "").strip()
+    if not content:
+        return "스크립트 도구"
+
+    for line in content.splitlines():
+        line = line.strip()
+        m = re.match(r"^#\s*(?:description|설명)\s*:\s*(.+)$", line, re.IGNORECASE)
+        if m:
+            return _clip_summary_text(m.group(1).strip(), 120)
+
+    if ext == ".py":
+        doc_m = re.search(r'^(?:#[^\n]*\n)*\s*(?:"""|\'\'\')(.*?)(?:"""|\'\'\')', content, re.DOTALL)
+        if doc_m:
+            doc = " ".join(doc_m.group(1).strip().split())
+            if doc:
+                return _clip_summary_text(doc, 120)
+
+    if ext == ".md":
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                clean = line.lstrip("#").strip()
+                if clean:
+                    return _clip_summary_text(clean, 120)
+
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("#") and not line.startswith("#!"):
+            clean = line.lstrip("#").strip()
+            if clean:
+                return _clip_summary_text(clean, 120)
+
+    if ext == ".py":
+        return "Python 스크립트 도구"
+    elif ext in (".sh", ".bash"):
+        return "Shell 스크립트 도구"
+    elif ext == ".md":
+        return "스킬 가이드 문서"
+    return "작업 공간 도구"
+
+
+def discover_workspace_skills(workspace) -> list:
+    target_dir = os.path.join(workspace.root, "skills")
+    if not os.path.isdir(target_dir):
+        return []
+    skills = []
+    try:
+        entries = sorted(os.listdir(target_dir))
+    except Exception:
+        return []
+    for entry in entries:
+        if entry.startswith(".") or entry.startswith("_"):
+            continue
+        full_path = os.path.join(target_dir, entry)
+        if not os.path.isfile(full_path):
+            continue
+        ext = os.path.splitext(entry)[1].lower()
+        if ext not in (".py", ".sh", ".bash", ".md"):
+            continue
+        try:
+            size = os.path.getsize(full_path)
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(2048)
+        except Exception:
+            continue
+        desc = _extract_skill_description(content, ext)
+        skill_type = "python" if ext == ".py" else ("shell" if ext in (".sh", ".bash") else "markdown")
+        skills.append({
+            "name": f"skills/{entry}",
+            "path": full_path,
+            "type": skill_type,
+            "description": desc,
+            "size": size,
+        })
+    return skills
+
+
+def render_skills_block(workspace) -> str:
+    skills = discover_workspace_skills(workspace)
+    header = "[재사용 가능한 작업 공간 스킬 (Workspace Skills)]"
+    if not skills:
+        return (
+            f"{header}\n"
+            "(현재 등록된 스킬 없음. 복잡하거나 반복되는 작업은 write_file을 사용해 "
+            "skills/<name>.py 또는 .sh로 스크립트화하여 저장하고 bash_exec로 재사용하세요.)"
+        )
+    lines = [header]
+    for s in skills:
+        lines.append(f"- `{s['name']}`: {s['description']} ({s['size']}B)")
+    lines.append(
+        "* 실행 방법: bash_exec(command=\"python3 skills/<name>.py ...\") 또는 "
+        "bash_exec(command=\"bash skills/<name>.sh ...\")\n"
+        "* 새 스킬 생성: write_file로 skills/<name>.py 또는 .sh를 작성하고 재사용하세요."
+    )
+    return "\n".join(lines)
+
+
+# --- Hierarchical Trajectory & Multi-level Compaction ---
+
+MILESTONES_SECTION_HEADER = "## 🏛️ 장기 마일스톤 색인"
+RECENT_PHASE_SECTION_HEADER = "## 🔍 직전 구간 상세 요약"
+ARTIFACTS_SECTION_HEADER = "## 📁 핵심 발견 및 산출물 색인"
+
+
+def format_hierarchical_summary(
+    milestones: list = None,
+    recent_summary: str = "",
+    discoveries: list = None,
+) -> str:
+    sections = []
+    milestone_lines = [str(m).strip() for m in (milestones or []) if str(m).strip()]
+    milestone_content = "\n".join(milestone_lines) if milestone_lines else "(초기 탐색 단계 - 이전 마일스톤 없음)"
+    sections.append(f"{MILESTONES_SECTION_HEADER}\n{milestone_content}")
+
+    recent_text = str(recent_summary or "").strip()
+    sections.append(f"{RECENT_PHASE_SECTION_HEADER}\n{recent_text or '(진행 중인 세부 작업 없음)'}")
+
+    discovery_lines = [str(d).strip() for d in (discoveries or []) if str(d).strip()]
+    if discovery_lines:
+        sections.append(f"{ARTIFACTS_SECTION_HEADER}\n" + "\n".join(discovery_lines))
+
+    return "\n\n".join(sections)
+
+
+def parse_hierarchical_summary(text: str) -> dict:
+    text = str(text or "").strip()
+    if not text:
+        return {"milestones": [], "recent_summary": "", "discoveries": []}
+
+    milestones = []
+    recent_summary = ""
+    discoveries = []
+
+    if MILESTONES_SECTION_HEADER not in text and RECENT_PHASE_SECTION_HEADER not in text:
+        return {"milestones": [], "recent_summary": text, "discoveries": []}
+
+    curr_section = None
+    curr_lines = []
+
+    for line in text.splitlines():
+        trimmed = line.strip()
+        if trimmed.startswith(MILESTONES_SECTION_HEADER):
+            if curr_section == "recent":
+                recent_summary = "\n".join(curr_lines).strip()
+            elif curr_section == "artifacts":
+                discoveries.extend([l for l in curr_lines if l.strip()])
+            curr_section = "milestones"
+            curr_lines = []
+        elif trimmed.startswith(RECENT_PHASE_SECTION_HEADER):
+            if curr_section == "milestones":
+                milestones.extend([l for l in curr_lines if l.strip() and not l.strip().startswith("(초기")])
+            elif curr_section == "artifacts":
+                discoveries.extend([l for l in curr_lines if l.strip()])
+            curr_section = "recent"
+            curr_lines = []
+        elif trimmed.startswith(ARTIFACTS_SECTION_HEADER):
+            if curr_section == "milestones":
+                milestones.extend([l for l in curr_lines if l.strip() and not l.strip().startswith("(초기")])
+            elif curr_section == "recent":
+                recent_summary = "\n".join(curr_lines).strip()
+            curr_section = "artifacts"
+            curr_lines = []
+        else:
+            curr_lines.append(line)
+
+    if curr_section == "milestones":
+        milestones.extend([l for l in curr_lines if l.strip() and not l.strip().startswith("(초기")])
+    elif curr_section == "recent":
+        recent_summary = "\n".join(curr_lines).strip()
+    elif curr_section == "artifacts":
+        discoveries.extend([l for l in curr_lines if l.strip()])
+
+    return {
+        "milestones": milestones,
+        "recent_summary": recent_summary,
+        "discoveries": discoveries,
+    }
+
+
+def update_hierarchical_summary(
+    existing_summary: str,
+    new_recent_summary: str,
+    step_range: str = "",
+    discoveries: list = None,
+) -> str:
+    parsed = parse_hierarchical_summary(existing_summary)
+    old_milestones = list(parsed["milestones"])
+    old_recent = parsed["recent_summary"].strip()
+
+    if old_recent and not old_recent.startswith("(진행") and not old_recent.startswith("(초기"):
+        condensed = _clip_summary_text(old_recent.replace("\n", " "), 250)
+        prefix = f"• 구간 ({step_range}): " if step_range else "• 이전 구간: "
+        if not any(condensed in m for m in old_milestones):
+            old_milestones.append(f"{prefix}{condensed}")
+
+    merged_discoveries = list(parsed["discoveries"])
+    for d in (discoveries or []):
+        if d not in merged_discoveries:
+            merged_discoveries.append(d)
+
+    return format_hierarchical_summary(
+        milestones=old_milestones,
+        recent_summary=new_recent_summary,
+        discoveries=merged_discoveries,
+    )
+
+
+def extract_discovered_artifacts(text: str, workspace) -> list:
+    artifacts = []
+    for m in re.finditer(r"(`(?:skills/[a-zA-Z0-9_.-]+|findings\.md|plan\.md|[a-zA-Z0-9_.-]+\.(?:py|sh|json|md|txt))`|https?://[^\s)\]]+)", text):
+        found = m.group(1).strip()
+        item = f"- 참조/산출물: {found}"
+        if item not in artifacts:
+            artifacts.append(item)
+    skills = discover_workspace_skills(workspace)
+    for s in skills:
+        skill_item = f"- 스킬: `{s['name']}` ({s['description']})"
+        if skill_item not in artifacts:
+            artifacts.append(skill_item)
+    return artifacts[:10]
+
+
 # --- User's Rolling Compaction (Rollup) Architecture ---
 
 ROLLING_SUMMARY_LABEL = "누적 작업 요약 및 이전 대화 컨텍스트"
@@ -816,6 +1048,9 @@ def build_system_content(workspace, ledger=None, summary: str = "") -> str:
     checkpoint and rollover sees the same authoritative state.
     """
     parts = [SYSTEM_PROMPT_TEMPLATE.format(workspace_root=workspace.root)]
+    skills_block = render_skills_block(workspace)
+    if skills_block:
+        parts.append(skills_block)
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
@@ -940,10 +1175,19 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
             + "\n"
         )
 
+    start_step = max(1, step_num - ROLLING_COMPACTION_INTERVAL + 1)
+    step_range = f"Step {start_step}-{step_num}"
+    discoveries = extract_discovered_artifacts(
+        source + "\n" + (existing_summary or ""), workspace
+    )
+
     summary_prompt = (
-        "이것은 장시간 자율 에이전트의 컨텍스트 압축 작업입니다.\n"
-        "이전 원본 대화를 그대로 반복하지 말고, 다음 에이전트가 작업을 이어갈 수 있는 "
-        "정확한 누적 요약만 작성하세요.\n"
+        "이것은 장시간 자율 에이전트의 다단계 계층형 컨텍스트 압축 작업입니다.\n"
+        "이전 원본 대화를 그대로 반복하지 말고, 다음 에이전트가 작업을 이어갈 수 있도록 "
+        "아래 3개 섹션 구조로 명확하게 작성하세요:\n\n"
+        f"1. `{MILESTONES_SECTION_HEADER}`: 이전 구간들의 핵심 결정, 반증된 가설, 주요 마일스톤을 간결한 불릿 포인트(•)로 요약\n"
+        f"2. `{RECENT_PHASE_SECTION_HEADER}`: 이번 구간({step_range})의 구체적인 도구 실행 결과, 확인된 사실/수치/에러, 다음 할 일 상세 기술\n"
+        f"3. `{ARTIFACTS_SECTION_HEADER}`: 생성/수정한 파일(`plan.md`, `findings.md`, `skills/...`), 확인한 URL, 주요 명령어 목록\n\n"
         "반드시 포함할 것: 원래 사용자 목표, 완료한 작업, 확인된 사실/수치/URL/파일 경로, "
         "실패와 원인, 반증된 가설과 그 근거, 무효가 된 결론, 아직 검증하지 않은 가정, "
         "다음에 해야 할 구체적인 작업.\n"
@@ -991,14 +1235,23 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         new_summary = ""
 
     if not new_summary:
-        new_summary = _clip_summary_text(
-            "\n".join(part for part in [existing_summary, source] if part),
-            ROLLING_SUMMARY_MAX_CHARS,
+        new_summary = update_hierarchical_summary(
+            existing_summary=existing_summary,
+            new_recent_summary=source,
+            step_range=step_range,
+            discoveries=discoveries,
         )
-        validation_notes.append("결정적 폴백 요약(기존 요약 + 원본 기록)을 사용했습니다.")
+        validation_notes.append("결정적 폴백 계층 요약(기존 요약 + 원본 기록)을 사용했습니다.")
     else:
-        new_summary = _clip_summary_text(new_summary, ROLLING_SUMMARY_MAX_CHARS)
+        if MILESTONES_SECTION_HEADER not in new_summary and RECENT_PHASE_SECTION_HEADER not in new_summary:
+            new_summary = update_hierarchical_summary(
+                existing_summary=existing_summary,
+                new_recent_summary=new_summary,
+                step_range=step_range,
+                discoveries=discoveries,
+            )
 
+    new_summary = _clip_summary_text(new_summary, ROLLING_SUMMARY_MAX_CHARS)
     dropped_markers = missing_state_markers(new_summary, required_markers)
     if dropped_markers:
         validation_notes.append("누락된 상태 마커를 권위 있는 상태 블록으로 보정했습니다: " + ", ".join(dropped_markers))
