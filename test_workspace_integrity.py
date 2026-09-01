@@ -468,12 +468,25 @@ class ToolIntegrationTest(WorkspaceTestCase):
     async def test_prompt_schema_and_dispatcher_receive_explicit_run_context(self):
         # Production mutation caught: a global/default context makes overlapping
         # dispatches and rollovers silently target whichever workspace won last.
-        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        other_workspace = catalog.acquire(TEST_USER_ID, CHANNEL_B)
+        skill_write = json.loads(await bot.tool_write_file(
+            workspace,
+            "skills/run_only.py",
+            '"""현재 실행에서만 사용하는 진단 스킬"""\n',
+            None,
+        ))
+        self.assertEqual(skill_write["status"], "success")
+
         prompt = bot.build_system_content(workspace, None, "summary")
+        other_prompt = bot.build_system_content(other_workspace, None, "summary")
         schema_text = json.dumps(bot.TOOLS_SCHEMA, ensure_ascii=False)
 
         self.assertIn(str(workspace.root), prompt)
         self.assertIn(workspace.run_id, prompt)
+        self.assertIn("skills/run_only.py", prompt)
+        self.assertNotIn("skills/run_only.py", other_prompt)
         self.assertNotIn(str(TEST_USER_ID), prompt)
         self.assertNotIn(str(CHANNEL_A), prompt)
         self.assertNotIn(str(bot.CONFIG.workspace_dir), schema_text)
@@ -521,7 +534,10 @@ class ToolIntegrationTest(WorkspaceTestCase):
                 10,
                 session_file=workspace.log_path,
             )
-        self.assertEqual(summary, "rolled summary")
+        self.assertIn(bot.MILESTONES_SECTION_HEADER, summary)
+        self.assertIn(bot.RECENT_PHASE_SECTION_HEADER, summary)
+        self.assertIn("rolled summary", summary)
+        self.assertIn("skills/run_only.py", summary)
         self.assertIn(str(workspace.root), bot._msg_content(rolled[0]))
         self.assertIn(workspace.run_id, bot._msg_content(rolled[0]))
         self.assertTrue(workspace.log_path.exists())
