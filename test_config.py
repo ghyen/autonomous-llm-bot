@@ -67,6 +67,49 @@ class EnvFileTest(unittest.TestCase):
     def test_missing_file_is_not_an_error(self):
         self.assertEqual(load_env_file("/nonexistent/.env"), {})
 
+    def test_bom_does_not_corrupt_the_first_key(self):
+        # Mutation caught: reading as plain utf-8 leaves the BOM inside the first
+        # key, so an editor-written file makes the token look unset - exactly the
+        # silent-misconfiguration failure this loader exists to remove.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "w", encoding="utf-8-sig") as handle:
+                handle.write("DISCORD_BOT_TOKEN=dummy-invalid-token\n")
+            values = load_env_file(path)
+
+        self.assertEqual(values, {"DISCORD_BOT_TOKEN": "dummy-invalid-token"})
+
+    def test_trailing_comment_is_not_part_of_an_unquoted_value(self):
+        # Mutation caught: keeping the comment made MODEL_NAME literally
+        # "gpt-4 # the model", and a numeric field would fail with a message
+        # blaming the operator's value rather than the stray comment.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "MODEL_NAME=gpt-4  # the model\n"
+                    "LLM_API_KEY=secret#not-a-comment\n"
+                    'DISCORD_BOT_TOKEN="quoted # stays"\n'
+                )
+            values = load_env_file(path)
+
+        self.assertEqual(values["MODEL_NAME"], "gpt-4")
+        self.assertEqual(values["LLM_API_KEY"], "secret#not-a-comment")
+        self.assertEqual(values["DISCORD_BOT_TOKEN"], "quoted # stays")
+
+    def test_unterminated_quote_is_refused_instead_of_truncated(self):
+        # Mutation caught: the old length-2 quote check left the opening quote in
+        # place and silently cut the value at the newline, so a multi-line value
+        # became '"line one' and started the bot with a wrong secret.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('DISCORD_BOT_TOKEN="line one\nline two"\n')
+            with self.assertRaises(ConfigError) as caught:
+                load_env_file(path)
+
+        self.assertIn("DISCORD_BOT_TOKEN", str(caught.exception))
+
     def test_real_environment_wins_over_the_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, ".env")
