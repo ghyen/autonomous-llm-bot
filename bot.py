@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 import authz
 import outcome as outcome_mod
+import steering as steering_mod
 from deadlines import (
     CancelToken,
     RunCancelled,
@@ -319,10 +320,10 @@ bot = CustomBot(command_prefix="!", intents=intents)
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
 channel_reasoning = defaultdict(lambda: "high")
-# Public control follows the newest active lease when one exists; otherwise it
-# follows the newest pending direct lease. The list restores the surviving
-# caller-owned controller after either overlap completion order and never gates,
-# queues, or delays admission.
+# A run marks its lease active before its first await, so the admission check and
+# the mailbox it publishes are decided in one event-loop turn: a message arriving
+# during a live run is always steering, never a second run. The list keeps every
+# lease identity-scoped so a run's cleanup can only ever remove its own.
 channel_cancel_token = {}
 channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
@@ -382,11 +383,49 @@ def clear_channel_state(channel_id) -> None:
     channel_ledger[channel_id].clear()
 
 
+def steering_receipt_notice(receipt, text: str) -> str:
+    """접수 결과를 실제 처리 결과대로 알린다.
+
+    거절된 지시에 "다음 스텝에 반영"이라고 답하면 안 된다. 반영할 스텝이
+    없다는 것이 바로 거절 사유이기 때문이다.
+    """
+    if receipt.state == steering_mod.QUEUED:
+        return (
+            f"📥 **[실시간 개입 접수]** 대기열 {receipt.depth}번째로 등록했습니다. "
+            "다음 스텝에 반영하며, 반영되지 못하면 종료 시 알려드립니다:\n"
+            f"> 💬 *\"{_clip_summary_text(text, 120)}\"*"
+        )
+    if receipt.state == steering_mod.COALESCED:
+        return (
+            f"📥 **[실시간 개입 병합]** 대기 중인 동일 지시에 병합했습니다 (대기 {receipt.depth}건). "
+            "같은 지시를 두 번 주입하지 않습니다."
+        )
+    if receipt.reason == steering_mod.REASON_QUEUE_FULL:
+        return (
+            f"⛔ **[실시간 개입 거절]** 대기열이 상한({receipt.depth}건)까지 찼습니다. "
+            "이 지시는 **적용되지 않았습니다**. 대기 중인 지시가 반영된 뒤 다시 보내주세요."
+        )
+    if receipt.reason == steering_mod.REASON_TERMINAL:
+        return (
+            "⛔ **[실시간 개입 미적용]** 실행이 종료 단계(보고서 합성·전송)에 들어가 "
+            "반영할 다음 스텝이 없습니다. 이 지시는 **적용되지 않았습니다**. "
+            "런이 끝난 뒤 다시 보내주세요."
+        )
+    return (
+        "⛔ **[실시간 개입 미적용]** 이 실행은 단문 직접 답변이라 지시를 반영할 스텝이 없습니다. "
+        "이 지시는 **적용되지 않았습니다**. 답변이 끝난 뒤 다시 보내주세요."
+    )
+
+
 MAX_RECENT_TURNS = 8
 CHECKPOINT_INTERVAL = 10
 MAX_AGENT_LOOPS = 250
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = 250
+
+# 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
+# 한 채널이 이후 모든 스텝의 프롬프트를 대기 깊이만큼 부풀릴 수 있다.
+STEERING_QUEUE_MAX = 8
 
 MAX_NO_TOOL_RESPONSES = 6
 
@@ -1909,26 +1948,45 @@ async def on_message(message: discord.Message):
 
     # [실시간 동적 개입 큐 주입]
     if channel_active_runs[message.channel.id]:
-        steering = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
-        if not steering:
-            await message.reply(f"⛔ {steering.reason}")
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
             return
         active_lease = next(
             candidate
             for candidate in reversed(channel_run_leases[message.channel.id])
             if candidate["active"]
         )
+        mailbox = active_lease["steering"]
         session_file = active_lease["workspace"].log_path
-        active_lease["steering"].append((str(message.author), content))
-        log_session_event(session_file, f"💬 [사용자 실시간 중간 개입] {message.author}", content)
-        print(f"[Mid-Flight User Steering Queued from {message.author}]: {content}", flush=True)
+        receipt = mailbox.offer(str(message.author), content)
+        log_session_event(
+            session_file,
+            f"💬 [사용자 실시간 중간 개입 - {receipt.state}] {message.author}",
+            content,
+        )
+        # 큐 관측은 내용 없이 남긴다. 깊이와 접수/적용 시각만으로도 반영 지연을
+        # 판별할 수 있고, 지시 본문은 이 줄에 들어가지 않는다.
+        log_session_event(
+            session_file, "📊 [실시간 지시 큐 상태]", mailbox.observability_line()
+        )
+        print(
+            f"[Steering {receipt.state}] run={mailbox.run_id} depth={receipt.depth}"
+            f" reason={receipt.reason or '-'}",
+            flush=True,
+        )
+
+        if not receipt.accepted:
+            # 미적용 안내는 자동 삭제하지 않는다. 사용자가 반드시 봐야 한다.
+            await message.reply(steering_receipt_notice(receipt, content))
+            return
 
         try:
             await message.add_reaction("📥")
         except Exception:
             pass
 
-        notice = await message.reply(f"📥 **[실시간 개입 수신]** 실행 중인 에이전트의 다음 스텝에 지시사항이 즉시 반영됩니다:\n> 💬 *\"{content[:120]}\"*")
+        notice = await message.reply(steering_receipt_notice(receipt, content))
         asyncio.create_task(_auto_delete_notice(notice, delay=6))
         return
 
@@ -1942,12 +2000,17 @@ async def on_message(message: discord.Message):
         )
         return
     session_file = workspace.log_path
+    # 승인과 메일박스를 한 턴에 함께 소유한다. 이 지점부터 첫 await까지 사이가
+    # 없으므로 같은 채널의 다음 메시지는 언제나 steering으로 판정된다. 실패 시
+    # 아래 status 응답 실패 경로의 release_run()이 승인을 되돌린다.
     lease = {
         "token": token,
         "owner": caller_id,
-        "active": False,
+        "active": True,
         "workspace": workspace,
-        "steering": [],
+        "steering": steering_mod.SteeringMailbox(
+            workspace.run_id, max_depth=STEERING_QUEUE_MAX
+        ),
     }
     channel_run_leases[message.channel.id].append(lease)
 
@@ -1981,6 +2044,9 @@ async def on_message(message: discord.Message):
         if released:
             return
         released = True
+        # 런이 끝나면 반영할 스텝도 없다. 남은 항목을 여기서 종결시켜야 어떤
+        # 항목도 상태 없이 남지 않는다(정상 경로는 루프 직후에 이미 닫는다).
+        lease["steering"].close(steering_mod.CANCELLED)
         try:
             RUN_CATALOG.finish(workspace, status)
         finally:
@@ -2106,13 +2172,62 @@ async def on_message(message: discord.Message):
     messages_payload = sanitize_messages_for_chat_template(messages_payload)
 
     current_effort = channel_reasoning[message.channel.id]
+    # 여기부터 에이전트 루프가 보장되므로 지시를 받는다. 직접 답변 런은 이 지점에
+    # 오지 않으므로 큐가 닫힌 상태로 남고, 반영할 스텝이 없다는 사실이 접수
+    # 단계에서 그대로 통지된다.
+    lease["steering"].open()
     try:
         status_msg = await message.reply(f"🚀 **[완전자율 목표 달성 모드]** 모델 초기 추론 및 작업 공간 가동 중... (실시간 지시/개입 가능 / 중단: `!stop`)")
     except BaseException:
         release_run()
         raise
-    lease["active"] = True
-    publish_run_control()
+
+    def apply_steering(step_num: int):
+        """대기 중인 지시를 도착 순서대로 흡수한다.
+
+        루프 머리에서만 소비하면 스텝 하나가 긴 동안 접수된 지시가 모델 호출과
+        도구 실행을 모두 기다린다. 도구 결과 직후에도 불러서 체크포인트·롤오버
+        모델 단계까지 기다리지 않게 한다.
+        """
+        applied = lease["steering"].drain()
+        for item in applied:
+            steering_block = {
+                "role": "user",
+                "content": f"💬 [사용자({item.author}) 실시간 추가 지침/피드백]:\n{item.text}\n\n(이 지침을 바탕으로 현재 작업 방향을 적절히 조정하거나, 요청받은 내용을 우선 처리하세요.)"
+            }
+            messages_payload.append(steering_block)
+            history.append(steering_block)
+            log_session_event(session_file, f"💬 [Step {step_num} 실시간 사용자 지침 주입]", f"[{item.author}] {item.text}")
+        if applied:
+            log_session_event(
+                session_file,
+                "📊 [실시간 지시 큐 상태]",
+                lease["steering"].observability_line(),
+            )
+        return applied
+
+    async def close_steering():
+        """종료 단계에 들어갈 때 큐를 닫고 미적용 사실을 알린다.
+
+        닫은 뒤 도착하는 지시는 접수 시점에 거절되고, 이미 대기 중이던 항목은
+        여기서 취소로 종결된다. 예전에는 이 구간에서도 접수와 "다음 스텝 반영"
+        안내가 나갔지만 소비할 반복이 없어 항목이 조용히 사라졌다.
+        """
+        unapplied = lease["steering"].close(steering_mod.CANCELLED)
+        log_session_event(
+            session_file,
+            "📭 [실시간 지시 큐 마감]",
+            lease["steering"].observability_line(),
+        )
+        if not unapplied:
+            return
+        try:
+            await message.channel.send(
+                f"📭 **[실시간 개입 미적용]** 대기 중이던 지시 {len(unapplied)}건은 "
+                "런이 종료되어 **적용되지 않았습니다**. 새 목표 요청으로 다시 보내주세요."
+            )
+        except Exception:
+            pass
 
     total_tools_executed = 0
     last_failed_signature = None
@@ -2167,20 +2282,14 @@ async def on_message(message: discord.Message):
                 break
 
             # [실시간 사용자 동적 개입 주입]
-            if lease["steering"]:
-                while lease["steering"]:
-                    q_author, q_text = lease["steering"].pop(0)
-                    steering_block = {
-                        "role": "user",
-                        "content": f"💬 [사용자({q_author}) 실시간 추가 지침/피드백]:\n{q_text}\n\n(이 지침을 바탕으로 현재 작업 방향을 적절히 조정하거나, 요청받은 내용을 우선 처리하세요.)"
-                    }
-                    messages_payload.append(steering_block)
-                    history.append(steering_block)
-                    log_session_event(session_file, f"💬 [Step {iteration+1} 실시간 사용자 지침 주입]", f"[{q_author}] {q_text}")
-                    try:
-                        await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** 💬 **사용자 실시간 지시사항 반영 중...** (*\"{q_text[:60]}...\"*)")
-                    except Exception:
-                        pass
+            applied_steering = apply_steering(iteration + 1)
+            if applied_steering:
+                head = _clip_summary_text(applied_steering[0].text, 60)
+                extra = f" 외 {len(applied_steering) - 1}건" if len(applied_steering) > 1 else ""
+                try:
+                    await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** 💬 **사용자 실시간 지시사항 반영 중...** (*\"{head}\"*{extra})")
+                except Exception:
+                    pass
 
             extra_params = {}
             if iteration == 0:
@@ -2547,6 +2656,10 @@ async def on_message(message: discord.Message):
                         "content": tool_result
                     })
 
+                # 도구 실행 중에 접수된 지시를 여기서 흡수한다. 다음 루프 머리까지
+                # 미루면 체크포인트 보고서와 롤오버 모델 단계를 모두 기다린다.
+                apply_steering(iteration + 1)
+
                 # [옵션 B: 매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
                 if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
@@ -2741,6 +2854,10 @@ async def on_message(message: discord.Message):
         # 루프가 break 없이 끝나는 경로도 사유 없이 남지 않게 한다.
         outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
 
+        # 여기부터 종료 단계다. 합성·전송 중 도착분은 접수 시점에 거절되고,
+        # 대기 중이던 항목은 미적용으로 종결된다.
+        await close_steering()
+
         cleaned_check = re.sub(r"<think>.*?</think>|</?(function|parameter|tool_call)[^>]*>", "", final_raw, flags=re.DOTALL).strip()
 
         # 합성 여부는 길이 추정이 아니라 종료 사유로 결정한다.
@@ -2931,6 +3048,9 @@ async def on_message(message: discord.Message):
         err_msg = f"⚠️ **{outcome_mod.LABELS[outcome_mod.FAILED]}** — 작업 도중 예외 발생: `{e}`\n📁 현재까지의 추론/도구 실행 기록은 시스템 로그에 저장되었습니다."
         print(f"[Run settled: {outcome.describe()}] {e}", file=sys.stderr, flush=True)
         log_session_event(session_file, f"⚠️ [종료: {outcome.describe()}]", str(e))
+        # 루프 안에서 예외로 빠져나오면 위의 종료 단계 마감을 지나치므로 여기서
+        # 닫는다. 이미 닫혀 있으면 아무 일도 하지 않는다.
+        await close_steering()
         try:
             await status_msg.edit(content=err_msg)
         except Exception:
