@@ -14,7 +14,8 @@ policy is a startup failure, not a silently open door.
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, List, Mapping, Optional
+from typing import Dict, FrozenSet, List, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 DEFAULT_LLM_BASE_URL = "http://127.0.0.1:18080/v1"
 DEFAULT_MODEL_NAME = "default"
@@ -31,6 +32,17 @@ DEFAULT_MODEL_STAGE_TIMEOUT = 600.0
 DEFAULT_TOOL_STAGE_TIMEOUT = 120.0
 DEFAULT_BASH_TIMEOUT = 60.0
 
+# Tool workers are disposable and deny-by-default. These are ceilings, not
+# tuning hints: lowering them is safe, while removing them is refused.
+DEFAULT_TOOL_CPU_SECONDS = 30.0
+DEFAULT_TOOL_MEMORY_BYTES = 268435456
+DEFAULT_TOOL_PROCESS_LIMIT = 32
+DEFAULT_TOOL_THREAD_LIMIT = 64
+DEFAULT_TOOL_OPEN_FILES = 64
+DEFAULT_TOOL_FILE_BYTES = 10485760
+DEFAULT_TOOL_OUTPUT_BYTES = 65536
+DEFAULT_TOOL_DISK_BYTES = 52428800
+
 # Log hygiene. Content-level capture is off by default: it is the one setting
 # that puts raw reasoning, tool arguments, and tool results back on disk.
 DEFAULT_LOG_MAX_BYTES = 1048576
@@ -43,6 +55,9 @@ FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 class ConfigError(Exception):
     """A configuration value is missing, malformed, or unsafe by default."""
+
+
+NetworkAllowlistEntry = Tuple[str, str, int]
 
 
 @dataclass(frozen=True)
@@ -63,6 +78,15 @@ class BotConfig:
     model_stage_timeout: float
     tool_stage_timeout: float
     bash_timeout: float
+    tool_cpu_seconds: float
+    tool_memory_bytes: int
+    tool_process_limit: int
+    tool_thread_limit: int
+    tool_open_files: int
+    tool_file_bytes: int
+    tool_output_bytes: int
+    tool_disk_bytes: int
+    tool_network_allowlist: Tuple[NetworkAllowlistEntry, ...]
     log_max_bytes: int
     log_retention_days: float
     log_content_debug: bool
@@ -141,6 +165,50 @@ def parse_positive_int(raw, field: str, default: int) -> int:
     if not value.isdigit() or int(value) <= 0:
         raise ConfigError("{0}: '{1}'은 0보다 큰 정수여야 합니다.".format(field, raw))
     return int(value)
+
+
+def parse_network_allowlist(raw, field: str) -> Tuple[NetworkAllowlistEntry, ...]:
+    """Parse explicit HTTP(S) origins used by the Seatbelt worker."""
+    entries = []
+    seen = set()
+    for value in str(raw or "").split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            parsed = urlsplit(value)
+            scheme = parsed.scheme.lower()
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise ConfigError(
+                "{0}: '{1}'은 유효한 네트워크 origin이 아닙니다.".format(field, value)
+            )
+        if scheme not in ("http", "https") or not parsed.netloc or not hostname:
+            raise ConfigError(
+                "{0}: '{1}'은 http 또는 https origin이어야 합니다.".format(field, value)
+            )
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError(
+                "{0}: '{1}'에는 사용자명이나 비밀번호를 넣을 수 없습니다.".format(field, value)
+            )
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+            raise ConfigError(
+                "{0}: '{1}'에는 root 경로만 허용되며 query/fragment는 금지됩니다.".format(
+                    field, value
+                )
+            )
+        if port is None:
+            port = 443 if scheme == "https" else 80
+        if not 1 <= port <= 65535:
+            raise ConfigError(
+                "{0}: '{1}'의 포트는 1부터 65535 사이여야 합니다.".format(field, value)
+            )
+        entry = (scheme, hostname.lower(), port)
+        if entry not in seen:
+            entries.append(entry)
+            seen.add(entry)
+    return tuple(entries)
 
 
 def load_env_file(path) -> Dict[str, str]:
@@ -269,6 +337,33 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         bash_timeout=parse_positive_float(
             get("BASH_TIMEOUT_SECONDS"), "BASH_TIMEOUT_SECONDS", DEFAULT_BASH_TIMEOUT
         ),
+        tool_cpu_seconds=parse_positive_float(
+            get("TOOL_CPU_SECONDS"), "TOOL_CPU_SECONDS", DEFAULT_TOOL_CPU_SECONDS
+        ),
+        tool_memory_bytes=parse_positive_int(
+            get("TOOL_MEMORY_BYTES"), "TOOL_MEMORY_BYTES", DEFAULT_TOOL_MEMORY_BYTES
+        ),
+        tool_process_limit=parse_positive_int(
+            get("TOOL_PROCESS_LIMIT"), "TOOL_PROCESS_LIMIT", DEFAULT_TOOL_PROCESS_LIMIT
+        ),
+        tool_thread_limit=parse_positive_int(
+            get("TOOL_THREAD_LIMIT"), "TOOL_THREAD_LIMIT", DEFAULT_TOOL_THREAD_LIMIT
+        ),
+        tool_open_files=parse_positive_int(
+            get("TOOL_OPEN_FILES"), "TOOL_OPEN_FILES", DEFAULT_TOOL_OPEN_FILES
+        ),
+        tool_file_bytes=parse_positive_int(
+            get("TOOL_FILE_BYTES"), "TOOL_FILE_BYTES", DEFAULT_TOOL_FILE_BYTES
+        ),
+        tool_output_bytes=parse_positive_int(
+            get("TOOL_OUTPUT_BYTES"), "TOOL_OUTPUT_BYTES", DEFAULT_TOOL_OUTPUT_BYTES
+        ),
+        tool_disk_bytes=parse_positive_int(
+            get("TOOL_DISK_BYTES"), "TOOL_DISK_BYTES", DEFAULT_TOOL_DISK_BYTES
+        ),
+        tool_network_allowlist=parse_network_allowlist(
+            get("TOOL_NETWORK_ALLOWLIST"), "TOOL_NETWORK_ALLOWLIST"
+        ),
         log_max_bytes=parse_positive_int(
             get("LOG_MAX_BYTES"), "LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES
         ),
@@ -316,6 +411,17 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             config.model_stage_timeout,
             config.tool_stage_timeout,
             config.bash_timeout,
+        ),
+        "tool sandbox: cpu={0}s memory={1} processes={2} threads={3} open_files={4} file_bytes={5} output_bytes={6} disk_bytes={7} network_origins={8}".format(
+            config.tool_cpu_seconds,
+            config.tool_memory_bytes,
+            config.tool_process_limit,
+            config.tool_thread_limit,
+            config.tool_open_files,
+            config.tool_file_bytes,
+            config.tool_output_bytes,
+            config.tool_disk_bytes,
+            len(config.tool_network_allowlist),
         ),
         "workspace: {0}".format(config.workspace_dir),
         "system logs: {0}".format(config.system_log_dir),
