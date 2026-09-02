@@ -215,8 +215,8 @@ def process_memory_bytes(pid):
     return _task_info(pid).resident_size
 
 
-def _kill_group(process):
-    if process is None or process.poll() is not None:
+def _kill_group(process, include_exited=False):
+    if process is None or (process.poll() is not None and not include_exited):
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -271,13 +271,14 @@ def _read_output(stream, name, output):
         output.error = type(error).__name__
 
 
-def _child_environment(root):
+def _child_environment(root, display_root=None):
+    display_root = str(display_root or root)
     return {
         "PATH": FIXED_PATH,
         "LANG": "C",
         "LC_ALL": "C",
-        "HOME": str(root),
-        "TMPDIR": str(root),
+        "HOME": display_root,
+        "TMPDIR": display_root,
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
     }
@@ -293,6 +294,7 @@ def _active_process_for_signal(signum, _frame):
 
 def _bash(request):
     root = Path(request["workspace"])
+    display_root = request.get("display_workspace")
     command = request.get("command")
     limits = request["limits"]
     if not isinstance(command, str):
@@ -314,7 +316,7 @@ def _bash(request):
         process = subprocess.Popen(
             ["/bin/bash", "-c", command],
             cwd=str(root),
-            env=_child_environment(root),
+            env=_child_environment(root, display_root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -371,6 +373,7 @@ def _bash(request):
             _kill_group(process)
         else:
             process.wait()
+            _kill_group(process, include_exited=True)
             try:
                 if workspace_usage(root) > limits["disk_bytes"]:
                     reason = "workspace_disk_limit"
@@ -381,6 +384,11 @@ def _bash(request):
     finally:
         for reader in readers:
             reader.join(timeout=1)
+        if reason is None:
+            if output.overflow:
+                reason = "worker_output_limit"
+            elif output.error:
+                reason = "worker_output_unavailable"
         with _active_process_lock:
             _active_process = None
 
@@ -513,6 +521,7 @@ def handle_request(request):
 
 
 def main():
+    signal.signal(signal.SIGTERM, _active_process_for_signal)
     line = sys.stdin.buffer.readline()
     if not line.strip():
         result = _error("empty_request")
