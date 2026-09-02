@@ -503,7 +503,7 @@ class RestartRecoveryTest(DurableStateTestCase):
         self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=active@v1")
 
         # 이미 실행한 호출은 결정적 구조화 결과로 차단된다.
-        blocked = json.loads(self.bash_result_of(self.stub, "c1"))
+        blocked = json.loads(self.bash_result_of(self.stub, "c1", resumed))
         self.assertTrue(blocked["blocked"])
         self.assertEqual(blocked["reason"], "already_executed")
 
@@ -519,9 +519,15 @@ class RestartRecoveryTest(DurableStateTestCase):
         self.assertEqual(min(steps), resume_step)
 
     @staticmethod
-    def bash_result_of(stub, call_id):
-        """가장 나중에 붙은 결과. 복원한 tail에도 같은 id의 옛 결과가 들어 있다."""
-        for messages in reversed(stub.payloads("agent")):
+    def bash_result_of(stub, call_id, workspace=None):
+        """복원된 런의 durable 결과를 우선하고, 모델 입력을 보조로 본다."""
+        payloads = []
+        if workspace is not None:
+            record = run_state.load(workspace)
+            if record is not None:
+                payloads.append(record["tail"])
+        payloads.extend(stub.payloads("agent"))
+        for messages in payloads:
             for item in reversed(messages):
                 if bot._msg_role(item) == "tool" and item.get("tool_call_id") == call_id:
                     return bot._msg_content(item)
