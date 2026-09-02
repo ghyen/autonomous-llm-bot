@@ -71,28 +71,34 @@ def is_canonical(root, target):
     return any(target == root / name for name in CANONICAL_NAMES)
 
 
-def read_bytes(root, path):
+def read_bytes(root, path, max_bytes=None):
     target = resolve_path(root, path)
     try:
-        return "success", target.read_bytes()
+        with target.open("rb") as handle:
+            data = handle.read(int(max_bytes) + 1) if max_bytes is not None else handle.read()
+        if max_bytes is not None and len(data) > int(max_bytes):
+            return "file_bytes_limit", None
+        return "success", data
     except FileNotFoundError:
         return "not_found", None
     except (IsADirectoryError, PermissionError, OSError) as error:
         return type(error).__name__, None
 
 
-def read_file(root, path):
+def read_file(root, path, max_bytes=None):
     """Return the parent-compatible read envelope without a cache."""
     display_path = os.fspath(path)
     try:
         target = resolve_path(root, path)
-        status, data = read_bytes(root, path)
+        status, data = read_bytes(root, path, max_bytes=max_bytes)
     except (TypeError, ValueError, OSError) as error:
         return {
             "status": "error",
             "path": display_path,
             "error": "path_escape" if isinstance(error, ValueError) else type(error).__name__,
         }
+    if status == "file_bytes_limit":
+        return {"status": "resource_limit", "path": display_path, "error": status}
     if status != "success":
         return {"status": "error", "path": display_path, "error": status}
 
