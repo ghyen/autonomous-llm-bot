@@ -256,7 +256,7 @@ class DeadlineConfigTest(unittest.TestCase):
                 config.tool_stage_timeout,
                 config.bash_timeout,
             ),
-            (15.0, 300.0, 600.0, 120.0, 60.0),
+            (15.0, 3600.0, 3600.0, 120.0, 60.0),
         )
 
     def test_overrides_are_applied(self):

@@ -125,8 +125,8 @@ LLM_BASE_URL=http://127.0.0.1:18080/v1
 MODEL_NAME=default
 DISCORD_FREE_RESPONSE_CHANNELS=123456789012345678
 LLM_CONNECT_TIMEOUT_SECONDS=15
-LLM_IDLE_TIMEOUT_SECONDS=300
-MODEL_STAGE_TIMEOUT_SECONDS=600
+LLM_IDLE_TIMEOUT_SECONDS=3600
+MODEL_STAGE_TIMEOUT_SECONDS=3600
 TOOL_STAGE_TIMEOUT_SECONDS=120
 BASH_TIMEOUT_SECONDS=60
 TOOL_CPU_SECONDS=30
@@ -157,8 +157,8 @@ represented by the Seatbelt profile fail closed. `web_search` uses a fixed
 parent loopback CONNECT broker for the single configured DuckDuckGo origin.
 
 The wait budgets are separate: connection establishment is 15 seconds, the
-maximum idle gap between stream chunks is 300 seconds, one model stage totals
-600 seconds, a tool batch totals 120 seconds, and a shell process totals 60
+maximum idle gap between stream chunks is 3600 seconds, one model stage totals
+3600 seconds, a tool batch totals 120 seconds, and a shell process totals 60
 seconds. A tool-correlation recovery retry consumes only the remaining time from
 the original model-stage budget. Timed-out or cancelled shell commands kill and
 reap their whole process group.
