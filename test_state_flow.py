@@ -141,9 +141,9 @@ class MicroCompactionTest(unittest.TestCase):
                 "role": "tool", "tool_call_id": f"c{step}", "name": "bash_exec", "content": BASH_RESULT,
             })
 
-        compacted = bot.sanitize_messages_for_chat_template(
+        compacted = bot.validate_chat_payload(
             bot.apply_micro_compaction(payload, preserve_recent_tool_groups=1)
-        )
+        ).messages
         text = serialize(compacted)
 
         # Old tool results really are gutted - that is the point of compaction.

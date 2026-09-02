@@ -647,7 +647,6 @@ class ToolIntegrationTest(WorkspaceTestCase):
                 messages,
                 "",
                 10,
-                session_file=workspace.log_path,
             )
         self.assertIn(bot.MILESTONES_SECTION_HEADER, summary)
         self.assertIn(bot.RECENT_PHASE_SECTION_HEADER, summary)
@@ -697,7 +696,7 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         self.assertEqual(len(run_dirs), 1)
         direct_meta = json.loads((run_dirs[0] / "run.json").read_text())
         self.assertEqual(direct_meta["status"], "completed")
-        self.assertTrue((self.log_root / "runs" / f"{direct_meta['run_id']}.md").exists())
+        self.assertTrue((self.log_root / "runs" / f"{direct_meta['run_id']}.jsonl").exists())
 
         empty_direct = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
             content="", reasoning_content="", reasoning="", tool_calls=[]
@@ -1075,7 +1074,7 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             ["exhausted", "failed", "interrupted"],
         )
         self.assertTrue(all(
-            (self.log_root / "runs" / f"{item['run_id']}.md").exists()
+            (self.log_root / "runs" / f"{item['run_id']}.jsonl").exists()
             for item in metadata
         ))
 
