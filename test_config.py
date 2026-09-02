@@ -219,6 +219,7 @@ class LoadConfigTest(unittest.TestCase):
             "ftp://example.com",
             "https://user@example.com",
             "https://example.com/path",
+            "https://example.com:0",
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(ConfigError):
