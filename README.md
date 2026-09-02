@@ -303,10 +303,25 @@ and `!delete` also delete the run's durable state record. A selected run is cons
 There is no list/share surface, and admin control authority is not workspace
 read/delete authority: cross-owner IDs return `run not found`.
 
-Relative tool paths are resolved lexically under the current run and `..` escape
-is rejected. `bash_exec` uses that run as cwd. Absolute paths, shell commands
-that leave cwd, and symlink/host-boundary confinement are deliberately outside
-this feature's security claim.
+Both file tools resolve every path through one choke point: a relative path is
+joined to the current run root, an absolute path is taken as given, and the
+result is compared against the root after `realpath` on both sides. Anything that
+lands outside the root is refused before any byte is read or written, so absolute
+host paths, `..` traversal, and symlinks planted inside the root by `bash_exec`
+all fail. A contained target is then re-expressed under the run root, so an
+absolute or symlinked alias of `plan.md`/`findings.md` cannot skip their revision
+check. Session logs live under the system log directory, outside every run root,
+so no file-tool path reaches them and past-run bytes cannot re-enter the current
+context through `read_file`. `bash_exec` runs in that run as cwd and receives an
+explicit environment allowlist (`PATH`, `LANG`, plus `HOME`/`TMPDIR` pointed at
+the run root), so service credentials in the bot process environment and home
+credential files are not handed to the shell.
+
+Still deliberately outside this security claim: `bash_exec` can leave cwd and can
+read or write anything the bot's own OS user may touch, including its own session
+log; there is no OS-level process, filesystem, or network isolation, no resource
+limit, and no separate low-privilege tool worker. Path containment binds the file
+tools, not the shell.
 
 Only root `plan.md` and `findings.md` are canonical. Their revision is
 `sha256:<64 lowercase hex>` over exact bytes, or `absent` before creation. A
