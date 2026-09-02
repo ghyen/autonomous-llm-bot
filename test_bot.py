@@ -342,5 +342,48 @@ class StateUpdateBlockParsingTest(unittest.TestCase):
         self.assertEqual(cleaned, "### 1. 완료 작업\n- 20스텝 도달")
 
 
+
+class RobustJSONParsingTest(unittest.TestCase):
+    def test_robust_json_loads_markdown_fences(self):
+        text = "```json\n{\"name\": \"bash_exec\", \"arguments\": {\"command\": \"ls\"}}\n```"
+        parsed = bot._robust_json_loads(text)
+        self.assertEqual(parsed, {"name": "bash_exec", "arguments": {"command": "ls"}})
+
+    def test_robust_json_loads_trailing_commas(self):
+        text = '{"a": 1, "b": [2, 3,], "c": {"d": 4,},}'
+        parsed = bot._robust_json_loads(text)
+        self.assertEqual(parsed, {"a": 1, "b": [2, 3], "c": {"d": 4}})
+
+    def test_robust_json_loads_unescaped_newlines(self):
+        text = '{"command": "echo line1\necho line2"}'
+        parsed = bot._robust_json_loads(text)
+        self.assertIsNotNone(parsed)
+        self.assertIn("echo line1", parsed["command"])
+
+    def test_extract_tool_calls_with_markdown_fence(self):
+        text = """<tool_call>
+```json
+{
+  "name": "bash_exec",
+  "arguments": {
+    "command": "ls -la"
+  }
+}
+```
+</tool_call>"""
+        extracted = bot.extract_tool_calls_from_text(text)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["name"], "bash_exec")
+        self.assertEqual(extracted[0]["arguments"], {"command": "ls -la"})
+
+    def test_extract_tool_calls_with_string_arguments(self):
+        text = r'<tool_call>{"name": "read_file", "arguments": "{\"path\": \"workspace/a.txt\"}"}</tool_call>'
+        extracted = bot.extract_tool_calls_from_text(text)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["name"], "read_file")
+        self.assertEqual(extracted[0]["arguments"], {"path": "workspace/a.txt"})
+
+
 if __name__ == "__main__":
+
     unittest.main()

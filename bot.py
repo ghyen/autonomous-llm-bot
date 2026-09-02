@@ -460,6 +460,35 @@ STEERING_QUEUE_MAX = 8
 MAX_NO_TOOL_RESPONSES = 6
 
 
+def _robust_json_loads(raw: str):
+    """Parse JSON with resilience to markdown fences, unescaped newlines, and trailing commas."""
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    if not s:
+        return None
+
+    # 1. Standard json parse with strict=False (allows unescaped newlines/control chars in strings)
+    try:
+        return json.loads(s, strict=False)
+    except Exception:
+        pass
+
+    # 2. Fix trailing commas before closing braces or brackets (repeatedly for nested objects)
+    cleaned = s
+    while re.search(r",\s*([\}\]])", cleaned):
+        cleaned = re.sub(r",\s*([\}\]])", r"\1", cleaned)
+    try:
+        return json.loads(cleaned, strict=False)
+    except Exception:
+        pass
+
+    return None
+
+
 def _blocked_tool_result(reason: str, tool_name: str, limit: int, count: int) -> str:
     return json.dumps(
         {
@@ -773,14 +802,17 @@ def extract_tool_calls_from_text(text: str) -> list:
     xml_matches = re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
     for m in xml_matches:
         raw_json = m.group(1).strip()
-        try:
-            parsed = json.loads(raw_json)
+        parsed = _robust_json_loads(raw_json)
+        if isinstance(parsed, dict):
+            args = parsed.get("arguments", {})
+            if isinstance(args, str):
+                sub_parsed = _robust_json_loads(args)
+                if isinstance(sub_parsed, dict):
+                    args = sub_parsed
             extracted.append({
                 "name": parsed.get("name"),
-                "arguments": parsed.get("arguments", {})
+                "arguments": args if isinstance(args, dict) else {}
             })
-        except Exception:
-            pass
 
     if not extracted:
         func_matches = re.finditer(r"<function=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</function>", text, re.DOTALL)
@@ -792,10 +824,8 @@ def extract_tool_calls_from_text(text: str) -> list:
             for pm in param_matches:
                 pname = pm.group(1).strip()
                 pval = pm.group(2).strip()
-                try:
-                    args_dict[pname] = json.loads(pval)
-                except Exception:
-                    args_dict[pname] = pval
+                parsed_val = _robust_json_loads(pval)
+                args_dict[pname] = parsed_val if parsed_val is not None else pval
             if fname:
                 extracted.append({"name": fname, "arguments": args_dict})
 
@@ -1344,10 +1374,8 @@ def parse_state_update_blocks(text: str):
     updates = []
 
     def _collect(match):
-        try:
-            parsed = json.loads(match.group(1).strip())
-        except Exception:
-            return ""
+        raw = match.group(1).strip()
+        parsed = _robust_json_loads(raw)
         if isinstance(parsed, dict):
             updates.append(parsed)
         elif isinstance(parsed, list):
@@ -3141,12 +3169,15 @@ async def on_message(message: discord.Message):
                     if isinstance(raw_value, str):
                         raw_arguments = raw_value
                         try:
-                            args = json.loads(raw_value)
+                            args = json.loads(raw_value, strict=False)
                         except Exception:
-                            args = None
-                            argument_error = _invalid_tool_arguments_result(
-                                "malformed_json", tc.function.name
-                            )
+                            args = _robust_json_loads(raw_value)
+                            if args is None:
+                                argument_error = _invalid_tool_arguments_result(
+                                    "malformed_json", tc.function.name
+                                )
+                            else:
+                                argument_error = None
                         else:
                             argument_error = None
                     else:
