@@ -1,5 +1,6 @@
 import json
-import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,3 +79,28 @@ class WorkerProtocolTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertNotIn(command, json.dumps(result))
 
+    def test_read_limit_rejects_large_files_without_returning_content(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "large.txt").write_bytes(b"x" * 2048)
+            result = handle_request(
+                {
+                    "operation": "read_file",
+                    "workspace": root,
+                    "path": "large.txt",
+                    "limits": {"file_bytes": 1024},
+                }
+            )
+        self.assertEqual(result["status"], "resource_limit")
+        self.assertNotIn("content", result)
+
+    def test_stdin_entrypoint_rejects_a_second_request(self):
+        probe = subprocess.run(
+            [sys.executable, "tool_worker.py"],
+            input='{"operation":"read_file","workspace":"/tmp","path":"missing"}\n{}\n',
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertEqual(json.loads(probe.stdout)["error"], "multiple_requests")
