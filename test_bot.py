@@ -321,5 +321,26 @@ class ReasoningThreadTimelineTest(unittest.IsolatedAsyncioTestCase):
                 state.pop(channel_id, None)
 
 
+class StateUpdateBlockParsingTest(unittest.TestCase):
+    def test_parse_complete_state_update_block(self):
+        text = """### 1. 완료 작업\n- 작업 진행 완료\n\n```state_update\n{\n  "goal": "조사 목표",\n  "evidence": [{"id": "e1", "description": "증거 1", "source": "bash"}]\n}\n```\n\n추가 보고 내용"""
+        updates, cleaned = bot.parse_state_update_blocks(text)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["goal"], "조사 목표")
+        self.assertNotIn("```state_update", cleaned)
+        self.assertNotIn("증거 1", cleaned)
+        self.assertIn("### 1. 완료 작업", cleaned)
+        self.assertIn("추가 보고 내용", cleaned)
+
+    def test_strip_truncated_unclosed_state_update_block(self):
+        text = """### 1. 완료 작업\n- 20스텝 도달\n\n```state_update\n{\n  "goal": "조사 목표",\n  "evidence": [\n    {"id": "e1", "description": "미완성된 잘린 상태 업데이트"""
+        updates, cleaned = bot.parse_state_update_blocks(text)
+        # 잘린 불완전 JSON은 파싱되지 않지만, 디스코드 보고서 본문에서는 완전히 제거되어야 함
+        self.assertEqual(len(updates), 0)
+        self.assertNotIn("```state_update", cleaned)
+        self.assertNotIn("미완성된 잘린 상태 업데이트", cleaned)
+        self.assertEqual(cleaned, "### 1. 완료 작업\n- 20스텝 도달")
+
+
 if __name__ == "__main__":
     unittest.main()
