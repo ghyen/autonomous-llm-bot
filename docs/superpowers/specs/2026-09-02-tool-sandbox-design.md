@@ -49,10 +49,11 @@ small shared workspace-I/O module for the canonical path, revision, and
 atomic-write behavior; it never imports `bot.py`, reads the Discord/LLM
 configuration, or opens the system log.
 
-The parent creates a new process group for every worker. The worker's shell
-child stays in that group, so the existing process-group cleanup path can reap
-the worker and its descendants together. The parent reads stdout/stderr with a
-hard byte cap and kills the group before retaining an oversized result.
+The parent creates a new process group for every worker. The worker creates a
+second process group for its shell child and installs a signal handler that
+terminates that active group before the worker exits; the parent terminates the
+worker group and awaits the worker. The parent reads stdout/stderr with a hard
+byte cap and kills the worker group before retaining an oversized result.
 
 `record_state` and `finish_task` continue through the existing in-process
 dispatcher. A worker failure is returned as an explicit structured tool error
@@ -79,12 +80,16 @@ shell command can still execute any binary visible in the approved executable
 paths, but that binary inherits the same Seatbelt restrictions.
 
 The allowlist is empty by default. An operator supplies URL origins through
-`TOOL_NETWORK_ALLOWLIST`; the loader validates scheme, host, and port, and the
-parent resolves the host before producing the profile. DNS resolver access is
-limited to the system resolver socket; the resulting outbound connection must
-still match an allowlisted address and port. `bash_exec` has no network
-allowance unless the same setting explicitly grants one. `web_search` reports
-an actionable denial when its configured destination is absent.
+`TOOL_NETWORK_ALLOWLIST`; the loader validates scheme, host, and port. Direct
+`bash_exec` networking is supported only for loopback destinations because the
+macOS Seatbelt profile cannot safely express the external host/IP rules needed
+for arbitrary shell traffic; non-local direct destinations fail closed. For
+`web_search`, the parent resolves the exact configured
+`https://html.duckduckgo.com:443` origin and exposes only a per-call loopback
+CONNECT broker. The broker accepts that exact authority and connects only to
+the resolved target addresses. DNS resolver access is limited to the system
+resolver socket. Search reports an actionable denial when its fixed origin is
+absent.
 
 No fallback executes a tool directly when `sandbox-exec` is missing, the
 profile fails to compile, a destination cannot be resolved, or the runtime
@@ -95,7 +100,7 @@ paths cannot be represented safely. The tool fails closed.
 The operator-visible configuration gets bounded positive defaults for:
 
 - CPU seconds (`RLIMIT_CPU`);
-- address space (`RLIMIT_AS`, required on the supported macOS runtime);
+- memory RSS (worker and child tree; macOS rejects lowering `RLIMIT_AS`);
 - open file descriptors (`RLIMIT_NOFILE`);
 - maximum individual file size (`RLIMIT_FSIZE`);
 - process creation budget using a per-worker process-tree monitor;
@@ -103,7 +108,8 @@ The operator-visible configuration gets bounded positive defaults for:
 - aggregate bytes below the run workspace, sampled by the worker monitor;
 - the existing wall-clock shell/tool deadlines.
 
-The worker also disables core dumps. A limit violation terminates the worker
+The worker also disables core dumps and fails closed when process information
+needed by the monitors is unavailable. A limit violation terminates the worker
 group, returns a deterministic error, and leaves the run observable as a
 failed tool call. Limits are applied before starting the shell or network
 client. Aggregate workspace accounting is bounded by the monitor interval;
@@ -115,10 +121,8 @@ as a filesystem quota.
 
 - Worker startup or JSON protocol failure: structured `worker_unavailable`
   error; no direct execution fallback.
-- Seatbelt denial: structured `sandbox_denied` error including the operation,
-  not the command or secret-bearing path.
-- Network denial: structured `network_denied` error with the destination and
-  configured-policy reason.
+- Seatbelt or network denial: a deterministic structured error without the
+  command or secret-bearing path.
 - CPU, memory, process, file, output, or workspace limit: structured
   `resource_limit` error.
 - Timeout/cancellation: kill the worker process group, await the child, and

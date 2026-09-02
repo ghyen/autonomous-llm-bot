@@ -34,6 +34,17 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(len(addresses), len(set(addresses)))
 
 
+class DocumentationContractTest(unittest.TestCase):
+    def test_readme_and_ci_describe_the_fail_closed_macos_sandbox(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("sandbox-exec", readme)
+        self.assertIn("TOOL_NETWORK_ALLOWLIST", readme)
+        self.assertIn("직접 실행 fallback", readme)
+        self.assertIn("macos-latest", workflow)
+        self.assertIn("Check macOS Seatbelt", workflow)
+
+
 @unittest.skipUnless(sys.platform == "darwin", "macOS Seatbelt integration")
 class SandboxIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_fixed_proxy_tunnels_only_the_approved_authority(self):

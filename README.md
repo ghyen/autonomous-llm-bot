@@ -2,7 +2,7 @@
 
 A fully autonomous, self-extending goal-driven AI agent for Discord powered by local LLM backends (like **Rapid-MLX**, **vLLM**, **Ollama**, or **llama.cpp**) or remote OpenAI-compatible endpoints.
 
-Designed for long-horizon autonomous exploration, terminal execution, research, and deep reasoning with rich Discord UI interactions.
+Designed for long-horizon autonomous exploration, terminal execution, research, and deep reasoning with rich Discord UI interactions. OS-facing tools are implemented for the macOS LaunchAgent deployment described below.
 
 ---
 
@@ -18,10 +18,10 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
 - 🛠️ **Built-in Power Tools**:
-  - `bash_exec`: Run arbitrary shell commands (curl, python3, grep, jq, etc.) with the current run directory as cwd and output auto-truncation.
+  - `bash_exec`: Run arbitrary shell commands (curl, python3, grep, jq, etc.) in a disposable macOS Seatbelt worker rooted at the current run directory.
   - `read_file`: Read relative paths from the current run. First or changed reads include a full-byte revision; unchanged reads return a hash reference.
   - `write_file`: Write ordinary run files, including reusable scripts in `skills/`, directly; root `plan.md` and `findings.md` require an optimistic `expected_revision`.
-  - `web_search`: Live DuckDuckGo search.
+  - `web_search`: Live DuckDuckGo search through the explicitly allowlisted worker broker.
   - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
 - 💬 **Mid-Flight Dynamic User Steering**: Users can send messages into the channel while the agent is running; instructions are automatically queued and injected into the agent's next step without restarting.
@@ -55,6 +55,12 @@ User Prompt (Discord) ────────┐
                               │
                               ▼
                ┌─────────────────────────────┐
+               │ macOS Seatbelt Tool Worker  │
+               │ one-shot / deny-by-default  │
+               └──────────────┬──────────────┘
+                              │
+                              ▼
+               ┌─────────────────────────────┐
                │  Research Ledger            │  record_state
                │  (hypotheses / evidence /   │◄─────────────
                │   conclusions, per channel) │
@@ -79,6 +85,8 @@ User Prompt (Discord) ────────┐
 ### 1. Prerequisites
 
 - Python 3.10+
+- macOS with executable `/usr/bin/sandbox-exec` for OS-facing tools. On other
+  platforms, or when Seatbelt is unavailable, those tools fail closed.
 - A running OpenAI-compatible local LLM server (e.g. [Rapid-MLX](https://github.com/alexw/rapid-mlx) with Qwen 2.5 / Qwen 3.8 / DeepSeek, Ollama, or vLLM)
 - A Discord Bot Token ([Discord Developer Portal](https://discord.com/developers/applications))
 
@@ -121,11 +129,32 @@ LLM_IDLE_TIMEOUT_SECONDS=120
 MODEL_STAGE_TIMEOUT_SECONDS=600
 TOOL_STAGE_TIMEOUT_SECONDS=120
 BASH_TIMEOUT_SECONDS=60
+TOOL_CPU_SECONDS=30
+TOOL_MEMORY_BYTES=268435456
+TOOL_PROCESS_LIMIT=32
+TOOL_THREAD_LIMIT=64
+TOOL_OPEN_FILES=64
+TOOL_FILE_BYTES=10485760
+TOOL_OUTPUT_BYTES=65536
+TOOL_DISK_BYTES=52428800
 LOG_MAX_BYTES=1048576
 LOG_RETENTION_DAYS=14
 LOG_CONTENT_DEBUG=false
 LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 ```
+
+Network is deny-by-default. Enable `web_search` only when the operator wants
+the worker to use DuckDuckGo:
+
+```env
+TOOL_NETWORK_ALLOWLIST=https://html.duckduckgo.com:443
+```
+
+The allowlist accepts only HTTP(S) origins without credentials, query strings,
+fragments, or non-root paths. Direct `bash_exec` access to external origins is
+not enabled by this setting on macOS; external destinations that cannot be
+represented by the Seatbelt profile fail closed. `web_search` uses a fixed
+parent loopback CONNECT broker for the single configured DuckDuckGo origin.
 
 The wait budgets are separate: connection establishment is 15 seconds, the
 maximum idle gap between stream chunks is 120 seconds, one model stage totals
@@ -137,8 +166,9 @@ reap their whole process group.
 Startup fails, loudly, when:
 
 - `DISCORD_BOT_TOKEN` is missing or blank.
-- `DISCORD_ALLOWED_USER_IDS` is empty while tools are enabled. The agent runs
-  shell commands on the host, so there is no safe default. Set
+- `DISCORD_ALLOWED_USER_IDS` is empty while tools are enabled. The agent can
+  dispatch OS-facing work to a sandboxed worker, so there is no safe default.
+  Set
   `BOT_TOOLS_ENABLED=false` to run a tool-free bot without an allowlist.
 - Any ID list contains a non-numeric entry.
 - Any timeout is not a finite number greater than zero.
@@ -148,6 +178,8 @@ Startup fails, loudly, when:
 - `DISCORD_ADMIN_USER_IDS` names someone outside `DISCORD_ALLOWED_USER_IDS`.
 - `LLM_BASE_URL` is non-local without `LLM_ALLOW_REMOTE=true`. Conversation
   content and tool results would leave the machine.
+- Any `TOOL_*` limit is missing a positive finite value, or a network origin is
+  malformed.
 
 See `.env.example` for the full set. On startup the bot writes a secret-free
 `startup` record carrying the running commit, dependency versions, and every
@@ -312,16 +344,40 @@ all fail. A contained target is then re-expressed under the run root, so an
 absolute or symlinked alias of `plan.md`/`findings.md` cannot skip their revision
 check. Session logs live under the system log directory, outside every run root,
 so no file-tool path reaches them and past-run bytes cannot re-enter the current
-context through `read_file`. `bash_exec` runs in that run as cwd and receives an
-explicit environment allowlist (`PATH`, `LANG`, plus `HOME`/`TMPDIR` pointed at
-the run root), so service credentials in the bot process environment and home
-credential files are not handed to the shell.
+context through `read_file`. OS-facing tools run in a fresh one-shot macOS
+Seatbelt worker with an explicit environment allowlist (`PATH`, `LANG`, `LC_ALL`,
+`HOME`, and `TMPDIR` pointed at the run root, plus the Python no-user-site
+flags). Service credentials in the bot process environment and home credential
+files are not handed to the shell. `record_state` and `finish_task` are the
+explicit parent-process exceptions because they own the live ledger and
+terminal state; they do not run shell commands or open arbitrary files.
 
-Still deliberately outside this security claim: `bash_exec` can leave cwd and can
-read or write anything the bot's own OS user may touch, including its own session
-log; there is no OS-level process, filesystem, or network isolation, no resource
-limit, and no separate low-privilege tool worker. Path containment binds the file
-tools, not the shell.
+### macOS tool-worker contract
+
+Every `bash_exec`, `read_file`, `write_file`, and `web_search` call starts a new
+`sandbox-exec` worker and sends exactly one JSON request. There is no direct
+execution fallback (직접 실행 fallback 없음): missing Seatbelt, an invalid profile, an unresolved network
+destination, a malformed response, or an unsupported platform returns a
+deterministic tool error.
+
+The worker permits only the current run workspace, the Python runtime needed to
+start it, and the fixed system files required for DNS/TLS and process startup.
+Shell descendants stay in a dedicated process group and are reaped on
+cancellation, timeout, output overflow, or a resource violation.
+
+The default ceilings are CPU 30 seconds, memory RSS 256 MiB, 32 processes, 64
+threads, 64 open files, 10 MiB per file, 65,536 response bytes, and 50 MiB of
+workspace bytes. CPU, open-file, file-size, and core-dump limits use kernel
+resource limits. macOS rejects lowering `RLIMIT_AS`, so the worker enforces the
+memory ceiling with a fail-closed RSS monitor over the worker and its child
+tree. Workspace bytes are sampled every 50 ms; this is a bounded monitoring
+ceiling, not a filesystem quota.
+
+`sandbox-exec` and its SBPL language are deprecated/undocumented macOS
+interfaces. This deployment therefore keeps the profile small, runs real
+Seatbelt integration tests on macOS CI, and does not claim portability to Linux
+or Windows. The broker/network and monitor limitations are recorded in
+[`docs/adr/2026-09-02-macos-seatbelt-tool-sandbox.md`](docs/adr/2026-09-02-macos-seatbelt-tool-sandbox.md).
 
 Only root `plan.md` and `findings.md` are canonical. Their revision is
 `sha256:<64 lowercase hex>` over exact bytes, or `absent` before creation. A
@@ -377,8 +433,8 @@ leaves your history intact and is reported as a failure.
 
 ```bash
 ./venv/bin/python -m unittest discover -v
-./venv/bin/python -m compileall -q bot.py run_workspace.py run_state.py config.py authz.py outcome.py ledger.py deadlines.py steering.py session_log.py
-./venv/bin/python tools/check_no_credential_defaults.py bot.py run_workspace.py run_state.py config.py ledger.py authz.py outcome.py deadlines.py steering.py session_log.py tools
+./venv/bin/python -m compileall -q bot.py config.py authz.py outcome.py deadlines.py ledger.py run_state.py run_workspace.py workspace_io.py session_log.py steering.py tool_sandbox.py tool_worker.py tools
+./venv/bin/python tools/check_no_credential_defaults.py bot.py config.py authz.py outcome.py deadlines.py ledger.py run_state.py run_workspace.py workspace_io.py session_log.py steering.py tool_sandbox.py tool_worker.py tools
 ```
 
 `test_config.py` covers configuration loading and deadline defaults,
@@ -396,13 +452,15 @@ round trip, the parallel-group save boundary, atomic replacement, restart
 recovery and explicit abort, the rollover write-back, and record deletion on
 reset, `test_workspace_integrity.py`
 covers opaque identity, lifecycle/privacy, lexical paths, canonical CAS, bounded
-hash caching, per-run prompt/log/dispatcher wiring, and concurrent isolation,
-and `test_bot.py` covers request routing. `test_support.py` holds the shared
+hash caching, per-run prompt/log/dispatcher wiring, concurrent isolation, and
+sandbox-supervisor routing, and `test_tool_sandbox.py` covers the real macOS
+Seatbelt profile, network policy, resource ceilings, and process cleanup.
+`test_bot.py` covers request routing. `test_support.py` holds the shared
 bootstrap, temporary catalog helper, and Discord doubles; every identifier in
 tests is synthetic.
 
-All three commands also run in CI (`.github/workflows/ci.yml`) on Python 3.10 and
-3.12.
+All three commands also run in CI (`.github/workflows/ci.yml`) on macOS with
+Python 3.10 and 3.12.
 
 ---
 

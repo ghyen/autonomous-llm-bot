@@ -12,9 +12,9 @@
 
 - The supported tool-execution platform is macOS; Linux and Windows must never fall back to unsandboxed execution.
 - `sandbox-exec` absence, SBPL compilation failure, unresolved allowlist destinations, malformed worker output, and unsupported resource limits fail closed.
-- The network allowlist is empty by default; `web_search` uses the deterministic HTML DuckDuckGo backend and requires its host to be configured.
+- The network allowlist is empty by default; direct shell networking is loopback-only, while `web_search` uses the deterministic HTML DuckDuckGo backend through a fixed parent loopback broker and requires `https://html.duckduckgo.com:443` to be configured.
 - Worker environment contains only `PATH`, `LANG`, `HOME`, `TMPDIR`, `PYTHONDONTWRITEBYTECODE`, and `PYTHONNOUSERSITE`.
-- Worker output is capped at 65,536 bytes, each file at 10 MiB, each workspace at 50 MiB, address space at 256 MiB, CPU at 30 seconds, processes at 32, threads at 64, and open files at 64 by default.
+- Worker output is capped at 65,536 bytes, each file at 10 MiB, each workspace at 50 MiB, memory RSS at 256 MiB, CPU at 30 seconds, processes at 32, threads at 64, and open files at 64 by default. macOS rejects lowering `RLIMIT_AS`, so memory is monitored fail-closed across the worker and child tree.
 - Existing `BASH_TIMEOUT_SECONDS=60` remains the wall-clock ceiling for a shell worker; tool-stage deadlines remain the outer batch ceiling.
 - No new runtime dependency is added.
 - `record_state` and `finish_task` remain parent-process exceptions and are documented as such.
@@ -32,7 +32,7 @@
 - Produces `NetworkAllowlistEntry = tuple[str, str, int]` and `parse_network_allowlist(raw, field) -> tuple[NetworkAllowlistEntry, ...]`.
 - Extends `BotConfig` with `tool_cpu_seconds: float`, `tool_memory_bytes: int`, `tool_process_limit: int`, `tool_thread_limit: int`, `tool_open_files: int`, `tool_file_bytes: int`, `tool_output_bytes: int`, `tool_disk_bytes: int`, and `tool_network_allowlist: tuple[NetworkAllowlistEntry, ...]`.
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ```python
 def test_tool_limits_have_bounded_defaults(self):
@@ -62,13 +62,13 @@ def test_network_allowlist_accepts_origins_and_rejects_ambiguous_values(self):
                 load_config(env=env(TOOL_NETWORK_ALLOWLIST=raw), env_file=None)
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm they fail because the fields/parser are absent**
+- [x] **Step 2: Run the focused tests and confirm they fail because the fields/parser are absent**
 
 Run: `.venv/bin/python -m unittest test_config.LoadConfigTest test_config.DeadlineConfigTest -v`
 
 Expected: FAIL with missing `BotConfig` attributes or missing network parser behavior.
 
-- [ ] **Step 3: Implement parsing and immutable config fields**
+- [x] **Step 3: Implement parsing and immutable config fields**
 
 Add these defaults and parse values with the existing strict helpers:
 
@@ -85,7 +85,7 @@ DEFAULT_TOOL_DISK_BYTES = 52428800
 
 `parse_network_allowlist` must split commas, require `http` or `https`, reject credentials/query/fragment/non-root paths, normalize the hostname to lowercase, choose port 80/443 when omitted, and return entries in input order without duplicates. Empty input returns `()`.
 
-- [ ] **Step 4: Add `.env.example` entries and startup diagnostics**
+- [x] **Step 4: Add `.env.example` entries and startup diagnostics**
 
 Document the exact keys and values:
 
@@ -103,7 +103,7 @@ TOOL_NETWORK_ALLOWLIST=https://html.duckduckgo.com:443
 
 `TOOL_NETWORK_ALLOWLIST` is an example, not an implicit default; the effective default remains empty.
 
-- [ ] **Step 5: Run focused tests and commit**
+- [x] **Step 5: Run focused tests and commit**
 
 Run: `.venv/bin/python -m unittest test_config -v`
 
@@ -131,7 +131,7 @@ git commit -m "feat: configure macOS tool sandbox limits"
 - Worker request operations: `{"operation": "read_file", "workspace": str, "path": str}`, `{"operation": "write_file", "workspace": str, "path": str, "content": str, "expected_revision": str | None}`, `{"operation": "bash_exec", "workspace": str, "command": str, "env": dict, "limits": dict, "timeout": float}`, and `{"operation": "web_search", "query": str, "timeout": float}`.
 - Worker response is one JSON object with `status` plus operation-specific fields; it never includes the raw command in an error.
 
-- [ ] **Step 1: Write failing worker protocol tests**
+- [x] **Step 1: Write failing worker protocol tests**
 
 ```python
 class WorkerProtocolTest(unittest.TestCase):
@@ -150,21 +150,21 @@ class WorkerProtocolTest(unittest.TestCase):
             self.assertNotIn("content", result)
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm they fail**
+- [x] **Step 2: Run the focused tests and confirm they fail**
 
 Run: `.venv/bin/python -m unittest test_tool_worker -v`
 
 Expected: FAIL because the worker module and shared primitives do not exist.
 
-- [ ] **Step 3: Move path/revision/atomic-write primitives into `workspace_io.py`**
+- [x] **Step 3: Move path/revision/atomic-write primitives into `workspace_io.py`**
 
 Keep `RunWorkspace.resolve`, `read`, and `write` response formats unchanged by delegating to the shared functions. Preserve the existing `realpath` containment and canonical-file CAS rules. Add `RunWorkspace.remember_worker_read(path, revision)` so a parent-side worker read updates the existing LRU without reading bytes in the bot process.
 
-- [ ] **Step 4: Implement `tool_worker.handle_request` and its stdin/stdout entrypoint**
+- [x] **Step 4: Implement `tool_worker.handle_request` and its stdin/stdout entrypoint**
 
 The entrypoint must read one line, parse one JSON object, call `handle_request`, emit one compact JSON line, flush, and exit. It must reject a second non-empty line. File operations use `workspace_io`; no import of `bot.py`, `config.py`, or `session_log.py` is permitted.
 
-- [ ] **Step 5: Run worker and existing workspace tests, then commit**
+- [x] **Step 5: Run worker and existing workspace tests, then commit**
 
 Run: `.venv/bin/python -m unittest test_tool_worker test_workspace_integrity.CanonicalIntegrityTest test_workspace_integrity.CatalogIsolationTest -v`
 
@@ -190,7 +190,7 @@ git commit -m "feat: add one-shot tool worker protocol"
 - `tool_worker.workspace_usage(root: str | Path) -> int`
 - `tool_worker.process_tree_counts(root_pid: int) -> tuple[int, int]`
 
-- [ ] **Step 1: Write failing profile and supervisor tests**
+- [x] **Step 1: Write failing profile and supervisor tests**
 
 ```python
 class ProfileTest(unittest.TestCase):
@@ -229,27 +229,27 @@ class ProfileTest(unittest.TestCase):
 
 The test must create a concrete temporary file, issue a `read_file` request, and issue a `bash_exec` request for `$HOME/.ssh`; the former must succeed and the latter must return `sandbox_denied` or a nonzero exit without exposing file bytes.
 
-- [ ] **Step 2: Run the focused tests and confirm they fail for missing profile/supervisor behavior**
+- [x] **Step 2: Run the focused tests and confirm they fail for missing profile/supervisor behavior**
 
 Run: `.venv/bin/python -m unittest test_tool_sandbox -v`
 
 Expected: FAIL because the profile builder, resolver, and supervisor are absent.
 
-- [ ] **Step 3: Implement strict macOS capability checks and SBPL generation**
+- [x] **Step 3: Implement strict macOS capability checks and SBPL generation**
 
-`tool_sandbox` must require `sys.platform == "darwin"` and an executable `/usr/bin/sandbox-exec`. The profile must use `(deny default (with no-callout))`, parameterized `WORKSPACE`, `WORKER`, `PYTHON_PREFIX`, `PYTHON_STDLIB`, `PYTHON_SITE`, and `WORKER_DIR`, allow only the current workspace plus runtime files, allow `process-fork`, `process-exec*`, and same-sandbox signalling, and add one `(allow network-outbound (remote tcp "IP:PORT"))` rule per resolved allowlisted address. It must allow only the resolver socket and standard resolver files needed for allowlisted DNS.
+`tool_sandbox` must require `sys.platform == "darwin"` and an executable `/usr/bin/sandbox-exec`. The profile must use `(deny default (with no-callout))`, parameterized `WORKSPACE`, `WORKER`, `PYTHON_PREFIX`, `PYTHON_STDLIB`, `PYTHON_SITE`, and `WORKER_DIR`, allow only the current workspace plus runtime files, allow `process-fork`, `process-exec*`, and same-sandbox signalling, and add one loopback `(allow network-outbound (remote tcp "localhost:PORT"))` rule per direct local allowlisted address. External direct destinations fail closed because the supported Seatbelt profile cannot safely express their host/IP rules. `web_search` uses a parent fixed CONNECT broker whose worker-visible port is loopback-only. It must allow only the resolver socket and standard resolver files needed for allowlisted DNS.
 
 Escape SBPL string parameters by replacing `\\` with `\\\\`, `"` with `\\"`, and newline/carriage-return with `\\n`/`\\r`. Do not interpolate model-provided command text into SBPL.
 
-- [ ] **Step 4: Implement resource limits and monitors in the worker**
+- [x] **Step 4: Implement resource limits and monitors in the worker**
 
-`apply_limits` must set `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, and `RLIMIT_CORE=(0, 0)` before the shell/network operation. Absence or failure of a required limit raises a deterministic `resource_limit` error. A monitor samples workspace logical bytes, descendant process count, and `ps -M` thread count every 50 ms; on a limit breach it kills the child process group and returns `resource_limit`.
+`apply_limits` must set `RLIMIT_CPU`, attempt `RLIMIT_AS` (and use the Darwin RSS monitor when the kernel rejects lowering it), `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, and `RLIMIT_CORE=(0, 0)` before the shell/network operation. Absence or failure of a required enforceable limit raises a deterministic `resource_limit` error. A monitor samples workspace logical bytes, descendant process count, child-tree RSS, and thread count through macOS libproc APIs every 50 ms; on a limit breach it kills the child process group and returns `resource_limit`. Missing process information fails closed.
 
 For `bash_exec`, use `/bin/bash -c <command>` with `HOME` and `TMPDIR` equal to the run root, a fixed executable `PATH`, `start_new_session=True`, and bounded concurrent stdout/stderr readers. The child group is killed on timeout, output overflow, workspace overflow, or monitor violation. The worker installs a SIGTERM handler that kills the active child group before exiting.
 
-For `web_search`, use `DDGS(timeout=...)` with `backend="html"` so the only intended HTTP host is `html.duckduckgo.com`; no proxy environment variable is inherited.
+For `web_search`, use the installed DDGS HTML backend through the fixed parent loopback broker so the only intended HTTP host is `html.duckduckgo.com`; no proxy environment variable is inherited.
 
-- [ ] **Step 5: Implement the async parent supervisor**
+- [x] **Step 5: Implement the async parent supervisor**
 
 `run_worker` launches:
 
@@ -264,7 +264,7 @@ await asyncio.create_subprocess_exec(
 
 It writes one JSON line, reads at most `tool_output_bytes + 8192` response bytes, waits under the supplied timeout, sends SIGTERM then SIGKILL to the worker process group when needed, awaits reaping, and never invokes the old direct shell path. Invalid/empty responses become `worker_unavailable`.
 
-- [ ] **Step 6: Run profile, resource, and cleanup tests, then commit**
+- [x] **Step 6: Run profile, resource, and cleanup tests, then commit**
 
 Run: `.venv/bin/python -m unittest test_tool_sandbox -v`
 
@@ -288,7 +288,7 @@ git commit -m "feat: enforce macOS Seatbelt tool limits"
 - Preserve `async def tool_bash_exec(workspace, command) -> str`, `async def tool_read_file(workspace, path) -> str`, `async def tool_write_file(workspace, path, content, expected_revision) -> str`, and `async def tool_web_search(query) -> str`.
 - `tool_bash_exec`, `tool_read_file`, and `tool_write_file` call `tool_sandbox.run_worker`; `tool_web_search` supplies a worker request with the configured network policy.
 
-- [ ] **Step 1: Add failing routing assertions**
+- [x] **Step 1: Add failing routing assertions**
 
 ```python
 async def test_os_facing_tools_use_the_sandbox_supervisor(self):
@@ -301,21 +301,21 @@ async def test_os_facing_tools_use_the_sandbox_supervisor(self):
 
 Add equivalent assertions for file read/write and ensure `record_state` remains local and receives the live ledger object.
 
-- [ ] **Step 2: Run the focused routing tests and confirm they fail because bot tools still execute locally**
+- [x] **Step 2: Run the focused routing tests and confirm they fail because bot tools still execute locally**
 
 Run: `.venv/bin/python -m unittest test_workspace_integrity.ToolIntegrationTest -v`
 
 Expected: FAIL because `bot.py` still calls `asyncio.create_subprocess_shell` or `RunWorkspace` directly.
 
-- [ ] **Step 3: Replace the direct tool implementations with worker calls**
+- [x] **Step 3: Replace the direct tool implementations with worker calls**
 
-Remove the `DDGS` import and the direct subprocess/file code from `bot.py`. Convert worker responses to the existing tool result strings/JSON envelopes. Update the parent read-hash cache from worker revisions and guard canonical writes with the existing per-file asyncio lock while the worker CAS operation runs. Keep `_terminate_process_tree` as the worker-group cleanup primitive and extend it to SIGTERM-then-SIGKILL.
+Remove the `DDGS` import and the direct subprocess/file code from `bot.py`. Convert worker responses to the existing tool result strings/JSON envelopes. Update the parent read-hash cache from worker revisions and guard canonical writes with the existing per-file asyncio lock while the worker CAS operation runs. The supervisor owns worker-group cleanup; the worker owns its nested shell group and handles SIGTERM before exiting.
 
-- [ ] **Step 4: Preserve failure classification and cancellation semantics**
+- [x] **Step 4: Preserve failure classification and cancellation semantics**
 
 Worker errors for `read_file`/`write_file` retain `status="error"` or `status="conflict"`; bash failures retain a terminal `[exit code: N]`; network/resource/sandbox failures start with `[Error` or a structured envelope recognized by `_tool_result_failed`. `RunCancelled` must cancel the worker and re-raise after the group is reaped.
 
-- [ ] **Step 5: Run tool integration and cancellation tests, then commit**
+- [x] **Step 5: Run tool integration and cancellation tests, then commit**
 
 Run: `.venv/bin/python -m unittest test_workspace_integrity test_cancellation_flow test_duplicate_tool_policy -v`
 
@@ -338,7 +338,7 @@ git commit -m "feat: route OS tools through sandbox workers"
 - CI runs the full suite on `macos-latest` for Python 3.10 and 3.12.
 - README exposes the exact environment variables, default-deny behavior, worker exception for state tools, and fail-closed behavior.
 
-- [ ] **Step 1: Write failing documentation/CI assertions**
+- [x] **Step 1: Write failing documentation/CI assertions**
 
 ```python
 class DocumentationContractTest(unittest.TestCase):
@@ -349,17 +349,17 @@ class DocumentationContractTest(unittest.TestCase):
         self.assertIn("직접 실행 fallback", text)
 ```
 
-- [ ] **Step 2: Run the documentation test and confirm the new contract is absent**
+- [x] **Step 2: Run the documentation test and confirm the new contract is absent**
 
 Run: `.venv/bin/python -m unittest test_tool_sandbox.DocumentationContractTest -v`
 
 Expected: FAIL until README and ADR are updated.
 
-- [ ] **Step 3: Add the ADR and README deployment sections**
+- [x] **Step 3: Add the ADR and README deployment sections**
 
 The ADR must record: macOS LaunchAgent as target, Seatbelt selection, Docker and in-process alternatives, `sandbox-exec` deprecation/undocumented SBPL risk, empty network default, resource defaults, monitor sampling ceiling for aggregate disk, and the explicit parent-process state-tool exception. README must show a valid `.env` snippet with `TOOL_NETWORK_ALLOWLIST=https://html.duckduckgo.com:443` when search is desired.
 
-- [ ] **Step 4: Change CI to macOS and keep both supported Python versions**
+- [x] **Step 4: Change CI to macOS and keep both supported Python versions**
 
 Use:
 
@@ -371,9 +371,12 @@ strategy:
     python-version: ["3.10", "3.12"]
 ```
 
-Retain credential scan, compile, and full unittest steps. Add an explicit `sandbox-exec -p '(version 1) (deny default)' /usr/bin/true` preflight that is allowed to fail only with a clear CI error.
+Retain credential scan, compile, and full unittest steps. Add a preflight that
+checks `/usr/bin/sandbox-exec` with a minimal profile granting only the file
+reads and executable mapping needed by `/usr/bin/true`; an unavailable or
+refused Seatbelt is a clear CI error.
 
-- [ ] **Step 5: Run the full local verification and commit documentation**
+- [x] **Step 5: Run the full local verification and commit documentation**
 
 Run:
 
