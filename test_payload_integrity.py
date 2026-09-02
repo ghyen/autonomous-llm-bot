@@ -408,10 +408,10 @@ class PayloadRecoveryDispatchTest(unittest.IsolatedAsyncioTestCase):
 
         original_log = bot.log_session_event
 
-        def recording_log(session_file, title, content):
+        def recording_log(workspace, kind, *args, **fields):
             if log_records is not None:
-                log_records.append((title, content))
-            original_log(session_file, title, content)
+                log_records.append((kind, fields))
+            original_log(workspace, kind, *args, **fields)
 
         message = FakeMessage("payload 무결성 점검해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, ExitStack() as stack:
@@ -519,15 +519,14 @@ class PayloadRecoveryDispatchTest(unittest.IsolatedAsyncioTestCase):
             log_records=records,
         )
 
-        fingerprints = [
-            content for title, content in records if "구조 지문" in title
-        ]
-        self.assertEqual(len(fingerprints), 1)
-        record = fingerprints[0]
-        self.assertIn("revision=", record)
-        self.assertIn("tool:t1", record)
-        self.assertNotIn("corr-secret-1", record)
-        self.assertNotIn(SUCCESS_RESULT, record)
+        failures = [fields for kind, fields in records if kind == "model_stage_failure"]
+        self.assertEqual(len(failures), 1)
+        record = failures[0]
+        self.assertIn("revision", record)
+        self.assertIn("tool:t1", record["fingerprint"])
+        serialized = json.dumps(record, ensure_ascii=False)
+        self.assertNotIn("corr-secret-1", serialized)
+        self.assertNotIn(SUCCESS_RESULT, serialized)
 
 
 if __name__ == "__main__":
