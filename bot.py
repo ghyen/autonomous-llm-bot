@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import authz
 import outcome as outcome_mod
+import run_state
 import session_log
 import steering as steering_mod
 from deadlines import (
@@ -394,6 +395,9 @@ def clear_channel_state(channel_id) -> None:
     channel_history[channel_id].clear()
     channel_summary[channel_id] = ""
     channel_ledger[channel_id].clear()
+    # 메모리만 지우면 지운 런이 재시작 뒤 디스크의 durable 레코드에서 되살아난다.
+    for workspace in RUN_CATALOG.workspaces(channel_id):
+        run_state.discard(workspace)
 
 
 def steering_receipt_notice(receipt, text: str) -> str:
@@ -1192,6 +1196,150 @@ def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = 
             break
 
     return messages[:boundary], messages[boundary:]
+
+
+# --- Durable run state boundaries (issue #6) ---
+
+# ponytail: tail은 메시지 12개·메시지당 2000자로 자른다. 복원한 런은 그보다
+# 오래된 도구 결과 원문을 다시 보지 못하고 누적 요약만 본다. 더 긴 tail이
+# 필요하다면 상한을 올리기 전에 요약 품질을 먼저 봐야 한다.
+SNAPSHOT_TAIL_MESSAGES = 12
+SNAPSHOT_TAIL_CHARS = 2000
+
+
+def _tool_call_id(call):
+    if isinstance(call, dict):
+        return call.get("id")
+    return getattr(call, "id", None)
+
+
+def _snapshot_message(message) -> dict:
+    """Reduce one payload message to a bounded JSON-safe record."""
+    record = {"role": _msg_role(message)}
+    raw = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    # assistant 도구 지시는 content가 의도적으로 None이다. 빈 문자열로 바꾸면
+    # 같은 메시지가 다른 종류가 된다.
+    record["content"] = (
+        None if raw is None else _clip_summary_text(str(raw), SNAPSHOT_TAIL_CHARS)
+    )
+    for key in ("name", "tool_call_id"):
+        value = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
+        if value:
+            record[key] = str(value)
+    calls = _msg_tool_calls(message)
+    if calls:
+        record["tool_calls"] = []
+        for call in calls:
+            function = (call.get("function") or {}) if isinstance(call, dict) else {}
+            record["tool_calls"].append({
+                "id": str(_tool_call_id(call) or ""),
+                "type": "function",
+                "function": {
+                    "name": str(function.get("name") or "tool"),
+                    "arguments": _clip_summary_text(
+                        str(function.get("arguments") or ""), SNAPSHOT_TAIL_CHARS
+                    ),
+                },
+            })
+    return record
+
+
+def snapshot_tail(messages: list, max_messages: int = None) -> list:
+    """Bounded tail that only ever holds whole assistant/tool groups.
+
+    A save boundary must never cut across a parallel call/result group. Results
+    without their instruction are rejected by the chat template, and an
+    instruction without its results would make a resumed run dispatch tool calls
+    whose side effects already happened - so either half is dropped with the
+    other.
+    """
+    if max_messages is None:
+        max_messages = SNAPSHOT_TAIL_MESSAGES
+    # 0번 system 메시지는 매 스텝 원장과 요약으로 새로 만들어지므로 저장하지 않는다.
+    tail = [message for message in messages if _msg_role(message) != "system"]
+    tail = tail[-max_messages:]
+    while tail and _msg_role(tail[0]) == "tool":
+        tail.pop(0)
+    for index in range(len(tail) - 1, -1, -1):
+        calls = _msg_tool_calls(tail[index])
+        if not calls:
+            continue
+        settled = {
+            (item.get("tool_call_id") if isinstance(item, dict) else None)
+            for item in tail[index + 1:]
+            if _msg_role(item) == "tool"
+        }
+        if any(_tool_call_id(call) not in settled for call in calls):
+            tail = tail[:index]
+        # 결과가 붙지 않은 그룹은 마지막 그룹뿐이다. 그 앞의 그룹들은 다음 지시가
+        # 실리기 전에 결과가 모두 채워졌다.
+        break
+    return [_snapshot_message(message) for message in tail]
+
+
+def recover_interrupted_runs() -> dict:
+    """Settle every unterminated record once, at startup.
+
+    Each one either becomes the selection the channel's next goal consumes - so
+    the same run id continues at its next cursor - or gets exactly one explicit
+    abort. There is deliberately no third path: silently falling back to Step 1
+    is what made a restart indistinguishable from a new request (issue #6).
+    """
+    aborted = 0
+
+    def abort(workspace, reason):
+        run_state.discard(workspace)
+        log_session_event(workspace, "run_abort", status="aborted", reason=reason)
+
+    candidates = {}
+    for workspace in RUN_CATALOG.workspaces():
+        record = run_state.load(workspace)
+        if record is None:
+            # 읽을 수 없거나 스키마가 다른 레코드는 마이그레이션하지 않고 버린다.
+            # 남겨 두면 시작마다 같은 abort를 다시 남긴다.
+            if run_state.discard(workspace):
+                log_session_event(
+                    workspace, "run_abort", status="aborted", reason="unusable_record"
+                )
+                aborted += 1
+            continue
+        if record["state"] != run_state.RUNNING:
+            # 종료 이벤트를 남긴 런이다. 명시적 !resume 대상으로는 남지만 자동
+            # 복구 대상은 아니다.
+            continue
+        key = (workspace.owner_id, workspace.channel_id)
+        previous = candidates.get(key)
+        if previous is None:
+            candidates[key] = (workspace, record)
+            continue
+        # 한 채널은 한 번에 하나만 이어갈 수 있다. 최신 레코드가 이기고, 밀린
+        # 쪽은 조용히 남지 않고 abort로 종결된다.
+        stale, winner = previous, (workspace, record)
+        if str(previous[1].get("updated_at", "")) > str(record.get("updated_at", "")):
+            stale, winner = winner, previous
+        abort(stale[0], "superseded_by_newer_run")
+        aborted += 1
+        candidates[key] = winner
+
+    recovered = 0
+    for workspace, record in candidates.values():
+        try:
+            RUN_CATALOG.resume(workspace.owner_id, workspace.channel_id, workspace.run_id)
+        except (RunNotFoundError, RunActiveError):
+            abort(workspace, "not_resumable")
+            aborted += 1
+            continue
+        log_session_event(
+            workspace,
+            "run_resume_armed",
+            step=record["next_step"],
+            next_step=record["next_step"],
+            tail_msgs=len(record["tail"]),
+            calls=len(record["executed_call_ids"]),
+        )
+        recovered += 1
+    return {"recovered": recovered, "aborted": aborted}
+
 
 async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, ledger=None, token=None):
     """Summarize old steps and replace the live payload with a bounded tail."""
@@ -2029,6 +2177,14 @@ async def on_message(message: discord.Message):
             "A reset/clear operation is in progress; retry this goal."
         )
         return
+    # 재시작 전에 남은 durable 레코드. 있으면 이 런은 같은 런 id로 다음 커서에서
+    # 이어간다. 신규 런에는 레코드가 없으므로 평소처럼 Step 1부터다.
+    restored = run_state.load(workspace)
+    resume_from = restored["next_step"] if restored is not None else 1
+    same_origin = (
+        restored is not None
+        and restored.get("message_id") == getattr(message, "id", None)
+    )
     # 승인과 메일박스를 한 턴에 함께 소유한다. 이 지점부터 첫 await까지 사이가
     # 없으므로 같은 채널의 다음 메시지는 언제나 steering으로 판정된다. 실패 시
     # 아래 status 응답 실패 경로의 release_run()이 승인을 되돌린다.
@@ -2072,6 +2228,9 @@ async def on_message(message: discord.Message):
     outcome = RunOutcome()
     total_tools_executed = 0
     current_step = 0
+    # 이미 실행한 호출 식별자. 재시작 뒤 모델이 같은 호출을 다시 요청해도 부작용을
+    # 두 번 일으키지 않는다.
+    executed_call_ids = list(restored["executed_call_ids"]) if restored is not None else []
     run_end_logged = False
     released = False
 
@@ -2118,6 +2277,9 @@ async def on_message(message: discord.Message):
         # 런이 끝나면 반영할 스텝도 없다. 남은 항목을 여기서 종결시켜야 어떤
         # 항목도 상태 없이 남지 않는다(정상 경로는 루프 직후에 이미 닫는다).
         lease["steering"].close(steering_mod.CANCELLED)
+        # 종료한 런은 자동 복구 대상이 아니다. 레코드 자체는 남겨 명시적 !resume은
+        # 계속 가능하게 하고, 삭제는 !reset/!clear/!delete가 맡는다.
+        run_state.terminate(workspace, status)
         try:
             RUN_CATALOG.finish(workspace, status)
         finally:
@@ -2137,6 +2299,10 @@ async def on_message(message: discord.Message):
             await message.channel.send(chunk)
 
     wants_short_answer = wants_direct_response(content)
+    if restored is not None:
+        # 이어갈 런이 있으면 단문 빠른 경로로 빠지지 않는다. 그 경로는 즉시
+        # 종료하므로, 복구한 런을 조용히 버리는 것과 같다.
+        wants_short_answer = False
     log_session_event(
         workspace,
         "run_start",
@@ -2145,6 +2311,30 @@ async def on_message(message: discord.Message):
         effort=channel_reasoning[message.channel.id],
     )
     log_content_debug(workspace, "user_goal", content)
+
+    if restored is not None:
+        # 재개는 조용히 일어나지 않는다. 이 레코드가 없으면 Step 기록만으로는
+        # 재시작 때문인지 새 요청 때문인지 구분할 수 없다.
+        log_session_event(
+            workspace,
+            "run_resumed",
+            step=resume_from,
+            next_step=resume_from,
+            same_origin=same_origin,
+            tail_msgs=len(restored["tail"]),
+            calls=len(executed_call_ids),
+            summary_chars=len(restored["summary"]),
+        )
+        # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
+        channel_summary[message.channel.id] = restored["summary"]
+        channel_ledger[message.channel.id] = restored["ledger"]
+        try:
+            await message.channel.send(
+                f"▶️ **[중단된 실행 재개]** run `{workspace.run_id}`을 Step {resume_from}에서 "
+                f"이어갑니다. 이미 실행한 도구 {len(executed_call_ids)}건은 다시 실행하지 않습니다."
+            )
+        except Exception:
+            pass
 
     history = channel_history[message.channel.id]
     history.append({"role": "user", "content": content})
@@ -2157,7 +2347,13 @@ async def on_message(message: discord.Message):
             role_label = "사용자" if msg_item["role"] == "user" else "AI"
             snippet = msg_item["content"][:150].replace("\n", " ")
             summary_snippets.append(f"{role_label}: {snippet}")
-        channel_summary[message.channel.id] = "이전 대화 요약: " + " | ".join(summary_snippets[-8:])
+        # 병합이지 교체가 아니다. 예전의 `=`는 계층 요약과 그 안에 실린 상태
+        # 마커를 스니펫으로 덮어써서, 복원한 요약이 첫 긴 대화에서 사라졌다.
+        channel_summary[message.channel.id] = update_hierarchical_summary(
+            existing_summary=channel_summary[message.channel.id],
+            new_recent_summary="이전 대화 요약: " + " | ".join(summary_snippets[-8:]),
+            step_range="대화 이력 초과분",
+        )
         channel_history[message.channel.id] = recent_turns
         history = recent_turns
 
@@ -2255,14 +2451,71 @@ async def on_message(message: discord.Message):
     messages_payload = [
         {"role": "system", "content": build_system_content(workspace, ledger, rolling_summary)}
     ]
-    messages_payload.extend(history)
+    if restored is not None:
+        # 복원한 tail은 완결된 그룹만 담으므로 그대로 이어 붙일 수 있다. 이전 대화
+        # 턴까지 다시 붙이지는 않는다: tail과 누적 요약이 이미 담고 있어 같은 맥락이
+        # 두 번 실린다.
+        messages_payload.extend(restored["tail"])
+        if not same_origin:
+            # 같은 원본 메시지가 다시 배달된 경우 목표는 이미 tail 안에 있다.
+            messages_payload.append(history[-1])
+    else:
+        messages_payload.extend(history)
     messages_payload = sanitize_messages_for_chat_template(messages_payload)
 
     current_effort = channel_reasoning[message.channel.id]
+
+    def save_snapshot(next_step, reason):
+        """완결된 그룹 경계에서만 부르는 원자적 durable 저장.
+
+        원자적 교체이므로 중단이 파일을 자를 수 없고, tail은 항상 완결된
+        assistant/tool 그룹만 담는다(snapshot_tail이 구조적으로 보장한다).
+        """
+        tail = snapshot_tail(messages_payload)
+        try:
+            run_state.save(
+                workspace,
+                message_id=getattr(message, "id", None),
+                next_step=next_step,
+                summary=rolling_summary,
+                tail=tail,
+                ledger=ledger,
+                interrupt={
+                    "cancelled": bool(token.cancelled),
+                    "reason": token.reason or "",
+                    "steering": lease["steering"].stats(),
+                },
+                executed_call_ids=executed_call_ids,
+            )
+        except OSError as snapshot_error:
+            # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
+            # 이 시점 이후 이 런은 복구 불가능하다는 뜻이다.
+            log_session_event(
+                workspace,
+                "snapshot_failed",
+                step=current_step,
+                reason=reason,
+                error=type(snapshot_error).__name__,
+            )
+            return
+        log_session_event(
+            workspace,
+            "snapshot",
+            step=current_step,
+            reason=reason,
+            next_step=next_step,
+            tail_msgs=len(tail),
+            summary_chars=len(rolling_summary),
+            calls=len(executed_call_ids),
+        )
+
     # 여기부터 에이전트 루프가 보장되므로 지시를 받는다. 직접 답변 런은 이 지점에
     # 오지 않으므로 큐가 닫힌 상태로 남고, 반영할 스텝이 없다는 사실이 접수
     # 단계에서 그대로 통지된다.
     lease["steering"].open()
+    # 첫 모델 호출 전에 레코드를 남긴다. 이것이 없으면 첫 스텝에서 죽은 런은
+    # 흔적 없이 사라지고, 다음 요청이 조용히 Step 1을 다시 낸다.
+    save_snapshot(resume_from, "run_start")
     try:
         status_msg = await message.reply(f"🚀 **[완전자율 목표 달성 모드]** 모델 초기 추론 및 작업 공간 가동 중... (실시간 지시/개입 가능 / 중단: `!stop`)")
     except BaseException:
@@ -2340,6 +2593,11 @@ async def on_message(message: discord.Message):
             ledger=ledger,
             token=token,
         )
+        # 롤오버는 누적 요약이 바뀌는 유일한 지점이다. 되돌려 쓰지 않으면 이 런의
+        # 모든 롤오버 요약이 함수 종료와 함께 사라지고, 같은 프로세스의 다음
+        # 메시지조차 낡은 요약에서 시작한다.
+        channel_summary[message.channel.id] = rolling_summary
+        save_snapshot(step_num + 1, "rollover")
 
     # 상시 타이핑 하트비트 루프 백그라운드 구동
     stop_typing = asyncio.Event()
@@ -2371,7 +2629,9 @@ async def on_message(message: discord.Message):
             )
 
     try:
-        for iteration in range(MAX_AGENT_LOOPS):
+        # 다음 커서에서 시작한다. 복원한 런은 Step 1을 다시 내지 않고, 신규 런은
+        # resume_from이 1이라 종전과 같다.
+        for iteration in range(resume_from - 1, MAX_AGENT_LOOPS):
             current_step = iteration + 1
             if token.cancelled:
                 outcome.settle(outcome_mod.STOPPED, token.reason)
@@ -2656,6 +2916,13 @@ async def on_message(message: discord.Message):
                     if tc["argument_error"] is not None:
                         merged_results[call_index] = tc["argument_error"]
                         continue
+                    if tc["id"] in executed_call_ids:
+                        # 재시작 이전에 이미 실행한 호출이다. 다시 보내면 같은
+                        # 부작용이 두 번 일어난다.
+                        merged_results[call_index] = _blocked_tool_result(
+                            "already_executed", tc["name"], 1, 1
+                        )
+                        continue
                     signature = (
                         tc["name"],
                         json.dumps(
@@ -2707,6 +2974,7 @@ async def on_message(message: discord.Message):
 
                 total_tools_executed += len(allowed_calls)
                 for tc in allowed_calls:
+                    executed_call_ids.append(tc["id"])
                     # 인자 원문 대신 어떤 인자가 왔는지만 남긴다. 도구 인자 JSON을
                     # 그대로 적는 것이 셸 명령과 파일 내용이 로그로 들어온 경로였다.
                     log_session_event(
@@ -2798,7 +3066,13 @@ async def on_message(message: discord.Message):
                 # 미루면 체크포인트 보고서와 롤오버 모델 단계를 모두 기다린다.
                 apply_steering(iteration + 1)
 
-                # [옵션 B: 매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
+                # 그룹이 완결됐다: 모든 호출에 결과가 붙었고 대기 지시도 흡수됐다.
+                # 저장 경계는 여기이며, 병렬 호출/결과 그룹 중간이 아니다.
+                save_snapshot(iteration + 2, "tool_group")
+
+                # [매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
+                # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
+                # 쓰이는 것은 바로 위 save_snapshot이 남긴 durable 레코드다.
                 if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
                     log_session_event(
@@ -2808,7 +3082,7 @@ async def on_message(message: discord.Message):
                         checkpoint=checkpoint_num,
                     )
                     try:
-                        await status_msg.edit(content=f"📊 **[Step {iteration+1} 체크포인트 도달]** 중간 진행 상황 종합 보고서 작성 및 다음 구간 자동 연장 준비 중... ▌")
+                        await status_msg.edit(content=f"📊 **[Step {iteration+1} 중간 보고 구간 도달]** 중간 진행 상황 종합 보고서 작성 및 다음 구간 자동 연장 준비 중... ▌")
                     except Exception:
                         pass
 
@@ -2866,6 +3140,9 @@ async def on_message(message: discord.Message):
                                 state_report,
                                 step=iteration + 1,
                             )
+                        # 정정이 반영된 직후 저장한다. 다음 구간에서 죽어도 잃는
+                        # 것은 한 구간뿐이고, 정정은 남는다.
+                        save_snapshot(iteration + 2, "interim_report")
 
                         inter_formatted = format_full_discord_output(inter_text)
 
@@ -2873,7 +3150,7 @@ async def on_message(message: discord.Message):
                         elapsed_cp_str = format_elapsed_time(elapsed_checkpoint)
 
                         cp_message = (
-                            f"📊 **[중간 진행 보고서 - {iteration+1}스텝 체크포인트]**\n\n"
+                            f"📊 **[중간 진행 보고서 - {iteration+1}스텝]**\n\n"
                             f"{inter_formatted}\n\n"
                             f"> ⏱️ **경과 시간**: {elapsed_cp_str} (총 {total_tools_executed}개 도구 실행 완료)\n"
                             f"> ⚡ **[자율 연장]** 목표 달성을 위해 다음 구간(Step {iteration+2} ~ {iteration+1+CHECKPOINT_INTERVAL})으로 계속 진행합니다... *(중단: `!stop`)*"
@@ -2935,10 +3212,10 @@ async def on_message(message: discord.Message):
                             f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
                         )})
                     else:
-                        # 실패한 체크포인트에 성공 마커를 남기지 않는다.
+                        # 실패한 중간 보고서에 성공 마커를 남기지 않는다.
                         messages_payload.append({
                             "role": "assistant",
-                            "content": f"[중간 보고서 생성 실패 - Step {iteration+1} 체크포인트는 제출되지 않았습니다]",
+                            "content": f"[중간 보고서 생성 실패 - Step {iteration+1} 중간 보고서는 제출되지 않았습니다]",
                         })
                         messages_payload.append({"role": "user", "content": (
                             f"[🤖 시스템 안내: Step {iteration+1} 중간 보고서 생성이 실패했습니다. 제출된 것으로 간주하지 마세요. "
@@ -3264,18 +3541,23 @@ async def on_message(message: discord.Message):
 
 
 def startup_maintenance():
-    """실행 리비전·의존성·유효 설정을 남기고 만료된 로그와 런을 정리한다.
+    """실행 리비전·의존성·유효 설정을 남기고, 만료된 로그와 런을 정리한 뒤
+    미종료 런을 판정한다.
 
     시작 기록을 먼저 쓴다. 정리 도중 죽어도 어떤 배포본이 무엇을 지우려 했는지는
     남아 있어야 한다. 설정 지문 해시는 넣지 않는다: startup_diagnostics가 정책
     필드를 하나씩 그대로 출력하므로, 값이 이미 다 있는데 해시는 두 배포본이
     무엇이 달랐는지 알려주지 못한다.
+
+    복구 판정은 정리 뒤에 온다. 먼저 하면 보관 기간이 지난 런이 prepared로 올라가
+    만료를 피해 버린다.
     """
     path = session_log.write_startup_record(startup_diagnostics(CONFIG))
     swept = session_log.sweep_retention()
     # 로그만 지우면 런이 수집한 파일은 영구히 남는다. 보관 기간은 둘 다 덮는다.
     swept["runs"] = RUN_CATALOG.sweep_retention(CONFIG.log_retention_days * 86400.0)
     log_session_event(None, "retention_sweep", **swept)
+    log_session_event(None, "run_recovery", **recover_interrupted_runs())
     return path
 
 
