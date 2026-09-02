@@ -9,9 +9,12 @@ import secrets
 import shutil
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+
+from session_log import secure_directory
 
 
 CANONICAL_NAMES = frozenset(("plan.md", "findings.md"))
@@ -38,11 +41,25 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _age_seconds(moment, stamp):
+    """Age of an ISO timestamp. Unparseable stamps never expire, deliberately:
+    retention deletes files, so an unreadable date must not authorise that."""
+    try:
+        return moment - datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
 def _revision(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _atomic_write(path, data):
+def atomic_write(path, data):
+    """Temp file → flush → fsync → replace, so an interrupt cannot truncate.
+
+    Public because run state (`run_state.py`) needs the same guarantee for the
+    same reason: a half-written record is worse than no record at all.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
@@ -106,7 +123,7 @@ class RunWorkspace:
         payload = json.dumps(
             self._metadata(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        _atomic_write(self.metadata_path, payload)
+        atomic_write(self.metadata_path, payload)
 
     def clear_read_cache(self):
         self._read_hashes.clear()
@@ -187,8 +204,10 @@ class RunWorkspace:
         target = self.resolve(path)
         data = str(content).encode("utf-8")
         if not self._is_canonical(target):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            # Ordinary files replace atomically too: an interrupt mid-write used
+            # to leave a truncated file behind, and the agent's own scripts and
+            # findings live here (issue #6).
+            atomic_write(target, data)
             revision = _revision(data)
             self._remember(target, revision)
             return {
@@ -228,7 +247,7 @@ class RunWorkspace:
                     "current_revision": current_revision,
                 }
 
-            _atomic_write(target, data)
+            atomic_write(target, data)
             revision = _revision(data)
             self._remember(target, revision)
             return {
@@ -250,8 +269,10 @@ class RunCatalog:
         )
         self.runs_root = self.workspace_root / "runs"
         self.logs_root = self.log_root / "runs"
-        self.runs_root.mkdir(parents=True, exist_ok=True)
-        self.logs_root.mkdir(parents=True, exist_ok=True)
+        # 0700 on every level: a run's collected data and its log are as
+        # sensitive as each other, and neither is anyone else's business.
+        secure_directory(self.runs_root)
+        secure_directory(self.logs_root)
         self._lock = threading.RLock()
         self._runs = {}
         self._selected = {}
@@ -287,7 +308,7 @@ class RunCatalog:
                 owner_id,
                 channel_id,
                 root,
-                self.logs_root / (run_id + ".md"),
+                self.logs_root / (run_id + ".jsonl"),
                 status,
                 created_at,
                 updated_at,
@@ -319,12 +340,16 @@ class RunCatalog:
             owner_id,
             channel_id,
             self.runs_root / run_id,
-            self.logs_root / (run_id + ".md"),
+            self.logs_root / (run_id + ".jsonl"),
             status,
             timestamp,
             timestamp,
         )
+        # mkdir without exist_ok on purpose: a colliding run id must fail loudly
+        # rather than adopt someone else's directory. secure_directory then fixes
+        # the mode, which mkdir's mode argument cannot do under a loose umask.
         workspace.root.mkdir()
+        secure_directory(workspace.root)
         workspace.persist()
         self._runs[run_id] = workspace
         return workspace
@@ -350,6 +375,20 @@ class RunCatalog:
             if workspace is None or workspace.owner_id != owner_id:
                 raise RunNotFoundError("run not found")
             return workspace
+
+    def workspaces(self, channel_id=None):
+        """Known runs, optionally narrowed to one channel.
+
+        A read accessor, not a lifecycle operation. Startup recovery and
+        `!reset` both need to find a channel's runs to settle their durable
+        state, and neither should be reaching into the catalog's internals.
+        """
+        with self._lock:
+            return [
+                workspace
+                for workspace in self._runs.values()
+                if channel_id is None or workspace.channel_id == channel_id
+            ]
 
     def _reset_conflicts(self, owner_id, channel_id):
         return any(
@@ -446,6 +485,39 @@ class RunCatalog:
     def delete(self, owner_id, run_id):
         with self._lock:
             workspace = self.lookup_owned(owner_id, run_id)
+            self._purge(workspace)
+
+    def sweep_retention(self, max_age_seconds, now=None):
+        """Delete runs whose files outlived the retention window.
+
+        Active and prepared runs are never swept: one is in use, and the other is
+        the selection a caller is about to consume. Returns the number deleted.
+
+        `now` is injectable so expiry is testable without waiting days for it.
+        """
+        max_age_seconds = float(max_age_seconds)
+        if max_age_seconds <= 0:
+            return 0
+        moment = time.time() if now is None else float(now)
+        with self._lock:
+            expired = [
+                workspace
+                for workspace in self._runs.values()
+                if workspace.status not in ("active", "prepared")
+                and _age_seconds(moment, workspace.updated_at) >= max_age_seconds
+            ]
+        deleted = 0
+        for workspace in expired:
+            try:
+                self._purge(workspace)
+            except (RunWorkspaceError, OSError):
+                continue
+            deleted += 1
+        return deleted
+
+    def _purge(self, workspace):
+        """Detach, then destroy: a run's directory and every log generation."""
+        with self._lock:
             if workspace.status == "active":
                 raise RunActiveError("run is active")
             selected_keys = [
@@ -466,7 +538,10 @@ class RunCatalog:
             self._runs.pop(workspace.run_id, None)
 
         shutil.rmtree(detached)
-        try:
-            workspace.log_path.unlink()
-        except FileNotFoundError:
-            pass
+        # Rotated generations are part of the run's log, so deletion covers them
+        # too; unlinking only log_path would leave the older records behind.
+        for path in sorted(workspace.log_path.parent.glob(workspace.run_id + "*")):
+            try:
+                path.unlink()
+            except (FileNotFoundError, IsADirectoryError, PermissionError):
+                pass
