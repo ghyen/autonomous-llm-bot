@@ -350,7 +350,9 @@ async def run_worker(workspace, request, timeout, token=None):
         return {"status": "error", "error": "invalid_request"}
     proxy_server = None
     try:
-        root = Path(os.path.realpath(os.fspath(workspace)))
+        workspace_path = getattr(workspace, "root", workspace)
+        display_root = str(Path(os.path.abspath(os.fspath(workspace_path))))
+        root = Path(os.path.realpath(os.fspath(workspace_path)))
         if not root.is_dir():
             return {"status": "error", "error": "invalid_workspace"}
         limits = _worker_limits(request)
@@ -373,6 +375,7 @@ async def run_worker(workspace, request, timeout, token=None):
         command.extend(("-p", profile, sys.executable, "-B", str(WORKER_PATH)))
         payload = dict(request)
         payload["workspace"] = str(root)
+        payload["display_workspace"] = display_root
         payload["limits"] = limits
         payload["network_allowlist"] = list(entries)
         if proxy_server is not None:

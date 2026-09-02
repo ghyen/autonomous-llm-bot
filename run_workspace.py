@@ -140,6 +140,13 @@ class RunWorkspace:
         self._remember(target, file_revision)
         return result
 
+    def remember_worker_write(self, result):
+        """Update the parent read cache from a successful worker write."""
+        if result.get("status") == "success":
+            target = self.resolve(result["path"])
+            self._remember(target, result["revision"])
+        return result
+
     def write_lock(self, path):
         target = self.resolve(path)
         return self._canonical_locks.get(target.name) if self._is_canonical(target) else None
