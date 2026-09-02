@@ -200,6 +200,10 @@ def parse_network_allowlist(raw, field: str) -> Tuple[NetworkAllowlistEntry, ...
             )
         if port is None:
             port = 443 if scheme == "https" else 80
+        if not 1 <= port <= 65535:
+            raise ConfigError(
+                "{0}: '{1}'의 포트는 1부터 65535 사이여야 합니다.".format(field, value)
+            )
         entry = (scheme, hostname.lower(), port)
         if entry not in seen:
             entries.append(entry)

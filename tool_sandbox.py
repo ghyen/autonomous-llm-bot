@@ -348,7 +348,14 @@ async def run_worker(workspace, request, timeout, token=None):
         return {"status": "error", "error": "sandbox_unavailable"}
     if not isinstance(request, dict):
         return {"status": "error", "error": "invalid_request"}
+    try:
+        timeout = float(timeout)
+        if timeout <= 0 or not math.isfinite(timeout):
+            return {"status": "error", "error": "invalid_timeout"}
+    except (TypeError, ValueError, OverflowError):
+        return {"status": "error", "error": "invalid_timeout"}
     proxy_server = None
+    process = None
     try:
         workspace_path = getattr(workspace, "root", workspace)
         display_root = str(Path(os.path.abspath(os.fspath(workspace_path))))
@@ -404,10 +411,12 @@ async def run_worker(workspace, request, timeout, token=None):
             int(limits["output_bytes"]) + 8192,
         )
     except asyncio.CancelledError:
-        if "process" in locals():
+        if process is not None:
             await _kill_process_group(process)
         raise
     except (OSError, TypeError, ValueError, RuntimeError):
+        if process is not None:
+            await _kill_process_group(process)
         return {"status": "error", "error": "sandbox_unavailable"}
     finally:
         if proxy_server is not None:
