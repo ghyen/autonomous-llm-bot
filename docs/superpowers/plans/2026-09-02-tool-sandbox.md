@@ -227,7 +227,7 @@ class ProfileTest(unittest.TestCase):
         self.assertNotIn("PRIVATE KEY", json.dumps(outside))
 ```
 
-Replace the ellipsis in the actual test with a concrete temporary file, a `read_file` request, and a `bash_exec` request for `$HOME/.ssh`, asserting the former succeeds and the latter returns `sandbox_denied` or exit code nonzero without exposing file bytes.
+The test must create a concrete temporary file, issue a `read_file` request, and issue a `bash_exec` request for `$HOME/.ssh`; the former must succeed and the latter must return `sandbox_denied` or a nonzero exit without exposing file bytes.
 
 - [ ] **Step 2: Run the focused tests and confirm they fail for missing profile/supervisor behavior**
 
