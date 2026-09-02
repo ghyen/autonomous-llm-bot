@@ -3,7 +3,7 @@
 Discord LLM Bot - Auto-Extension Goal-Driven Autonomous Agent
 Integrated with:
 - User's Streaming Completion & Rolling Compaction (Rollup) Architecture
-- Chat Template Multi-System Message Sanitizer (400 Error Immunity)
+- Pre-Send Tool Payload Validator (tool_call 상관관계 + chat template)
 - Continuous Keep-Alive Typing Heartbeat Loop (7s Interval)
 - Live Updating Real-Time Dashboard Card (message.edit)
 - 10-Step Periodic Checkpoints & Instant Feedback Loop
@@ -16,7 +16,6 @@ import json
 import time
 import signal
 import asyncio
-from datetime import datetime
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
 
@@ -29,6 +28,9 @@ from types import SimpleNamespace
 
 import authz
 import outcome as outcome_mod
+import run_state
+import session_log
+import steering as steering_mod
 from deadlines import (
     CancelToken,
     RunCancelled,
@@ -40,13 +42,16 @@ from deadlines import (
 from outcome import RunOutcome
 from ledger import ResearchLedger
 from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
+from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
 
 # Configuration is fully validated before any filesystem or network side effect.
 try:
     CONFIG = load_config()
 except ConfigError as config_error:
-    print(f"[Config Error] {config_error}", file=sys.stderr)
+    # 시작 실패에도 시각과 리비전이 붙어야 한다. 타임스탬프 없는 print 때문에
+    # 과거 시작 실패가 언제 있었는지 사후에 특정할 수 없었다(이슈 #11).
+    log_session_event(None, "config_error", detail=str(config_error))
     sys.exit(1)
 
 DISCORD_TOKEN = CONFIG.discord_token
@@ -57,8 +62,18 @@ ALLOWED_USER_IDS = set(CONFIG.allowed_user_ids)
 ADMIN_USER_IDS = set(CONFIG.admin_user_ids)
 TOOLS_ENABLED = CONFIG.tools_enabled
 
+# 로그 정책은 어떤 파일 부작용보다 먼저 선다. 바로 아래 RUN_CATALOG 생성이
+# 이미 로그 트리를 만들기 때문에, 모드·회전·보관 정책이 그 전에 있어야 한다.
+session_log.configure(
+    CONFIG.system_log_dir,
+    content_debug=CONFIG.log_content_debug,
+    max_bytes=CONFIG.log_max_bytes,
+    retention_days=CONFIG.log_retention_days,
+    content_retention_hours=CONFIG.log_content_debug_retention_hours,
+)
+
 for diagnostic_line in startup_diagnostics(CONFIG):
-    print(f"[Config] {diagnostic_line}", flush=True)
+    log_session_event(None, "config", line=diagnostic_line)
 
 RUN_CATALOG = RunCatalog(CONFIG.workspace_dir, CONFIG.system_log_dir)
 
@@ -310,19 +325,19 @@ class CustomBot(commands.Bot):
     async def setup_hook(self):
         try:
             await self.tree.sync()
-            print("[Discord LLM Bot] Slash commands synced successfully!", flush=True)
+            log_session_event(None, "slash_sync", status="ok")
         except Exception as e:
-            print(f"[Discord LLM Bot] Slash sync notice: {e}", flush=True)
+            log_session_event(None, "slash_sync", status="notice", error=type(e).__name__)
 
 bot = CustomBot(command_prefix="!", intents=intents)
 
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
 channel_reasoning = defaultdict(lambda: "high")
-# Public control follows the newest active lease when one exists; otherwise it
-# follows the newest pending direct lease. The list restores the surviving
-# caller-owned controller after either overlap completion order and never gates,
-# queues, or delays admission.
+# A run marks its lease active before its first await, so the admission check and
+# the mailbox it publishes are decided in one event-loop turn: a message arriving
+# during a live run is always steering, never a second run. The list keeps every
+# lease identity-scoped so a run's cleanup can only ever remove its own.
 channel_cancel_token = {}
 channel_run_leases = defaultdict(list)
 channel_ledger = defaultdict(ResearchLedger)
@@ -372,7 +387,7 @@ def request_run_cancel(channel_id, reason=outcome_mod.DETAIL_USER_STOP) -> bool:
     if token is None:
         return False
     token.cancel(reason)
-    print(f"[Cancel requested] channel={channel_id} reason={reason}", flush=True)
+    log_session_event(None, "cancel_requested", reason=reason, channel=channel_id)
     return True
 
 
@@ -380,6 +395,45 @@ def clear_channel_state(channel_id) -> None:
     channel_history[channel_id].clear()
     channel_summary[channel_id] = ""
     channel_ledger[channel_id].clear()
+    # 메모리만 지우면 지운 런이 재시작 뒤 디스크의 durable 레코드에서 되살아난다.
+    for workspace in RUN_CATALOG.workspaces(channel_id):
+        run_state.discard(workspace)
+
+
+def steering_receipt_notice(receipt, text: str) -> str:
+    """접수 결과를 실제 처리 결과대로 알린다.
+
+    거절된 지시에 "다음 스텝에 반영"이라고 답하면 안 된다. 반영할 스텝이
+    없다는 것이 바로 거절 사유이기 때문이다.
+
+    지시 본문은 되돌려 인용하지 않는다. 사용자가 방금 입력한 것이라 잃는 정보가
+    없고, 인용하면 채널에 원문이 한 번 더 남는다(이슈 #11).
+    """
+    if receipt.state == steering_mod.QUEUED:
+        return (
+            f"📥 **[실시간 개입 접수]** 대기열 {receipt.depth}번째로 등록했습니다 ({len(text)}자). "
+            "다음 스텝에 반영하며, 반영되지 못하면 종료 시 알려드립니다."
+        )
+    if receipt.state == steering_mod.COALESCED:
+        return (
+            f"📥 **[실시간 개입 병합]** 대기 중인 동일 지시에 병합했습니다 (대기 {receipt.depth}건). "
+            "같은 지시를 두 번 주입하지 않습니다."
+        )
+    if receipt.reason == steering_mod.REASON_QUEUE_FULL:
+        return (
+            f"⛔ **[실시간 개입 거절]** 대기열이 상한({receipt.depth}건)까지 찼습니다. "
+            "이 지시는 **적용되지 않았습니다**. 대기 중인 지시가 반영된 뒤 다시 보내주세요."
+        )
+    if receipt.reason == steering_mod.REASON_TERMINAL:
+        return (
+            "⛔ **[실시간 개입 미적용]** 실행이 종료 단계(보고서 합성·전송)에 들어가 "
+            "반영할 다음 스텝이 없습니다. 이 지시는 **적용되지 않았습니다**. "
+            "런이 끝난 뒤 다시 보내주세요."
+        )
+    return (
+        "⛔ **[실시간 개입 미적용]** 이 실행은 단문 직접 답변이라 지시를 반영할 스텝이 없습니다. "
+        "이 지시는 **적용되지 않았습니다**. 답변이 끝난 뒤 다시 보내주세요."
+    )
 
 
 MAX_RECENT_TURNS = 8
@@ -387,6 +441,10 @@ CHECKPOINT_INTERVAL = 10
 MAX_AGENT_LOOPS = 250
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = 250
+
+# 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
+# 한 채널이 이후 모든 스텝의 프롬프트를 대기 깊이만큼 부풀릴 수 있다.
+STEERING_QUEUE_MAX = 8
 
 MAX_NO_TOOL_RESPONSES = 6
 
@@ -493,14 +551,6 @@ def format_elapsed_time(seconds: float) -> str:
         mins = (total_sec % 3600) // 60
         return f"{hours}시간 {mins}분"
 
-def log_session_event(session_file: str, title: str, content: str):
-    try:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(session_file, "a", encoding="utf-8") as f:
-            f.write(f"## [{now_str}] {title}\n\n{content}\n\n---\n\n")
-    except Exception as e:
-        print(f"[Log Error]: {e}", file=sys.stderr, flush=True)
-
 async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
     await asyncio.sleep(delay)
     try:
@@ -553,7 +603,8 @@ async def tool_bash_exec(workspace, command: str) -> str:
     proc = None
     process_group_id = None
     try:
-        print(f"[Tool: bash_exec] {command}", flush=True)
+        # 명령어 원문은 표준 출력으로 나가지 않는다. 어떤 도구가 어느 스텝에서
+        # 호출되었는지는 루프가 남기는 tool_call 레코드에 이미 있다(이슈 #11).
         # start_new_session makes the shell PID the stable process-group id for
         # descendants, even if the shell exits before its inherited pipes close.
         proc = await asyncio.create_subprocess_shell(
@@ -602,8 +653,6 @@ def _workspace_result(payload) -> str:
 
 async def tool_read_file(workspace, path: str) -> str:
     try:
-        target_path = workspace.resolve(path)
-        print(f"[Tool: read_file] {target_path}", flush=True)
         return _workspace_result(workspace.read(path))
     except Exception as e:
         return _workspace_result({
@@ -617,8 +666,6 @@ async def tool_write_file(
     workspace, path: str, content: str, expected_revision
 ) -> str:
     try:
-        target_path = workspace.resolve(path)
-        print(f"[Tool: write_file] {target_path} ({len(content)} chars)", flush=True)
         return _workspace_result(
             await workspace.write(path, content, expected_revision)
         )
@@ -631,8 +678,6 @@ async def tool_write_file(
 
 async def tool_web_search(query: str) -> str:
     try:
-        print(f"[Tool: web_search] {query}", flush=True)
-
         def _search():
             # ponytail: to_thread cannot be interrupted, so the DDGS timeout is
             # the real bound here. On cancellation the worker thread may outlive
@@ -665,7 +710,6 @@ async def tool_record_state(ledger, updates) -> str:
             updates = json.loads(updates)
         except Exception:
             return "[Error: record_state 인자를 JSON 객체로 해석할 수 없습니다]"
-    print("[Tool: record_state]", flush=True)
     try:
         report, had_refusal = ledger.apply_updates_with_status(updates)
         status = "refused" if had_refusal else "success"
@@ -673,8 +717,18 @@ async def tool_record_state(ledger, updates) -> str:
     except Exception as e:
         return f"[Error applying state update: {e}]"
 
-async def tool_finish_task(report: str) -> str:
-    print(f"[Tool: finish_task Called!]", flush=True)
+async def tool_finish_task(workspace, report: str, step_num: int = 0) -> str:
+    # 완료 신호는 stdout 한 줄이 아니라 런 로그의 레코드로 남는다. 종료 경로를
+    # 사후에 구분하려면 이 호출이 어느 스텝에서 왔는지가 있어야 한다.
+    log_session_event(
+        workspace,
+        "tool_finish_task",
+        step=step_num,
+        status="ok",
+        tool="finish_task",
+        report_chars=len(report),
+    )
+    log_content_debug(workspace, "finish_report", report, step=step_num)
     return f"[Task Completed Successfully. Final Report Registered ({len(report)} chars)]"
 
 async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int = 1, ledger=None, token=None) -> list:
@@ -701,7 +755,7 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
             return await tool_record_state(ledger, args)
         elif name == "finish_task":
             r = args.get("report", "")
-            return await tool_finish_task(r)
+            return await tool_finish_task(workspace, r, step_num)
         else:
             return f"[Error: Unknown tool function '{name}']"
 
@@ -798,34 +852,241 @@ def _tool_call_summary(call) -> str:
         arguments = getattr(function, "arguments", "") if function else ""
     return f"{name}({_clip_summary_text(arguments, 700)})"
 
-# --- Chat Template Sanitizer (400 Error Immunity) ---
+# --- Pre-Send Payload Validator (tool 상관관계 + chat template) ---
 
-def sanitize_messages_for_chat_template(messages: list) -> list:
-    """Qwen chat template의 'System message must be at the beginning' 에러를 100% 원천 차단"""
-    if not messages:
-        return messages
+TOOL_PAYLOAD_MISSING_RESULT = "[Error: 도구 결과가 기록되지 않았습니다]"
+TOOL_CORRELATION_ERROR_MARKERS = ("tool_call_id", "tool_calls", "tool call")
 
-    sanitized = []
-    first_system_found = False
 
-    for msg in messages:
-        role = _msg_role(msg)
-        content = _msg_content(msg)
+def _call_parts(call):
+    """(id, name, arguments). payload의 tool_call은 dict지만 객체 형태도 받는다."""
+    if isinstance(call, dict):
+        call_id = call.get("id")
+        function = call.get("function") or {}
+    else:
+        call_id = getattr(call, "id", None)
+        function = getattr(call, "function", None) or {}
+    if isinstance(function, dict):
+        return call_id, function.get("name"), function.get("arguments")
+    return call_id, getattr(function, "name", None), getattr(function, "arguments", None)
 
-        if role == "system":
-            if not first_system_found and len(sanitized) == 0:
-                sanitized.append(msg)
-                first_system_found = True
-            else:
-                # 0번째가 아닌 위치의 system 메시지는 user 역할로 안전하게 전환
-                sanitized.append({
-                    "role": "user",
-                    "content": f"[시스템 참고 정보]: {content}"
-                })
+
+def _tool_result_id(message):
+    if isinstance(message, dict):
+        return message.get("tool_call_id")
+    return getattr(message, "tool_call_id", None)
+
+
+def _payload_fingerprint(messages: list) -> str:
+    """역할과 도구 id 시퀀스만 남긴 마스킹 구조 지문.
+
+    실패를 서버·템플릿 문제와 클라이언트 payload 문제로 가르려면 구조가 필요하다.
+    내용과 실제 id는 남기지 않는다.
+    """
+    aliases = {}
+
+    def alias(call_id):
+        if not isinstance(call_id, str) or not call_id:
+            return "t?"
+        return aliases.setdefault(call_id, "t{0}".format(len(aliases) + 1))
+
+    parts = []
+    for message in messages:
+        role = _msg_role(message) or "?"
+        calls = _msg_tool_calls(message)
+        if role == "assistant" and calls:
+            parts.append(
+                "assistant[" + ",".join(alias(_call_parts(call)[0]) for call in calls) + "]"
+            )
+        elif role == "tool":
+            parts.append("tool:" + alias(_tool_result_id(message)))
         else:
-            sanitized.append(msg)
+            parts.append(role)
+    return "|".join(parts)
 
-    return sanitized
+
+def validate_chat_payload(messages: list) -> SimpleNamespace:
+    """전송 직전 payload의 구조를 검증하고, 결함을 제거한 payload를 함께 돌려준다.
+
+    호출 수와 결과 수가 같다는 것은 유효성 근거가 되지 못한다. 같은 id를 두 번
+    알리거나 알리지 않은 id에 답하는 payload도 개수는 맞는다. 그래서 id 유일성,
+    호출-결과 1:1, 그룹 인접성, system 위치를 한 곳에서 함께 본다. 결함이 없으면
+    메시지를 그대로 두므로 정상 이력은 복구가 건드리지 않는다.
+    """
+    if not messages:
+        return SimpleNamespace(messages=list(messages), defects=(), ok=True)
+
+    defects = set()
+
+    # 1) 알림 수집. id는 비어 있지 않은 문자열이고 payload 전체에서 유일해야 한다.
+    announced = {}
+    kept_calls = {}
+    for position, message in enumerate(messages):
+        if _msg_role(message) != "assistant":
+            continue
+        calls = _msg_tool_calls(message)
+        if not calls:
+            continue
+        surviving = []
+        for call in calls:
+            call_id, name, arguments = _call_parts(call)
+            if not isinstance(call_id, str) or not call_id:
+                defects.add("tool_call_id_missing")
+                continue
+            if call_id in announced:
+                defects.add("tool_call_id_duplicate")
+                continue
+            if not isinstance(name, str) or not name:
+                defects.add("tool_name_missing")
+                continue
+            if not isinstance(arguments, str):
+                defects.add("tool_arguments_not_string")
+                try:
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                except Exception:
+                    arguments = str(arguments)
+            announced[call_id] = position
+            surviving.append({
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        kept_calls[position] = surviving
+
+    # 2) 결과 수집. 알린 id 하나에 결과 하나. 고아 결과는 본문을 잃지 않도록
+    #    user 메시지로 내리고, 내용이 문자열이 아닌 결과는 문자열로 채운다.
+    answers = {}
+    answer_positions = {}
+    demoted_orphans = {}
+    for position, message in enumerate(messages):
+        if _msg_role(message) != "tool":
+            continue
+        call_id = _tool_result_id(message)
+        if not isinstance(call_id, str) or call_id not in announced:
+            defects.add("tool_result_orphan")
+            demoted_orphans[position] = {
+                "role": "user",
+                "content": "[도구 실행 결과: {0}]\n{1}".format(
+                    _msg_name(message), _msg_content(message)
+                ),
+            }
+            continue
+        if call_id in answers:
+            defects.add("tool_result_duplicate")
+            continue
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+        if not isinstance(content, str):
+            defects.add("tool_content_missing")
+            repaired_result = dict(message) if isinstance(message, dict) else {
+                "role": "tool", "tool_call_id": call_id, "name": _msg_name(message)
+            }
+            repaired_result["content"] = TOOL_PAYLOAD_MISSING_RESULT
+            answers[call_id] = repaired_result
+        else:
+            answers[call_id] = message
+        answer_positions[call_id] = position
+
+    # 3) 재조립. 결과는 자기 assistant 알림 바로 뒤에, 알린 순서대로만 놓인다.
+    repaired = []
+    for position, message in enumerate(messages):
+        role = _msg_role(message)
+        if role == "tool":
+            if position in demoted_orphans:
+                repaired.append(demoted_orphans[position])
+            continue
+        if role == "system" and repaired:
+            # 0번이 아닌 system은 chat template이 거부하므로 user로 내린다.
+            defects.add("system_position")
+            repaired.append({
+                "role": "user",
+                "content": "[시스템 참고 정보]: {0}".format(_msg_content(message)),
+            })
+            continue
+        calls = kept_calls.get(position)
+        if calls is None:
+            repaired.append(message)
+            continue
+        if calls == list(_msg_tool_calls(message)):
+            repaired.append(message)
+        elif calls:
+            repaired.append({
+                "role": "assistant",
+                "content": _msg_content(message) or None,
+                "tool_calls": calls,
+            })
+        else:
+            repaired.append({
+                "role": "assistant",
+                "content": _msg_content(message) or "[도구 실행 지시]",
+            })
+
+        group_positions = [
+            answer_positions[call["id"]]
+            for call in calls
+            if call["id"] in answer_positions
+        ]
+        if group_positions and (
+            group_positions != sorted(group_positions)
+            or set(range(position + 1, max(group_positions) + 1)) - set(group_positions)
+        ):
+            defects.add("tool_group_split")
+        for call in calls:
+            answer = answers.get(call["id"])
+            if answer is None:
+                defects.add("tool_call_unanswered")
+                answer = {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "content": TOOL_PAYLOAD_MISSING_RESULT,
+                }
+            repaired.append(answer)
+
+    if not defects:
+        # 결함이 없으면 메시지는 그대로 두고 목록만 새로 만든다. 호출자가 받은
+        # payload가 이후에 append되는 살아 있는 이력과 같은 객체이면 안 된다.
+        return SimpleNamespace(messages=list(messages), defects=(), ok=True)
+    return SimpleNamespace(messages=repaired, defects=tuple(sorted(defects)), ok=False)
+
+
+def is_tool_correlation_error(error) -> bool:
+    """도구 호출-결과 상관관계 오류인지 판정한다.
+
+    예외 문자열에 400이 있다는 사실만으로는 원인이 되지 못한다. 문맥 길이 초과와
+    파라미터 오류도 같은 상태 코드를 쓰므로, 그런 실패까지 도구 프로토콜 제거로
+    처리하면 근거 없이 대화의 도구 이력을 지운다.
+    """
+    text = str(error).lower()
+    return any(marker in text for marker in TOOL_CORRELATION_ERROR_MARKERS)
+
+
+def flatten_tool_protocol(messages: list) -> list:
+    """도구 프로토콜을 지운 payload.
+
+    로컬 검증을 통과한 payload에도 서버가 상관관계 오류를 낼 때 남는 마지막
+    수단이다. 결과 본문은 user 메시지로 옮겨 정보를 잃지 않는다.
+    """
+    flattened = []
+    for message in messages:
+        role = _msg_role(message)
+        if role == "tool":
+            flattened.append({
+                "role": "user",
+                "content": "[도구 실행 결과: {0}]\n{1}".format(
+                    _msg_name(message), _msg_content(message)
+                ),
+            })
+        elif role == "assistant" and _msg_tool_calls(message):
+            flattened.append({
+                "role": "assistant",
+                "content": _msg_content(message) or "[도구 실행 지시]",
+            })
+        else:
+            flattened.append(message)
+    return flattened
 
 # --- Workspace Skills & Reusable Tools Architecture ---
 
@@ -1161,7 +1422,151 @@ def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = 
 
     return messages[:boundary], messages[boundary:]
 
-async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, session_file: str = "", ledger=None, token=None):
+
+# --- Durable run state boundaries (issue #6) ---
+
+# ponytail: tail은 메시지 12개·메시지당 2000자로 자른다. 복원한 런은 그보다
+# 오래된 도구 결과 원문을 다시 보지 못하고 누적 요약만 본다. 더 긴 tail이
+# 필요하다면 상한을 올리기 전에 요약 품질을 먼저 봐야 한다.
+SNAPSHOT_TAIL_MESSAGES = 12
+SNAPSHOT_TAIL_CHARS = 2000
+
+
+def _tool_call_id(call):
+    if isinstance(call, dict):
+        return call.get("id")
+    return getattr(call, "id", None)
+
+
+def _snapshot_message(message) -> dict:
+    """Reduce one payload message to a bounded JSON-safe record."""
+    record = {"role": _msg_role(message)}
+    raw = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    # assistant 도구 지시는 content가 의도적으로 None이다. 빈 문자열로 바꾸면
+    # 같은 메시지가 다른 종류가 된다.
+    record["content"] = (
+        None if raw is None else _clip_summary_text(str(raw), SNAPSHOT_TAIL_CHARS)
+    )
+    for key in ("name", "tool_call_id"):
+        value = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
+        if value:
+            record[key] = str(value)
+    calls = _msg_tool_calls(message)
+    if calls:
+        record["tool_calls"] = []
+        for call in calls:
+            function = (call.get("function") or {}) if isinstance(call, dict) else {}
+            record["tool_calls"].append({
+                "id": str(_tool_call_id(call) or ""),
+                "type": "function",
+                "function": {
+                    "name": str(function.get("name") or "tool"),
+                    "arguments": _clip_summary_text(
+                        str(function.get("arguments") or ""), SNAPSHOT_TAIL_CHARS
+                    ),
+                },
+            })
+    return record
+
+
+def snapshot_tail(messages: list, max_messages: int = None) -> list:
+    """Bounded tail that only ever holds whole assistant/tool groups.
+
+    A save boundary must never cut across a parallel call/result group. Results
+    without their instruction are rejected by the chat template, and an
+    instruction without its results would make a resumed run dispatch tool calls
+    whose side effects already happened - so either half is dropped with the
+    other.
+    """
+    if max_messages is None:
+        max_messages = SNAPSHOT_TAIL_MESSAGES
+    # 0번 system 메시지는 매 스텝 원장과 요약으로 새로 만들어지므로 저장하지 않는다.
+    tail = [message for message in messages if _msg_role(message) != "system"]
+    tail = tail[-max_messages:]
+    while tail and _msg_role(tail[0]) == "tool":
+        tail.pop(0)
+    for index in range(len(tail) - 1, -1, -1):
+        calls = _msg_tool_calls(tail[index])
+        if not calls:
+            continue
+        settled = {
+            (item.get("tool_call_id") if isinstance(item, dict) else None)
+            for item in tail[index + 1:]
+            if _msg_role(item) == "tool"
+        }
+        if any(_tool_call_id(call) not in settled for call in calls):
+            tail = tail[:index]
+        # 결과가 붙지 않은 그룹은 마지막 그룹뿐이다. 그 앞의 그룹들은 다음 지시가
+        # 실리기 전에 결과가 모두 채워졌다.
+        break
+    return [_snapshot_message(message) for message in tail]
+
+
+def recover_interrupted_runs() -> dict:
+    """Settle every unterminated record once, at startup.
+
+    Each one either becomes the selection the channel's next goal consumes - so
+    the same run id continues at its next cursor - or gets exactly one explicit
+    abort. There is deliberately no third path: silently falling back to Step 1
+    is what made a restart indistinguishable from a new request (issue #6).
+    """
+    aborted = 0
+
+    def abort(workspace, reason):
+        run_state.discard(workspace)
+        log_session_event(workspace, "run_abort", status="aborted", reason=reason)
+
+    candidates = {}
+    for workspace in RUN_CATALOG.workspaces():
+        record = run_state.load(workspace)
+        if record is None:
+            # 읽을 수 없거나 스키마가 다른 레코드는 마이그레이션하지 않고 버린다.
+            # 남겨 두면 시작마다 같은 abort를 다시 남긴다.
+            if run_state.discard(workspace):
+                log_session_event(
+                    workspace, "run_abort", status="aborted", reason="unusable_record"
+                )
+                aborted += 1
+            continue
+        if record["state"] != run_state.RUNNING:
+            # 종료 이벤트를 남긴 런이다. 명시적 !resume 대상으로는 남지만 자동
+            # 복구 대상은 아니다.
+            continue
+        key = (workspace.owner_id, workspace.channel_id)
+        previous = candidates.get(key)
+        if previous is None:
+            candidates[key] = (workspace, record)
+            continue
+        # 한 채널은 한 번에 하나만 이어갈 수 있다. 최신 레코드가 이기고, 밀린
+        # 쪽은 조용히 남지 않고 abort로 종결된다.
+        stale, winner = previous, (workspace, record)
+        if str(previous[1].get("updated_at", "")) > str(record.get("updated_at", "")):
+            stale, winner = winner, previous
+        abort(stale[0], "superseded_by_newer_run")
+        aborted += 1
+        candidates[key] = winner
+
+    recovered = 0
+    for workspace, record in candidates.values():
+        try:
+            RUN_CATALOG.resume(workspace.owner_id, workspace.channel_id, workspace.run_id)
+        except (RunNotFoundError, RunActiveError):
+            abort(workspace, "not_resumable")
+            aborted += 1
+            continue
+        log_session_event(
+            workspace,
+            "run_resume_armed",
+            step=record["next_step"],
+            next_step=record["next_step"],
+            tail_msgs=len(record["tail"]),
+            calls=len(record["executed_call_ids"]),
+        )
+        recovered += 1
+    return {"recovered": recovered, "aborted": aborted}
+
+
+async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, ledger=None, token=None):
     """Summarize old steps and replace the live payload with a bounded tail."""
     if token is not None:
         token.raise_if_cancelled()
@@ -1174,13 +1579,7 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         # Nothing new to fold in. Asking the model to rewrite the summary from
         # material it already covers is how a summary silently reverts to an
         # older state, so record a no-op instead.
-        if session_file:
-            log_session_event(
-                session_file,
-                f"⏭️ [Step {step_num} 롤링 압축 no-op]",
-                "압축할 새 실행 기록이 없어 요약을 갱신하지 않고 건너뜁니다.",
-            )
-        print(f"[Rolling Compaction Skipped at Step {step_num}] no new source content", flush=True)
+        log_session_event(workspace, "rollover_skipped", step=step_num, reason="no_new_source")
         return messages, existing_summary
 
     state_block = ledger.render() if ledger is not None else ""
@@ -1241,9 +1640,16 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         # Rollover is an optimization: the original source is still available,
         # so a bounded timeout can safely use deterministic local compaction.
         validation_notes_prefix = str(compaction_timeout)
-        print(f"[Rolling Compaction Timeout at Step {step_num}]: {compaction_timeout}", flush=True)
+        log_session_event(
+            workspace, "rollover_timeout", step=step_num, stage=compaction_timeout.stage
+        )
     except Exception as compaction_error:
-        print(f"[Rolling Compaction Summary Error at Step {step_num}]: {compaction_error}", flush=True)
+        log_session_event(
+            workspace,
+            "rollover_error",
+            step=step_num,
+            error=type(compaction_error).__name__,
+        )
 
     validation_notes = [validation_notes_prefix] if validation_notes_prefix else []
     if new_summary and existing_summary and new_summary == existing_summary.strip():
@@ -1284,28 +1690,40 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         },
     ]
     replaced_messages.extend(recent_messages)
-    replaced_messages = sanitize_messages_for_chat_template(replaced_messages)
+    replaced_messages = validate_chat_payload(replaced_messages).messages
 
     before_chars = sum(len(_msg_content(msg)) for msg in messages)
     after_chars = sum(len(_msg_content(msg)) for msg in replaced_messages)
-    compaction_record = (
-        f"메시지: {len(messages)} -> {len(replaced_messages)}\n"
-        f"내용 문자: {before_chars} -> {after_chars}\n"
-        f"최근 도구 메시지 보존: {KEEP_RECENT_TOOL_MESSAGES}\n"
-        f"요약 검증: {'; '.join(validation_notes) if validation_notes else '통과'}\n\n"
-        f"{new_summary}"
+    log_session_event(
+        workspace,
+        "rollover",
+        step=step_num,
+        msgs_before=len(messages),
+        msgs_after=len(replaced_messages),
+        chars_before=before_chars,
+        chars_after=after_chars,
+        kept_tool_msgs=KEEP_RECENT_TOOL_MESSAGES,
+        summary_chars=len(new_summary),
+        validation="; ".join(validation_notes) if validation_notes else "pass",
     )
-    if session_file:
-        log_session_event(session_file, f"🧹 [Step {step_num} 롤링 컨텍스트 교체]", compaction_record)
-    print(
-        f"[Rolling Compaction at Step {step_num}] messages {len(messages)}->{len(replaced_messages)}, "
-        f"chars {before_chars}->{after_chars}"
-        + (f", validation: {'; '.join(validation_notes)}" if validation_notes else ""),
-        flush=True,
-    )
+    # 압축된 요약 본문은 명시적 opt-in 싱크에만 남는다. 기본 배포에서는 이 줄이
+    # 아무것도 쓰지 않는다.
+    log_content_debug(workspace, "rollover_summary", new_summary, step=step_num)
     return replaced_messages, new_summary
 
 # --- User's Streaming Completion Collector ---
+
+# 대체 id는 completion 하나가 아니라 대화 전체에서 유일해야 한다. completion마다
+# 0으로 되돌아가는 카운터는 서로 다른 스텝에서 같은 call_stream_0을 만들고, 그
+# 둘이 한 payload에 같이 실리면 tool_call_id가 중복된다.
+_fallback_call_serial = 0
+
+
+def _next_fallback_call_id() -> str:
+    global _fallback_call_serial
+    _fallback_call_serial += 1
+    return "call_stream_{0}".format(_fallback_call_serial)
+
 
 async def run_completion_stage(token=None, stage="agent", deadline=None, **kwargs):
     """Run any completion implementation under the stage's total budget.
@@ -1349,7 +1767,9 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
     stream = await client.chat.completions.create(stream=True, **kwargs)
     content_parts = []
     reasoning_parts = []
-    tool_buffers = {}
+    tool_buffers = []
+    buffers_by_index = {}
+    current = None
 
     async for chunk in stream_chunks(stream, stage, CONFIG.idle_timeout, token):
         choices = getattr(chunk, "choices", None) or []
@@ -1373,31 +1793,55 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
 
         for partial in getattr(delta, "tool_calls", None) or []:
             index = getattr(partial, "index", None)
-            if index is None:
-                index = len(tool_buffers)
-            buf = tool_buffers.setdefault(
-                index, {"id": "", "name": "", "arguments": ""}
-            )
             call_id = getattr(partial, "id", None)
-            if call_id:
-                buf["id"] = call_id
             function = getattr(partial, "function", None)
-            if function is not None:
-                name = getattr(function, "name", None)
-                arguments = getattr(function, "arguments", None)
-                if name:
-                    buf["name"] += name
-                if arguments:
-                    buf["arguments"] += (
-                        arguments if isinstance(arguments, str) else str(arguments)
-                    )
+            name = getattr(function, "name", None) if function is not None else None
+            arguments = getattr(function, "arguments", None) if function is not None else None
+
+            if index is not None:
+                # int 0과 "0"을 같은 호출로 본다. 정렬 대신 도착 순서를 유지하므로
+                # 백엔드가 두 표기를 섞어도 순서 비교가 필요 없다.
+                buf = buffers_by_index.get(str(index))
+                if buf is None:
+                    buf = {"id": "", "name": "", "arguments": ""}
+                    buffers_by_index[str(index)] = buf
+                    tool_buffers.append(buf)
+                current = buf
+            elif current is None or (call_id and name):
+                # ponytail: index 없는 스트림의 호출 경계는 "id와 이름을 함께 들고
+                # 온 조각이 새 호출"이라는 규칙 하나로만 잡는다(천장). id와 이름을
+                # 서로 다른 조각으로 나눠 보내는 백엔드는 앞 호출에 병합되고, 그
+                # 결과는 인자 파싱에서 걸려 실행 전에 거부된다. 그런 백엔드가
+                # 생기면 index를 요구하는 쪽으로 올린다.
+                current = {"id": "", "name": "", "arguments": ""}
+                tool_buffers.append(current)
+
+            # 조각난 id는 이어 붙여야 한다. 매 조각에 전체 id를 다시 보내는
+            # 백엔드에서 같은 값을 두 번 붙이지 않도록 꼬리 중복만 건너뛴다.
+            if call_id and not current["id"].endswith(call_id):
+                current["id"] += call_id
+            if name:
+                current["name"] += name
+            if arguments:
+                current["arguments"] += (
+                    arguments if isinstance(arguments, str) else str(arguments)
+                )
 
     tool_calls = []
-    for index in sorted(tool_buffers):
-        buf = tool_buffers[index]
+    for buf in tool_buffers:
+        if not buf["name"]:
+            # 이름 없는 버퍼는 재구성 실패다. 어떤 도구를 부르려 했는지 알 수 없어
+            # 모델에 돌려줄 정정 근거도 없으므로 도구 실행 전에 거부한다.
+            # (파싱 불가한 인자는 호출 직전 argument_error 경로가 이미 거부한다.)
+            print(
+                "[Streaming tool call refused: 이름 없는 조각]",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         tool_calls.append(
             SimpleNamespace(
-                id=buf["id"] or f"call_stream_{index}",
+                id=buf["id"] or _next_fallback_call_id(),
                 function=SimpleNamespace(
                     name=buf["name"], arguments=buf["arguments"]
                 ),
@@ -1546,26 +1990,28 @@ def format_full_discord_output(text: str) -> str:
 
     think_match = re.search(r"<think>(.*?)(?:</think>|$)", t, flags=re.DOTALL)
     if think_match:
-        think_content = think_match.group(1).strip()
-        regular_content = t.split("</think>")[-1].strip() if "</think>" in t else ""
-        regular_content = re.sub(r"</?(function|parameter|tool_call)[^>]*>", "", regular_content).strip()
-
-        if think_content and regular_content:
-            return f"### 💭 **[심층 추론 과정 (Thinking - High)]**\n```text\n{think_content}\n```\n\n### 📝 **[최종 답변]**\n{regular_content}"
-        elif think_content and not regular_content:
-            return f"### 💭 **[심층 추론 및 분석 내용 (Thinking - High)]**\n```text\n{think_content}\n```"
-        elif regular_content:
-            return regular_content
+        # 추론 원문은 채널로 나가지 않는다. 여기서 렌더링하면 로그를 정리해도
+        # 같은 내용이 디스코드에 그대로 남는다(이슈 #11).
+        thought_chars = len(think_match.group(1).strip())
+        t = re.sub(r"<think>.*?(?:</think>|$)", "", t, flags=re.DOTALL).strip()
+        t = re.sub(r"</?(function|parameter|tool_call)[^>]*>", "", t, flags=re.DOTALL).strip()
+        if not t:
+            # 추론만 나온 응답. 원문 대신 제한된 상태 표현으로 진행 상황을 알린다.
+            return (
+                f"🧠 **[내부 추론만 반환됨]** 공개할 본문이 없습니다 (추론 {thought_chars}자). "
+                "다시 요청하거나 목표를 더 구체적으로 지정해 주세요."
+            )
 
     return t.strip()
 
 @bot.event
 async def on_ready():
-    print(f"[Discord LLM Bot] Logged in as {bot.user} (ID: {bot.user.id})", flush=True)
-    print(
-        f"[Discord LLM Bot] Ready in Auto-Extension Goal-Driven Mode! "
-        f"Run root: {RUN_CATALOG.runs_root}",
-        flush=True,
+    log_session_event(
+        None,
+        "ready",
+        user=str(bot.user),
+        user_id=getattr(bot.user, "id", None),
+        run_root=str(RUN_CATALOG.runs_root),
     )
     await bot.change_presence(activity=discord.Game(name="Qwen 27B + Auto-Extension"), status=discord.Status.online)
 
@@ -1573,10 +2019,14 @@ async def on_ready():
 # 슬래시 명령도 텍스트 명령과 동일한 정책 경로(authorize_caller)를 사용한다.
 
 async def deny_interaction(interaction: discord.Interaction, action: str, decision) -> None:
-    print(
-        f"[Access Denied] user={getattr(interaction.user, 'id', None)} "
-        f"channel={interaction.channel_id} action={action} reason={decision.reason}",
-        flush=True,
+    log_session_event(
+        None,
+        "access_denied",
+        action=action,
+        reason=decision.reason,
+        user=getattr(interaction.user, "id", None),
+        channel=interaction.channel_id,
+        via="slash",
     )
     # DENY_ACCESS_MESSAGE already carries the ⛔ marker; the per-decision reasons do
     # not. Prefixing both, as this used to, double-marked every access denial. The
@@ -1783,10 +2233,14 @@ async def on_message(message: discord.Message):
     caller_id = getattr(message.author, "id", None)
     access = authorize_caller(authz.ACCESS, caller_id, channel_id=message.channel.id)
     if not access:
-        print(
-            f"[Access Denied] user={caller_id} channel={message.channel.id} action=access "
-            f"reason={access.reason}",
-            flush=True,
+        log_session_event(
+            None,
+            "access_denied",
+            action=authz.ACCESS,
+            reason=access.reason,
+            user=caller_id,
+            channel=message.channel.id,
+            via="text",
         )
         await message.reply(authz.DENY_ACCESS_MESSAGE)
         return
@@ -1866,9 +2320,14 @@ async def on_message(message: discord.Message):
             caller_can_manage_messages=caller_can_manage_messages(message.channel, message.author),
         )
         if not purge:
-            print(
-                f"[Purge Denied] user={caller_id} channel={message.channel.id} reason={purge.reason}",
-                flush=True,
+            log_session_event(
+                None,
+                "access_denied",
+                action=authz.PURGE,
+                reason=purge.reason,
+                user=caller_id,
+                channel=message.channel.id,
+                via="text",
             )
             await message.reply(f"⛔ {purge.reason}")
             return
@@ -1886,7 +2345,9 @@ async def on_message(message: discord.Message):
             await message.reply("An active run must stop before clear.")
             return
 
-        print(f"[Clear Command]: Purging {amount} messages in channel {message.channel.id}", flush=True)
+        log_session_event(
+            None, "purge_requested", channel=message.channel.id, count=amount
+        )
 
         # 삭제를 먼저 시도하고, 성공한 뒤에만 대화 상태를 지운다. 예전에는 순서가
         # 반대여서 권한이 없어 삭제가 실패해도 기록은 이미 사라져 있었다.
@@ -1927,26 +2388,46 @@ async def on_message(message: discord.Message):
 
     # [실시간 동적 개입 큐 주입]
     if channel_active_runs[message.channel.id]:
-        steering = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
-        if not steering:
-            await message.reply(f"⛔ {steering.reason}")
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
             return
         active_lease = next(
             candidate
             for candidate in reversed(channel_run_leases[message.channel.id])
             if candidate["active"]
         )
-        session_file = active_lease["workspace"].log_path
-        active_lease["steering"].append((str(message.author), content))
-        log_session_event(session_file, f"💬 [사용자 실시간 중간 개입] {message.author}", content)
-        print(f"[Mid-Flight User Steering Queued from {message.author}]: {content}", flush=True)
+        mailbox = active_lease["steering"]
+        steering_workspace = active_lease["workspace"]
+        receipt = mailbox.offer(str(message.author), content)
+        # 지시 본문은 세지기만 한다. 이 줄이 원문을 실었던 것이 로그에 사용자
+        # 텍스트가 쌓인 경로였다(이슈 #11).
+        log_session_event(
+            steering_workspace,
+            "steering_received",
+            status=receipt.state,
+            reason=receipt.reason or None,
+            depth=receipt.depth,
+            chars=len(content),
+        )
+        log_content_debug(steering_workspace, "steering_text", content)
+        # 큐 관측은 내용 없이 남긴다. 깊이와 접수/적용 시각만으로도 반영 지연을
+        # 판별할 수 있고, 지시 본문은 이 줄에 들어가지 않는다.
+        log_session_event(
+            steering_workspace, "steering_queue", queue=mailbox.stats()
+        )
+
+        if not receipt.accepted:
+            # 미적용 안내는 자동 삭제하지 않는다. 사용자가 반드시 봐야 한다.
+            await message.reply(steering_receipt_notice(receipt, content))
+            return
 
         try:
             await message.add_reaction("📥")
         except Exception:
             pass
 
-        notice = await message.reply(f"📥 **[실시간 개입 수신]** 실행 중인 에이전트의 다음 스텝에 지시사항이 즉시 반영됩니다:\n> 💬 *\"{content[:120]}\"*")
+        notice = await message.reply(steering_receipt_notice(receipt, content))
         asyncio.create_task(_auto_delete_notice(notice, delay=6))
         return
 
@@ -1959,13 +2440,25 @@ async def on_message(message: discord.Message):
             "A reset/clear operation is in progress; retry this goal."
         )
         return
-    session_file = workspace.log_path
+    # 재시작 전에 남은 durable 레코드. 있으면 이 런은 같은 런 id로 다음 커서에서
+    # 이어간다. 신규 런에는 레코드가 없으므로 평소처럼 Step 1부터다.
+    restored = run_state.load(workspace)
+    resume_from = restored["next_step"] if restored is not None else 1
+    same_origin = (
+        restored is not None
+        and restored.get("message_id") == getattr(message, "id", None)
+    )
+    # 승인과 메일박스를 한 턴에 함께 소유한다. 이 지점부터 첫 await까지 사이가
+    # 없으므로 같은 채널의 다음 메시지는 언제나 steering으로 판정된다. 실패 시
+    # 아래 status 응답 실패 경로의 release_run()이 승인을 되돌린다.
     lease = {
         "token": token,
         "owner": caller_id,
-        "active": False,
+        "active": True,
         "workspace": workspace,
-        "steering": [],
+        "steering": steering_mod.SteeringMailbox(
+            workspace.run_id, max_depth=STEERING_QUEUE_MAX
+        ),
     }
     channel_run_leases[message.channel.id].append(lease)
 
@@ -1992,13 +2485,64 @@ async def on_message(message: discord.Message):
 
     publish_run_control()
 
+    # 종료 사유는 런 하나당 하나다. 직접 답변 빠른 경로도 같은 것을 쓴다.
+    # 예전에는 그 경로만 RunOutcome을 만들지 않아, 사유를 남기지 않는 유일한
+    # 종료 경로였다.
+    outcome = RunOutcome()
+    total_tools_executed = 0
+    current_step = 0
+    # 이미 실행한 호출 식별자. 재시작 뒤 모델이 같은 호출을 다시 요청해도 부작용을
+    # 두 번 일으키지 않는다.
+    executed_call_ids = list(restored["executed_call_ids"]) if restored is not None else []
+    run_end_logged = False
     released = False
+
+    def log_run_end(run_outcome, status=None, abnormal=False, **fields):
+        """종료 이벤트를 정확히 한 번 남긴다.
+
+        정상 성공·강제 종료·예외 전 중단을 사후에 구분할 수 있어야 하므로 모든
+        종료 경로가 이 하나를 지난다. 멱등이라 상세를 아는 경로가 먼저 부르고
+        release_run()이 뒤에서 다시 불러도 두 번 남지 않는다.
+
+        `status`는 예외 경로 때문에 따로 받는다. settle()은 선착순이라 이미
+        완료로 확정된 런이 전달 실패로 끝나면 reason이 completed로 남지만, 그
+        경로는 완료된 조사를 전달하지 못했으므로 종료 기록은 실패여야 한다.
+        """
+        nonlocal run_end_logged
+        if run_end_logged:
+            return
+        run_end_logged = True
+        ignored = [
+            f"{reason}:{detail}" for reason, detail in run_outcome.ignored_attempts
+        ]
+        log_session_event(
+            workspace,
+            "run_end",
+            step=current_step,
+            status=status or run_outcome.reason or outcome_mod.FAILED,
+            duration_ms=int((time.time() - start_time) * 1000),
+            detail=run_outcome.detail or "-",
+            abnormal=bool(abnormal),
+            tools=total_tools_executed,
+            # 선착순에 밀린 종료 시도는 지금까지 기록되지 않았다. 완료 뒤에 온
+            # 실패가 어떤 것이었는지는 이 필드에만 남는다.
+            ignored_settles=ignored or None,
+            **fields,
+        )
 
     def release_run(status="interrupted"):
         nonlocal released
         if released:
             return
         released = True
+        # 종료 기록의 최후 보장. 상세를 아는 경로가 이미 남겼으면 무시된다.
+        log_run_end(outcome)
+        # 런이 끝나면 반영할 스텝도 없다. 남은 항목을 여기서 종결시켜야 어떤
+        # 항목도 상태 없이 남지 않는다(정상 경로는 루프 직후에 이미 닫는다).
+        lease["steering"].close(steering_mod.CANCELLED)
+        # 종료한 런은 자동 복구 대상이 아니다. 레코드 자체는 남겨 명시적 !resume은
+        # 계속 가능하게 하고, 삭제는 !reset/!clear/!delete가 맡는다.
+        run_state.terminate(workspace, status)
         try:
             RUN_CATALOG.finish(workspace, status)
         finally:
@@ -2016,9 +2560,44 @@ async def on_message(message: discord.Message):
         await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
-    
-    log_session_event(session_file, f"👤 [사용자 목표 요청] {message.author}", content)
-    print(f"[Goal Request from {message.author}]: {content}", flush=True)
+
+    wants_short_answer = wants_direct_response(content)
+    if restored is not None:
+        # 이어갈 런이 있으면 단문 빠른 경로로 빠지지 않는다. 그 경로는 즉시
+        # 종료하므로, 복구한 런을 조용히 버리는 것과 같다.
+        wants_short_answer = False
+    log_session_event(
+        workspace,
+        "run_start",
+        goal_chars=len(content),
+        direct=wants_short_answer,
+        effort=channel_reasoning[message.channel.id],
+    )
+    log_content_debug(workspace, "user_goal", content)
+
+    if restored is not None:
+        # 재개는 조용히 일어나지 않는다. 이 레코드가 없으면 Step 기록만으로는
+        # 재시작 때문인지 새 요청 때문인지 구분할 수 없다.
+        log_session_event(
+            workspace,
+            "run_resumed",
+            step=resume_from,
+            next_step=resume_from,
+            same_origin=same_origin,
+            tail_msgs=len(restored["tail"]),
+            calls=len(executed_call_ids),
+            summary_chars=len(restored["summary"]),
+        )
+        # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
+        channel_summary[message.channel.id] = restored["summary"]
+        channel_ledger[message.channel.id] = restored["ledger"]
+        try:
+            await message.channel.send(
+                f"▶️ **[중단된 실행 재개]** run `{workspace.run_id}`을 Step {resume_from}에서 "
+                f"이어갑니다. 이미 실행한 도구 {len(executed_call_ids)}건은 다시 실행하지 않습니다."
+            )
+        except Exception:
+            pass
 
     history = channel_history[message.channel.id]
     history.append({"role": "user", "content": content})
@@ -2031,12 +2610,18 @@ async def on_message(message: discord.Message):
             role_label = "사용자" if msg_item["role"] == "user" else "AI"
             snippet = msg_item["content"][:150].replace("\n", " ")
             summary_snippets.append(f"{role_label}: {snippet}")
-        channel_summary[message.channel.id] = "이전 대화 요약: " + " | ".join(summary_snippets[-8:])
+        # 병합이지 교체가 아니다. 예전의 `=`는 계층 요약과 그 안에 실린 상태
+        # 마커를 스니펫으로 덮어써서, 복원한 요약이 첫 긴 대화에서 사라졌다.
+        channel_summary[message.channel.id] = update_hierarchical_summary(
+            existing_summary=channel_summary[message.channel.id],
+            new_recent_summary="이전 대화 요약: " + " | ".join(summary_snippets[-8:]),
+            step_range="대화 이력 초과분",
+        )
         channel_history[message.channel.id] = recent_turns
         history = recent_turns
 
     direct_call_failed = False
-    if wants_direct_response(content):
+    if wants_short_answer:
         try:
             direct_resp = await run_completion_stage(
                 token=token,
@@ -2051,41 +2636,39 @@ async def on_message(message: discord.Message):
             direct_text = direct_resp.choices[0].message.content or ""
             direct_text = clean_direct_response(direct_text)
         except RunCancelled as direct_cancelled:
-            direct_outcome = RunOutcome()
-            direct_outcome.settle(outcome_mod.STOPPED, direct_cancelled.reason)
+            outcome.settle(outcome_mod.STOPPED, direct_cancelled.reason)
             direct_report = build_incomplete_report(
-                direct_outcome,
+                outcome,
                 channel_ledger[message.channel.id],
                 channel_summary[message.channel.id],
                 history,
             )
             try:
                 await send_reply_chunks(
-                    f"**{direct_outcome.label}**\n\n{direct_report}",
+                    f"**{outcome.label}**\n\n{direct_report}",
                     local_fallback=True,
                 )
-                log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
+                log_run_end(outcome, phase="direct")
             finally:
                 release_run("stopped")
             return
         except StageTimeout as direct_timeout:
-            direct_outcome = RunOutcome()
-            direct_outcome.settle(
+            outcome.settle(
                 outcome_mod.FAILED,
                 f"마감 초과: {direct_timeout.stage} {direct_timeout.seconds:g}s",
             )
             direct_report = build_incomplete_report(
-                direct_outcome,
+                outcome,
                 channel_ledger[message.channel.id],
                 channel_summary[message.channel.id],
                 history,
             )
             try:
                 await send_reply_chunks(
-                    f"**{direct_outcome.label}**\n\n{direct_report}",
+                    f"**{outcome.label}**\n\n{direct_report}",
                     local_fallback=True,
                 )
-                log_session_event(session_file, f"🏁 [런 종료: {direct_outcome.describe()}]", direct_report)
+                log_run_end(outcome, phase="direct")
             finally:
                 release_run("failed")
             return
@@ -2094,14 +2677,25 @@ async def on_message(message: discord.Message):
             raise
         except Exception as direct_error:
             direct_call_failed = True
-            print(f"[Direct Reply Fallback]: {direct_error}", file=sys.stderr, flush=True)
+            log_session_event(
+                workspace,
+                "direct_fallback",
+                status="error",
+                error=type(direct_error).__name__,
+            )
         else:
             if direct_text:
                 try:
                     await send_reply_chunks(direct_text)
                     history.append({"role": "assistant", "content": direct_text})
-                    log_session_event(session_file, "💬 [간단 답변 완료]", direct_text)
-                    print(f"[Direct Reply to {message.author} finished]: {len(direct_text)} chars", flush=True)
+                    # 이 경로는 종료 사유 없이 stdout 한 줄만 남기고 돌아갔다.
+                    # 사유를 갖는 종료 기록을 남기는 유일한 방법은 다른 경로와
+                    # 같은 outcome을 확정하는 것이다.
+                    outcome.settle(
+                        outcome_mod.COMPLETED, outcome_mod.DETAIL_DIRECT_ANSWER
+                    )
+                    log_run_end(outcome, phase="direct", chars=len(direct_text))
+                    log_content_debug(workspace, "direct_answer", direct_text)
                 except asyncio.CancelledError:
                     release_run("interrupted")
                     raise
@@ -2120,19 +2714,133 @@ async def on_message(message: discord.Message):
     messages_payload = [
         {"role": "system", "content": build_system_content(workspace, ledger, rolling_summary)}
     ]
-    messages_payload.extend(history)
-    messages_payload = sanitize_messages_for_chat_template(messages_payload)
+    if restored is not None:
+        # 복원한 tail은 완결된 그룹만 담으므로 그대로 이어 붙일 수 있다. 이전 대화
+        # 턴까지 다시 붙이지는 않는다: tail과 누적 요약이 이미 담고 있어 같은 맥락이
+        # 두 번 실린다.
+        messages_payload.extend(restored["tail"])
+        if not same_origin:
+            # 같은 원본 메시지가 다시 배달된 경우 목표는 이미 tail 안에 있다.
+            messages_payload.append(history[-1])
+    else:
+        messages_payload.extend(history)
+    messages_payload = validate_chat_payload(messages_payload).messages
 
     current_effort = channel_reasoning[message.channel.id]
+
+    def save_snapshot(next_step, reason):
+        """완결된 그룹 경계에서만 부르는 원자적 durable 저장.
+
+        원자적 교체이므로 중단이 파일을 자를 수 없고, tail은 항상 완결된
+        assistant/tool 그룹만 담는다(snapshot_tail이 구조적으로 보장한다).
+        """
+        tail = snapshot_tail(messages_payload)
+        try:
+            run_state.save(
+                workspace,
+                message_id=getattr(message, "id", None),
+                next_step=next_step,
+                summary=rolling_summary,
+                tail=tail,
+                ledger=ledger,
+                interrupt={
+                    "cancelled": bool(token.cancelled),
+                    "reason": token.reason or "",
+                    "steering": lease["steering"].stats(),
+                },
+                executed_call_ids=executed_call_ids,
+            )
+        except OSError as snapshot_error:
+            # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
+            # 이 시점 이후 이 런은 복구 불가능하다는 뜻이다.
+            log_session_event(
+                workspace,
+                "snapshot_failed",
+                step=current_step,
+                reason=reason,
+                error=type(snapshot_error).__name__,
+            )
+            return
+        log_session_event(
+            workspace,
+            "snapshot",
+            step=current_step,
+            reason=reason,
+            next_step=next_step,
+            tail_msgs=len(tail),
+            summary_chars=len(rolling_summary),
+            calls=len(executed_call_ids),
+        )
+
+    # 여기부터 에이전트 루프가 보장되므로 지시를 받는다. 직접 답변 런은 이 지점에
+    # 오지 않으므로 큐가 닫힌 상태로 남고, 반영할 스텝이 없다는 사실이 접수
+    # 단계에서 그대로 통지된다.
+    lease["steering"].open()
+    # 첫 모델 호출 전에 레코드를 남긴다. 이것이 없으면 첫 스텝에서 죽은 런은
+    # 흔적 없이 사라지고, 다음 요청이 조용히 Step 1을 다시 낸다.
+    save_snapshot(resume_from, "run_start")
     try:
         status_msg = await message.reply(f"🚀 **[완전자율 목표 달성 모드]** 모델 초기 추론 및 작업 공간 가동 중... (실시간 지시/개입 가능 / 중단: `!stop`)")
     except BaseException:
         release_run()
         raise
-    lease["active"] = True
-    publish_run_control()
 
-    total_tools_executed = 0
+    def apply_steering(step_num: int):
+        """대기 중인 지시를 도착 순서대로 흡수한다.
+
+        루프 머리에서만 소비하면 스텝 하나가 긴 동안 접수된 지시가 모델 호출과
+        도구 실행을 모두 기다린다. 도구 결과 직후에도 불러서 체크포인트·롤오버
+        모델 단계까지 기다리지 않게 한다.
+        """
+        applied = lease["steering"].drain()
+        for item in applied:
+            steering_block = {
+                "role": "user",
+                "content": f"💬 [사용자({item.author}) 실시간 추가 지침/피드백]:\n{item.text}\n\n(이 지침을 바탕으로 현재 작업 방향을 적절히 조정하거나, 요청받은 내용을 우선 처리하세요.)"
+            }
+            messages_payload.append(steering_block)
+            history.append(steering_block)
+            log_session_event(
+                workspace,
+                "steering_applied",
+                step=step_num,
+                chars=len(item.text),
+                waited_ms=int(max(0.0, time.time() - item.received_at) * 1000),
+            )
+        if applied:
+            log_session_event(
+                workspace,
+                "steering_queue",
+                step=step_num,
+                queue=lease["steering"].stats(),
+            )
+        return applied
+
+    async def close_steering():
+        """종료 단계에 들어갈 때 큐를 닫고 미적용 사실을 알린다.
+
+        닫은 뒤 도착하는 지시는 접수 시점에 거절되고, 이미 대기 중이던 항목은
+        여기서 취소로 종결된다. 예전에는 이 구간에서도 접수와 "다음 스텝 반영"
+        안내가 나갔지만 소비할 반복이 없어 항목이 조용히 사라졌다.
+        """
+        unapplied = lease["steering"].close(steering_mod.CANCELLED)
+        log_session_event(
+            workspace,
+            "steering_closed",
+            step=current_step,
+            unapplied=len(unapplied),
+            queue=lease["steering"].stats(),
+        )
+        if not unapplied:
+            return
+        try:
+            await message.channel.send(
+                f"📭 **[실시간 개입 미적용]** 대기 중이던 지시 {len(unapplied)}건은 "
+                "런이 종료되어 **적용되지 않았습니다**. 새 목표 요청으로 다시 보내주세요."
+            )
+        except Exception:
+            pass
+
     last_failed_signature = None
     consecutive_failed_tool_calls = 0
 
@@ -2145,21 +2853,28 @@ async def on_message(message: discord.Message):
             messages_payload,
             rolling_summary,
             step_num,
-            session_file=session_file,
             ledger=ledger,
             token=token,
         )
+        # 롤오버는 누적 요약이 바뀌는 유일한 지점이다. 되돌려 쓰지 않으면 이 런의
+        # 모든 롤오버 요약이 함수 종료와 함께 사라지고, 같은 프로세스의 다음
+        # 메시지조차 낡은 요약에서 시작한다.
+        channel_summary[message.channel.id] = rolling_summary
+        save_snapshot(step_num + 1, "rollover")
 
     # 상시 타이핑 하트비트 루프 백그라운드 구동
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing_heartbeat(message.channel, stop_typing))
 
     final_raw = ""
-    outcome = RunOutcome()
     refused_companion_calls = []
     consecutive_no_tool_responses = 0
+    # 업스트림 예외 본문은 사용자에게는 필요하고 로그에는 위험하다. 종료 사유는
+    # 종류만 담아 로그로 가고, 잘라낸 본문은 사용자 보고서에만 붙는다(이슈 #11).
+    stage_failure_note = ""
 
     def settle_stage_failure(error):
+        nonlocal stage_failure_note
         if isinstance(error, RunCancelled):
             outcome.settle(outcome_mod.STOPPED, error.reason)
         elif isinstance(error, StageTimeout):
@@ -2168,37 +2883,32 @@ async def on_message(message: discord.Message):
                 f"마감 초과: {error.stage} {error.seconds:g}s",
             )
         else:
-            failure = _clip_summary_text(
+            stage_failure_note = _clip_summary_text(
                 f"{type(error).__name__}: {error}", 500
             )
             outcome.settle(
                 outcome_mod.FAILED,
-                f"업스트림 실패: {failure}",
+                f"업스트림 실패: {type(error).__name__}",
             )
-        print(f"[Run settled: {outcome.describe()}]", flush=True)
 
     try:
-        for iteration in range(MAX_AGENT_LOOPS):
+        # 다음 커서에서 시작한다. 복원한 런은 Step 1을 다시 내지 않고, 신규 런은
+        # resume_from이 1이라 종전과 같다.
+        for iteration in range(resume_from - 1, MAX_AGENT_LOOPS):
+            current_step = iteration + 1
             if token.cancelled:
                 outcome.settle(outcome_mod.STOPPED, token.reason)
-                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 break
 
             # [실시간 사용자 동적 개입 주입]
-            if lease["steering"]:
-                while lease["steering"]:
-                    q_author, q_text = lease["steering"].pop(0)
-                    steering_block = {
-                        "role": "user",
-                        "content": f"💬 [사용자({q_author}) 실시간 추가 지침/피드백]:\n{q_text}\n\n(이 지침을 바탕으로 현재 작업 방향을 적절히 조정하거나, 요청받은 내용을 우선 처리하세요.)"
-                    }
-                    messages_payload.append(steering_block)
-                    history.append(steering_block)
-                    log_session_event(session_file, f"💬 [Step {iteration+1} 실시간 사용자 지침 주입]", f"[{q_author}] {q_text}")
-                    try:
-                        await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** 💬 **사용자 실시간 지시사항 반영 중...** (*\"{q_text[:60]}...\"*)")
-                    except Exception:
-                        pass
+            applied_steering = apply_steering(iteration + 1)
+            if applied_steering:
+                # 지시 본문은 되돌려 인용하지 않는다. 사용자가 방금 입력한 것이라
+                # 잃는 정보가 없고, 인용하면 채널에 원문이 한 번 더 남는다.
+                try:
+                    await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** 💬 **사용자 실시간 지시사항 {len(applied_steering)}건 반영 중...**")
+                except Exception:
+                    pass
 
             extra_params = {}
             if iteration == 0:
@@ -2214,12 +2924,26 @@ async def on_message(message: discord.Message):
                     "content": build_system_content(workspace, ledger, rolling_summary),
                 }
 
-            compacted_payload = sanitize_messages_for_chat_template(
+            # 구조 결함은 이번 요청만의 문제가 아니다. 복구 결과를 messages_payload에
+            # 되돌려야 다음 스텝이 같은 결함을 다시 만들어 같은 400을 반복하지 않는다.
+            base_verdict = validate_chat_payload(messages_payload)
+            if not base_verdict.ok:
+                messages_payload = base_verdict.messages
+                log_session_event(
+                    workspace,
+                    "payload_repaired",
+                    step=iteration + 1,
+                    defects=list(base_verdict.defects),
+                    fingerprint=_payload_fingerprint(messages_payload),
+                )
+
+            compacted_payload = validate_chat_payload(
                 apply_micro_compaction(
                     messages_payload, preserve_recent_tool_groups=1
                 )
-            )
+            ).messages
             model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
+            model_stage_started = time.monotonic()
 
             try:
                 resp = await run_completion_stage(
@@ -2237,46 +2961,54 @@ async def on_message(message: discord.Message):
                 settle_stage_failure(stage_error)
                 break
             except Exception as api_err:
-                err_str = str(api_err)
-                if "tool_call_id" in err_str or "400" in err_str:
-                    print(f"[API 400 Auto-Recovery Triggered]: {err_str}", flush=True)
-                    sanitized_payload = []
-                    for p_msg in compacted_payload:
-                        if _msg_role(p_msg) == "tool":
-                            sanitized_payload.append({
-                                "role": "user",
-                                "content": f"[도구 실행 결과: {_msg_name(p_msg)}]\n{_msg_content(p_msg)}"
-                            })
-                        elif _msg_role(p_msg) == "assistant" and isinstance(p_msg, dict) and "tool_calls" in p_msg:
-                            sanitized_payload.append({
-                                "role": "assistant",
-                                "content": _msg_content(p_msg) or "[도구 실행 지시]"
-                            })
-                        else:
-                            sanitized_payload.append(p_msg)
-
-                    # Never restart a stage after cancellation.
-                    try:
-                        token.raise_if_cancelled()
-                        resp = await run_completion_stage(
-                            token=token,
-                            stage="agent:retry",
-                            deadline=model_stage_deadline,
-                            model=MODEL_NAME,
-                            messages=sanitize_messages_for_chat_template(sanitized_payload),
-                            max_tokens=1024 if iteration == 0 else 4096,
-                            temperature=0.7,
-                            **agent_tool_params(),
-                            **extra_params
-                        )
-                    except (RunCancelled, StageTimeout) as stage_error:
-                        settle_stage_failure(stage_error)
-                        break
-                    except Exception as retry_error:
-                        settle_stage_failure(retry_error)
-                        break
-                else:
+                # 실패 원인을 구조로 남긴다. 마스킹된 역할/id 시퀀스와 실행 리비전이
+                # 있어야 서버·템플릿 문제와 클라이언트 payload 문제를 구분할 수 있다.
+                correlation = is_tool_correlation_error(api_err)
+                log_session_event(
+                    workspace,
+                    "model_stage_failure",
+                    step=iteration + 1,
+                    revision=ledger.revision,
+                    error=type(api_err).__name__,
+                    failure_class="tool_correlation" if correlation else "other",
+                    cause="client" if base_verdict.defects else "server",
+                    defects=list(base_verdict.defects) or None,
+                    fingerprint=_payload_fingerprint(compacted_payload),
+                )
+                if not correlation:
                     settle_stage_failure(api_err)
+                    break
+
+                # 로컬 검증을 통과한 payload에도 상관관계 오류가 나면 남는 수단은
+                # 도구 프로토콜 제거뿐이다. 이 결과도 messages_payload에 남긴다.
+                messages_payload = flatten_tool_protocol(messages_payload)
+                save_snapshot(iteration + 1, "tool_protocol_recovery")
+                retry_payload = validate_chat_payload(
+                    apply_micro_compaction(
+                        messages_payload, preserve_recent_tool_groups=1
+                    )
+                ).messages
+
+                # Never restart a stage after cancellation.
+                try:
+                    token.raise_if_cancelled()
+                    # 도구 이력을 지운 payload에 도구를 다시 제시하면 모델이 같은
+                    # 오류로 되돌아간다. 재시도는 한 번, 도구 없이 한다.
+                    resp = await run_completion_stage(
+                        token=token,
+                        stage="agent:retry",
+                        deadline=model_stage_deadline,
+                        model=MODEL_NAME,
+                        messages=retry_payload,
+                        max_tokens=1024 if iteration == 0 else 4096,
+                        temperature=0.7,
+                        **extra_params
+                    )
+                except (RunCancelled, StageTimeout) as stage_error:
+                    settle_stage_failure(stage_error)
+                    break
+                except Exception as retry_error:
+                    settle_stage_failure(retry_error)
                     break
 
             # A response completed concurrently with !stop must not enable
@@ -2300,37 +3032,36 @@ async def on_message(message: discord.Message):
             else:
                 full_raw_thought = content_text.strip()
 
-            log_session_event(session_file, f"🤖 [Step {iteration+1} 자율 탐색 내용 & Think]", full_raw_thought or "(도구 호출 지시)")
+            log_session_event(
+                workspace,
+                "model_response",
+                step=iteration + 1,
+                duration_ms=int((time.monotonic() - model_stage_started) * 1000),
+                reasoning_chars=len(reasoning_text),
+                content_chars=len(content_text),
+                tool_calls=len(msg.tool_calls or []),
+                effort=extra_params.get("reasoning_effort", current_effort),
+            )
+            # 추론과 응답 원문은 opt-in 싱크에만 간다. 기본 배포에서는 아무것도
+            # 쓰지 않는다.
+            log_content_debug(
+                workspace, "model_response", full_raw_thought, step=iteration + 1
+            )
 
-            # [실시간 추론 생각(Thinking Trace) 디스코드 카드 라이브 업데이트]
-            thought_snippet = ""
-            if reasoning_text:
-                thought_snippet = reasoning_text.strip()
-            elif "<think>" in content_text:
-                think_match = re.search(r"<think>(.*?)(?:</think>|$)", content_text, flags=re.DOTALL)
-                thought_snippet = think_match.group(1).strip() if think_match else content_text.strip()
-            else:
-                thought_snippet = re.sub(r"</?(function|parameter|tool_call)[^>]*>|<tool_call>.*?</tool_call>", "", content_text, flags=re.DOTALL).strip()
-
-            display_thought = ""
-            if thought_snippet:
-                t_lines = [l.strip() for l in thought_snippet.split("\n") if l.strip()]
-                display_thought = "\n".join(t_lines[-6:]) if len(t_lines) > 6 else thought_snippet
-                if len(display_thought) > 650:
-                    display_thought = display_thought[-650:]
-
-                elapsed_live = format_elapsed_time(time.time() - start_time)
-                status_live_text = (
-                    f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
-                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 실행 도구: `{total_tools_executed}개`)\n"
-                    f"> 🧠 **실시간 추론(`<think>` 최근)**:\n"
-                    f"```text\n💭 {display_thought}\n```\n"
-                    f"> ⚡ *자율 탐색 및 추론 진행 중... (실시간 지시/피드백 가능 / 중단: `!stop`)*"
-                )
-                try:
-                    await status_msg.edit(content=status_live_text)
-                except Exception:
-                    pass
+            # [실시간 진행 상황 디스코드 카드 라이브 업데이트]
+            # 추론 스니펫은 더 이상 싣지 않는다. 로그에서 원문을 지워도 같은
+            # 내용이 채널에 남으면 아무것도 해결되지 않는다(이슈 #11).
+            elapsed_live = format_elapsed_time(time.time() - start_time)
+            status_live_text = (
+                f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
+                f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 실행 도구: `{total_tools_executed}개`)\n"
+                f"> 🧠 **실시간 추론 규모**: 추론 `{len(reasoning_text)}자` / 본문 `{len(content_text)}자` (추론 원문은 공개하지 않습니다)\n"
+                f"> ⚡ *자율 탐색 및 추론 진행 중... (실시간 지시/피드백 가능 / 중단: `!stop`)*"
+            )
+            try:
+                await status_msg.edit(content=status_live_text)
+            except Exception:
+                pass
 
             # Discord I/O above can yield to !stop after the model-stage check.
             # Cancellation must win before any terminal decision or dispatch.
@@ -2413,12 +3144,12 @@ async def on_message(message: discord.Message):
                 if companions:
                     refused_companion_calls = companions
                     log_session_event(
-                        session_file,
-                        f"⛔ [Step {iteration+1} finish_task 동반 호출 거부]",
-                        "실행하지 않은 도구: " + ", ".join(companions),
+                        workspace,
+                        "finish_companions_refused",
+                        step=iteration + 1,
+                        tools=companions,
                     )
                 outcome.settle(outcome_mod.COMPLETED, outcome_mod.DETAIL_FINISH_TASK)
-                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 final_raw = final_completed_report or full_raw_thought
                 break
 
@@ -2437,12 +3168,11 @@ async def on_message(message: discord.Message):
 
                 elapsed_live = format_elapsed_time(time.time() - start_time)
                 tools_display = ", ".join([f"`{tc['name']}`" for tc in tool_calls_to_run[:3]])
-                last_th_line = display_thought.splitlines()[-1][:80] if display_thought else "도구 실행 준비"
                 tool_live_text = (
                     f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
                     f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 현재까지 실행: `{total_tools_executed}개`)\n"
                     f"> 🛠️ **요청 도구**: {tools_display}\n"
-                    f"> 💭 **최근 판단**: `{last_th_line}`\n"
+                    f"> 💭 **판단 규모**: 추론 `{len(reasoning_text)}자` / 본문 `{len(content_text)}자`\n"
                     f"> ⚡ *도구 요청 검토 중... (실시간 지시 가능 / 중단: `!stop`)*"
                 )
                 try:
@@ -2464,6 +3194,13 @@ async def on_message(message: discord.Message):
                 for call_index, tc in enumerate(tool_calls_to_run):
                     if tc["argument_error"] is not None:
                         merged_results[call_index] = tc["argument_error"]
+                        continue
+                    if tc["id"] in executed_call_ids:
+                        # 재시작 이전에 이미 실행한 호출이다. 다시 보내면 같은
+                        # 부작용이 두 번 일어난다.
+                        merged_results[call_index] = _blocked_tool_result(
+                            "already_executed", tc["name"], 1, 1
+                        )
                         continue
                     signature = (
                         tc["name"],
@@ -2516,11 +3253,27 @@ async def on_message(message: discord.Message):
 
                 total_tools_executed += len(allowed_calls)
                 for tc in allowed_calls:
-                    print(f"Executing tool {tc['name']} with args {tc['arguments']}", flush=True)
-                    log_session_event(session_file, f"🛠️ [Step {iteration+1} 도구 호출] {tc['name']}", json.dumps(tc['arguments'], ensure_ascii=False, indent=2))
+                    executed_call_ids.append(tc["id"])
+                    # 인자 원문 대신 어떤 인자가 왔는지만 남긴다. 도구 인자 JSON을
+                    # 그대로 적는 것이 셸 명령과 파일 내용이 로그로 들어온 경로였다.
+                    log_session_event(
+                        workspace,
+                        "tool_call",
+                        step=iteration + 1,
+                        tool=tc["name"],
+                        arg_keys=sorted(tc["arguments"].keys()),
+                        args_chars=len(tc["raw_arguments"] or ""),
+                    )
+                    log_content_debug(
+                        workspace,
+                        "tool_arguments",
+                        tc["raw_arguments"],
+                        step=iteration + 1,
+                    )
 
                 parallel_results = []
                 if allowed_calls:
+                    tool_batch_started = time.monotonic()
                     try:
                         parallel_results = await execute_tools_in_parallel(
                             workspace,
@@ -2535,6 +3288,17 @@ async def on_message(message: discord.Message):
                     except Exception as tool_error:
                         settle_stage_failure(tool_error)
                         break
+                    # ponytail: 배치 단위 소요만 남긴다. 병렬 실행이라 어느 도구가
+                    # 오래 걸렸는지는 구분되지 않는다. 도구별 소요가 필요하면
+                    # _exec_single이 결과와 함께 시간을 돌려주도록 확장한다.
+                    log_session_event(
+                        workspace,
+                        "tool_batch",
+                        step=iteration + 1,
+                        duration_ms=int((time.monotonic() - tool_batch_started) * 1000),
+                        count=len(allowed_calls),
+                        tools=[tc["name"] for tc in allowed_calls],
+                    )
 
                 messages_payload.append({
                     "role": "assistant",
@@ -2556,7 +3320,21 @@ async def on_message(message: discord.Message):
                         consecutive_failed_tool_calls = 0
 
                 for tc, tool_result in zip(tool_calls_to_run, merged_results):
-                    log_session_event(session_file, f"📥 [Step {iteration+1} 도구 실행 결과] {tc['name']}", tool_result)
+                    if not isinstance(tool_result, str):
+                        tool_result = TOOL_PAYLOAD_MISSING_RESULT
+                    # 도구 결과 원문 대신 실패 여부와 규모만 남긴다. 명령 출력,
+                    # 파일 내용, HTTP 응답이 이 줄로 들어오던 것을 끊는다.
+                    log_session_event(
+                        workspace,
+                        "tool_result",
+                        step=iteration + 1,
+                        tool=tc["name"],
+                        status="error" if _tool_result_failed(tc["name"], tool_result) else "ok",
+                        result_chars=len(tool_result or ""),
+                    )
+                    log_content_debug(
+                        workspace, "tool_result", tool_result, step=iteration + 1
+                    )
 
                     messages_payload.append({
                         "role": "tool",
@@ -2565,12 +3343,27 @@ async def on_message(message: discord.Message):
                         "content": tool_result
                     })
 
-                # [옵션 B: 매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
+                # 도구 실행 중에 접수된 지시를 여기서 흡수한다. 다음 루프 머리까지
+                # 미루면 체크포인트 보고서와 롤오버 모델 단계를 모두 기다린다.
+                apply_steering(iteration + 1)
+
+                # 그룹이 완결됐다: 모든 호출에 결과가 붙었고 대기 지시도 흡수됐다.
+                # 저장 경계는 여기이며, 병렬 호출/결과 그룹 중간이 아니다.
+                save_snapshot(iteration + 2, "tool_group")
+
+                # [매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
+                # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
+                # 쓰이는 것은 바로 위 save_snapshot이 남긴 durable 레코드다.
                 if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
-                    print(f"[Checkpoint {checkpoint_num} Reached at Step {iteration+1} - Generating Intermediate Report]", flush=True)
+                    log_session_event(
+                        workspace,
+                        "checkpoint_start",
+                        step=iteration + 1,
+                        checkpoint=checkpoint_num,
+                    )
                     try:
-                        await status_msg.edit(content=f"📊 **[Step {iteration+1} 체크포인트 도달]** 중간 진행 상황 종합 보고서 작성 및 다음 구간 자동 연장 준비 중... ▌")
+                        await status_msg.edit(content=f"📊 **[Step {iteration+1} 중간 보고 구간 도달]** 중간 진행 상황 종합 보고서 작성 및 다음 구간 자동 연장 준비 중... ▌")
                     except Exception:
                         pass
 
@@ -2617,11 +3410,20 @@ async def on_message(message: discord.Message):
                         for update_payload in state_updates:
                             state_report = ledger.apply_updates(update_payload)
                             log_session_event(
-                                session_file,
-                                f"🧾 [Step {iteration+1} 체크포인트 상태 정정 반영]",
-                                state_report,
+                                workspace,
+                                "checkpoint_state_update",
+                                step=iteration + 1,
+                                report_chars=len(state_report),
                             )
-                            print(f"[Checkpoint State Update Applied at Step {iteration+1}]", flush=True)
+                            log_content_debug(
+                                workspace,
+                                "checkpoint_state_update",
+                                state_report,
+                                step=iteration + 1,
+                            )
+                        # 정정이 반영된 직후 저장한다. 다음 구간에서 죽어도 잃는
+                        # 것은 한 구간뿐이고, 정정은 남는다.
+                        save_snapshot(iteration + 2, "interim_report")
 
                         inter_formatted = format_full_discord_output(inter_text)
 
@@ -2629,7 +3431,7 @@ async def on_message(message: discord.Message):
                         elapsed_cp_str = format_elapsed_time(elapsed_checkpoint)
 
                         cp_message = (
-                            f"📊 **[중간 진행 보고서 - {iteration+1}스텝 체크포인트]**\n\n"
+                            f"📊 **[중간 진행 보고서 - {iteration+1}스텝]**\n\n"
                             f"{inter_formatted}\n\n"
                             f"> ⏱️ **경과 시간**: {elapsed_cp_str} (총 {total_tools_executed}개 도구 실행 완료)\n"
                             f"> ⚡ **[자율 연장]** 목표 달성을 위해 다음 구간(Step {iteration+2} ~ {iteration+1+CHECKPOINT_INTERVAL})으로 계속 진행합니다... *(중단: `!stop`)*"
@@ -2650,15 +3452,32 @@ async def on_message(message: discord.Message):
                         for c in chunks_cp:
                             await message.channel.send(c)
 
-                        log_session_event(session_file, f"📊 [Step {iteration+1} 중간 진행 보고서 제출 & 자동 연장]", inter_text)
+                        log_session_event(
+                            workspace,
+                            "checkpoint_report",
+                            step=iteration + 1,
+                            status="ok",
+                            checkpoint=checkpoint_num,
+                            chars=len(inter_text),
+                            chunks=len(chunks_cp),
+                        )
+                        log_content_debug(
+                            workspace, "checkpoint_report", inter_text, step=iteration + 1
+                        )
                         checkpoint_ok = True
 
                     except (RunCancelled, StageTimeout) as stage_error:
                         settle_stage_failure(stage_error)
                         break
                     except Exception as cp_err:
-                        print(f"[Intermediate Report Synthesis Error]: {cp_err}", flush=True)
-                        log_session_event(session_file, f"⚠️ [Step {iteration+1} 중간 보고서 실패]", str(cp_err))
+                        log_session_event(
+                            workspace,
+                            "checkpoint_report",
+                            step=iteration + 1,
+                            status="error",
+                            checkpoint=checkpoint_num,
+                            error=type(cp_err).__name__,
+                        )
 
                     if checkpoint_ok:
                         # 보고서 본문을 payload에 남긴다. 이것이 없으면 보고서에만 존재한
@@ -2674,10 +3493,10 @@ async def on_message(message: discord.Message):
                             f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
                         )})
                     else:
-                        # 실패한 체크포인트에 성공 마커를 남기지 않는다.
+                        # 실패한 중간 보고서에 성공 마커를 남기지 않는다.
                         messages_payload.append({
                             "role": "assistant",
-                            "content": f"[중간 보고서 생성 실패 - Step {iteration+1} 체크포인트는 제출되지 않았습니다]",
+                            "content": f"[중간 보고서 생성 실패 - Step {iteration+1} 중간 보고서는 제출되지 않았습니다]",
                         })
                         messages_payload.append({"role": "user", "content": (
                             f"[🤖 시스템 안내: Step {iteration+1} 중간 보고서 생성이 실패했습니다. 제출된 것으로 간주하지 마세요. "
@@ -2692,11 +3511,9 @@ async def on_message(message: discord.Message):
                 # 한 번 더 돌리고 나서 루프 경계로 조용히 끝나지 않도록.
                 if token.cancelled:
                     outcome.settle(outcome_mod.STOPPED, token.reason)
-                    print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                     break
                 if iteration + 1 >= MAX_AGENT_LOOPS:
                     outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
-                    print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                     break
 
                 try:
@@ -2711,7 +3528,6 @@ async def on_message(message: discord.Message):
             consecutive_no_tool_responses += 1
             if token.cancelled:
                 outcome.settle(outcome_mod.STOPPED, token.reason)
-                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 final_raw = full_raw_thought or content_text
                 break
 
@@ -2720,13 +3536,11 @@ async def on_message(message: discord.Message):
                     outcome_mod.EXHAUSTED,
                     f"{outcome_mod.DETAIL_NO_TOOL_STALL} {consecutive_no_tool_responses}회",
                 )
-                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 final_raw = full_raw_thought or content_text
                 break
 
             if iteration + 1 >= MAX_AGENT_LOOPS:
                 outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
-                print(f"[Run settled: {outcome.describe()} at Step {iteration+1}]", flush=True)
                 final_raw = full_raw_thought or content_text
                 break
 
@@ -2744,7 +3558,13 @@ async def on_message(message: discord.Message):
                 "role": "user",
                 "content": nudge_content
             })
-            log_session_event(session_file, f"🔄 [Step {iteration+1} 자율 루프 지속 추진(Nudge)]", content_text or "(진행 중)")
+            log_session_event(
+                workspace,
+                "nudge",
+                step=iteration + 1,
+                no_tool_streak=consecutive_no_tool_responses,
+                content_chars=len(content_text),
+            )
             try:
                 await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 루프 가속 진행 중... ▌")
             except Exception:
@@ -2759,6 +3579,10 @@ async def on_message(message: discord.Message):
         # 루프가 break 없이 끝나는 경로도 사유 없이 남지 않게 한다.
         outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
 
+        # 여기부터 종료 단계다. 합성·전송 중 도착분은 접수 시점에 거절되고,
+        # 대기 중이던 항목은 미적용으로 종결된다.
+        await close_steering()
+
         cleaned_check = re.sub(r"<think>.*?</think>|</?(function|parameter|tool_call)[^>]*>", "", final_raw, flags=re.DOTALL).strip()
 
         # 합성 여부는 길이 추정이 아니라 종료 사유로 결정한다.
@@ -2768,6 +3592,10 @@ async def on_message(message: discord.Message):
         uses_local_fallback = no_follow_up_stage
         if no_follow_up_stage:
             final_raw = build_incomplete_report(outcome, ledger, rolling_summary, messages_payload)
+            if stage_failure_note:
+                # 왜 보고서가 없는지는 사용자가 알아야 한다. 이 줄은 채널로만 가고
+                # 종료 기록에는 예외 종류만 남는다.
+                final_raw += f"\n\n> 업스트림 실패 상세: `{stage_failure_note}`"
             needs_synthesis = False
         else:
             # EXHAUSTED는 정상적으로 응답한 모델이 스텝/정체 예산만 소진한 경우라
@@ -2827,7 +3655,14 @@ async def on_message(message: discord.Message):
                     reasoning_effort="none"
                 )
                 final_raw = synth_resp.choices[0].message.content or ""
-                log_session_event(session_file, f"📝 [보고서 합성 - {outcome.describe()}]", final_raw)
+                log_session_event(
+                    workspace,
+                    "synthesis",
+                    step=current_step,
+                    status=outcome.reason,
+                    chars=len(final_raw),
+                )
+                log_content_debug(workspace, "synthesis", final_raw, step=current_step)
             except RunCancelled as synthesis_cancelled:
                 uses_local_fallback = True
                 final_raw = build_incomplete_report(
@@ -2838,7 +3673,13 @@ async def on_message(message: discord.Message):
                     + synthesis_cancelled.reason
                     + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
                 )
-                log_session_event(session_file, "🛑 [보고서 합성 취소]", final_raw)
+                log_session_event(
+                    workspace,
+                    "synthesis",
+                    step=current_step,
+                    status="stopped",
+                    reason=synthesis_cancelled.reason,
+                )
             except StageTimeout as synthesis_timeout:
                 uses_local_fallback = True
                 final_raw = build_incomplete_report(
@@ -2849,7 +3690,13 @@ async def on_message(message: discord.Message):
                     + str(synthesis_timeout)
                     + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
                 )
-                log_session_event(session_file, "⏱️ [보고서 합성 마감 초과]", final_raw)
+                log_session_event(
+                    workspace,
+                    "synthesis",
+                    step=current_step,
+                    status="timeout",
+                    stage=synthesis_timeout.stage,
+                )
             except Exception as synthesis_error:
                 uses_local_fallback = True
                 final_raw = build_incomplete_report(
@@ -2858,12 +3705,20 @@ async def on_message(message: discord.Message):
                 failure = _clip_summary_text(
                     f"{type(synthesis_error).__name__}: {synthesis_error}", 500
                 )
+                # 사용자에게는 왜 보고서가 없는지 알려야 하므로 업스트림 메시지를
+                # 그대로 전달한다. 로그에는 종류만 남긴다.
                 final_raw += (
                     "\n\n> 보고서 합성 업스트림 실패: `"
                     + failure
                     + "`. 모델 보고서 대신 보존된 상태를 사용했습니다."
                 )
-                log_session_event(session_file, "⚠️ [보고서 합성 업스트림 실패]", final_raw)
+                log_session_event(
+                    workspace,
+                    "synthesis",
+                    step=current_step,
+                    status="error",
+                    error=type(synthesis_error).__name__,
+                )
 
         final_text = format_full_discord_output(final_raw)
         if not final_text:
@@ -2930,15 +3785,7 @@ async def on_message(message: discord.Message):
             await message.channel.send(extra_chunk)
 
         history.append({"role": "assistant", "content": final_text})
-        log_session_event(
-            session_file,
-            f"🏁 [런 종료: {outcome.describe()}]",
-            f"도구 실행 {total_tools_executed}건 / 소요 {elapsed_str} / 응답 {len(final_text)}자",
-        )
-        print(
-            f"[Run finished: {outcome.describe()}] {len(final_text)} chars in {elapsed_str}",
-            flush=True,
-        )
+        log_run_end(outcome, chars=len(final_text), chunks=len(chunks))
 
     except Exception as e:
         outcome.settle(outcome_mod.FAILED, f"예외: {type(e).__name__}")
@@ -2946,9 +3793,20 @@ async def on_message(message: discord.Message):
         # Discord delivery is the common case. settle() is first-wins, so outcome.label
         # would still read "조사 완료" on a message that reports a failure. Whatever the
         # earlier reason was, this path did not deliver a finished investigation.
-        err_msg = f"⚠️ **{outcome_mod.LABELS[outcome_mod.FAILED]}** — 작업 도중 예외 발생: `{e}`\n📁 현재까지의 추론/도구 실행 기록은 시스템 로그에 저장되었습니다."
-        print(f"[Run settled: {outcome.describe()}] {e}", file=sys.stderr, flush=True)
-        log_session_event(session_file, f"⚠️ [종료: {outcome.describe()}]", str(e))
+        # 예외 문자열 대신 종류만 전달한다. 예외 본문은 실패 지점의 값을 그대로
+        # 물고 오므로 채널·로그·표준 출력 어디에도 남기지 않는다(이슈 #11).
+        err_msg = f"⚠️ **{outcome_mod.LABELS[outcome_mod.FAILED]}** — 작업 도중 예외 발생: `{type(e).__name__}`\n📁 현재까지의 실행 기록은 시스템 로그에 저장되었습니다."
+        # 같은 이유로 종료 기록도 FAILED로 남긴다. outcome.reason은 선착순이라
+        # 이미 completed일 수 있는데, 이 경로는 완료된 조사를 전달하지 못했다.
+        log_run_end(
+            outcome,
+            status=outcome_mod.FAILED,
+            abnormal=True,
+            error=type(e).__name__,
+        )
+        # 루프 안에서 예외로 빠져나오면 위의 종료 단계 마감을 지나치므로 여기서
+        # 닫는다. 이미 닫혀 있으면 아무 일도 하지 않는다.
+        await close_steering()
         try:
             await status_msg.edit(content=err_msg)
         except Exception:
@@ -2962,7 +3820,30 @@ async def on_message(message: discord.Message):
         finally:
             release_run(outcome.reason or "interrupted")
 
+
+def startup_maintenance():
+    """실행 리비전·의존성·유효 설정을 남기고, 만료된 로그와 런을 정리한 뒤
+    미종료 런을 판정한다.
+
+    시작 기록을 먼저 쓴다. 정리 도중 죽어도 어떤 배포본이 무엇을 지우려 했는지는
+    남아 있어야 한다. 설정 지문 해시는 넣지 않는다: startup_diagnostics가 정책
+    필드를 하나씩 그대로 출력하므로, 값이 이미 다 있는데 해시는 두 배포본이
+    무엇이 달랐는지 알려주지 못한다.
+
+    복구 판정은 정리 뒤에 온다. 먼저 하면 보관 기간이 지난 런이 prepared로 올라가
+    만료를 피해 버린다.
+    """
+    path = session_log.write_startup_record(startup_diagnostics(CONFIG))
+    swept = session_log.sweep_retention()
+    # 로그만 지우면 런이 수집한 파일은 영구히 남는다. 보관 기간은 둘 다 덮는다.
+    swept["runs"] = RUN_CATALOG.sweep_retention(CONFIG.log_retention_days * 86400.0)
+    log_session_event(None, "retention_sweep", **swept)
+    log_session_event(None, "run_recovery", **recover_interrupted_runs())
+    return path
+
+
 async def main():
+    startup_maintenance()
     async with bot:
         await bot.start(DISCORD_TOKEN)
 

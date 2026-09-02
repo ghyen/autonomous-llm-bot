@@ -31,6 +31,12 @@ DEFAULT_MODEL_STAGE_TIMEOUT = 600.0
 DEFAULT_TOOL_STAGE_TIMEOUT = 120.0
 DEFAULT_BASH_TIMEOUT = 60.0
 
+# Log hygiene. Content-level capture is off by default: it is the one setting
+# that puts raw reasoning, tool arguments, and tool results back on disk.
+DEFAULT_LOG_MAX_BYTES = 1048576
+DEFAULT_LOG_RETENTION_DAYS = 14.0
+DEFAULT_LOG_CONTENT_DEBUG_RETENTION_HOURS = 24.0
+
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
@@ -57,6 +63,10 @@ class BotConfig:
     model_stage_timeout: float
     tool_stage_timeout: float
     bash_timeout: float
+    log_max_bytes: int
+    log_retention_days: float
+    log_content_debug: bool
+    log_content_debug_retention_hours: float
 
     @property
     def llm_is_local(self) -> bool:
@@ -121,6 +131,16 @@ def parse_positive_float(raw, field: str, default: float) -> float:
             )
         )
     return value
+
+
+def parse_positive_int(raw, field: str, default: int) -> int:
+    """Whole-number sizes only: '1.5' bytes is a typo, not a size."""
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).strip()
+    if not value.isdigit() or int(value) <= 0:
+        raise ConfigError("{0}: '{1}'은 0보다 큰 정수여야 합니다.".format(field, raw))
+    return int(value)
 
 
 def load_env_file(path) -> Dict[str, str]:
@@ -249,6 +269,22 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         bash_timeout=parse_positive_float(
             get("BASH_TIMEOUT_SECONDS"), "BASH_TIMEOUT_SECONDS", DEFAULT_BASH_TIMEOUT
         ),
+        log_max_bytes=parse_positive_int(
+            get("LOG_MAX_BYTES"), "LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES
+        ),
+        log_retention_days=parse_positive_float(
+            get("LOG_RETENTION_DAYS"), "LOG_RETENTION_DAYS", DEFAULT_LOG_RETENTION_DAYS
+        ),
+        # Deny by default: turning this on stores raw reasoning, tool arguments,
+        # and tool results, so it must be an explicit operator decision.
+        log_content_debug=parse_bool(
+            get("LOG_CONTENT_DEBUG"), "LOG_CONTENT_DEBUG", False
+        ),
+        log_content_debug_retention_hours=parse_positive_float(
+            get("LOG_CONTENT_DEBUG_RETENTION_HOURS"),
+            "LOG_CONTENT_DEBUG_RETENTION_HOURS",
+            DEFAULT_LOG_CONTENT_DEBUG_RETENTION_HOURS,
+        ),
     )
 
     if not config.llm_is_local and not allow_remote_llm:
@@ -283,4 +319,10 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
         ),
         "workspace: {0}".format(config.workspace_dir),
         "system logs: {0}".format(config.system_log_dir),
+        "log policy: max_bytes={0} retention_days={1} content_debug={2} content_hours={3}".format(
+            config.log_max_bytes,
+            config.log_retention_days,
+            "ON (원문 저장)" if config.log_content_debug else "off",
+            config.log_content_debug_retention_hours,
+        ),
     ]

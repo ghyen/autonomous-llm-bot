@@ -9,7 +9,8 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 ## ✨ Key Features
 
 - 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 250 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
-- 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, checkpoint, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves.
+- 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, interim report, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves. The whole ledger round-trips through the run's durable record, so a restart cannot resurrect a rejected hypothesis as fact.
+- 💾 **Durable Run State**: Each run keeps one atomic record (`runs/<run-id>/state.json`) carrying its run id, originating message id, state, next step cursor, bounded summary and tail, interrupt state, ledger, and the ids of the tool calls already executed. It is written before the first model call and after every completed assistant/tool group, never mid-group. A restart resumes the same run id at its next step or records exactly one explicit abort.
 - 📁 **Owner-Bound Run Workspaces**: Every accepted top-level request receives an opaque `runs/<run-id>/` directory and opaque per-run log. Runs never derive paths from Discord IDs; exact owners can resume or delete inactive runs, while admins receive no implicit workspace access.
 - 🔄 **Canonical File Revisions**: Root `plan.md` and `findings.md` use exact-byte `sha256:` revisions, compare-and-swap writes, and atomic replacement. Per-execution read hashes return bounded references for unchanged content.
 - 🏛️ **Hierarchical Trajectory Compaction**: Every 10 steps, old execution history is compacted into a 3-tier memory structure: (1) Long-term Milestone Index (`## 🏛️ 장기 마일스톤 색인`), (2) Recent Phase Detailed Summary (`## 🔍 직전 구간 상세 요약`), and (3) Discovered Artifacts Index (`## 📁 핵심 발견 및 산출물 색인`). Bounded newest-first budgeting keeps historical decisions and refuted hypotheses indexed without exhausting the context window.
@@ -24,8 +25,8 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
   - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
 - 💬 **Mid-Flight Dynamic User Steering**: Users can send messages into the channel while the agent is running; instructions are automatically queued and injected into the agent's next step without restarting.
-- 🛡️ **Chat Template Sanitizer (400 Error Immunity)**: Automatically cleanses multi-system messages to adhere strictly to Qwen/DeepSeek Jinja chat templates (`System message must be at the beginning`).
-- ⚡ **Streaming Completion Delta Collector**: Reconstructs tool calls and reasoning deltas on the fly.
+- 🛡️ **Pre-Send Payload Validator**: One local validator checks every outgoing payload before it leaves — tool_call ids non-empty and unique, exactly one result per announced call, groups adjacent, no orphan results, `system` only at index 0 — and repairs the live history in place. A tool-correlation error retries once with the tool protocol erased; other 400s settle like any other failure and leave a masked role/id fingerprint.
+- ⚡ **Streaming Completion Delta Collector**: Reconstructs tool calls and reasoning deltas on the fly. Index-less fragments continue the call in progress instead of splitting it, fallback ids are unique for the whole process, and a fragment that never named a function is refused before dispatch.
 
 ---
 
@@ -63,7 +64,7 @@ User Prompt (Discord) ────────┐
                               │
                ┌──────────────▼──────────────┐
                │  10-Step Rolling Compaction │
-               │  & Checkpoint Synthesis     │
+               │  & Interim Report Briefing  │
                └──────────────┬──────────────┘
                               │
                               ▼
@@ -120,14 +121,18 @@ LLM_IDLE_TIMEOUT_SECONDS=120
 MODEL_STAGE_TIMEOUT_SECONDS=600
 TOOL_STAGE_TIMEOUT_SECONDS=120
 BASH_TIMEOUT_SECONDS=60
+LOG_MAX_BYTES=1048576
+LOG_RETENTION_DAYS=14
+LOG_CONTENT_DEBUG=false
+LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 ```
 
 The wait budgets are separate: connection establishment is 15 seconds, the
 maximum idle gap between stream chunks is 120 seconds, one model stage totals
 600 seconds, a tool batch totals 120 seconds, and a shell process totals 60
-seconds. A 400 recovery retry consumes only the remaining time from the original
-model-stage budget. Timed-out or cancelled shell commands kill and reap their
-whole process group.
+seconds. A tool-correlation recovery retry consumes only the remaining time from
+the original model-stage budget. Timed-out or cancelled shell commands kill and
+reap their whole process group.
 
 Startup fails, loudly, when:
 
@@ -137,12 +142,16 @@ Startup fails, loudly, when:
   `BOT_TOOLS_ENABLED=false` to run a tool-free bot without an allowlist.
 - Any ID list contains a non-numeric entry.
 - Any timeout is not a finite number greater than zero.
+- `LOG_MAX_BYTES` is not a whole number greater than zero.
+- `LOG_RETENTION_DAYS` or `LOG_CONTENT_DEBUG_RETENTION_HOURS` is not a finite
+  number greater than zero.
 - `DISCORD_ADMIN_USER_IDS` names someone outside `DISCORD_ALLOWED_USER_IDS`.
 - `LLM_BASE_URL` is non-local without `LLM_ALLOW_REMOTE=true`. Conversation
   content and tool results would leave the machine.
 
-See `.env.example` for the full set. On startup the bot prints a secret-free
-diagnostic block including a fingerprint of the effective policy.
+See `.env.example` for the full set. On startup the bot writes a secret-free
+`startup` record carrying the running commit, dependency versions, and every
+effective policy line.
 
 ### 4. Running the Bot
 
@@ -152,10 +161,74 @@ python bot.py
 
 ---
 
+## 🔒 Log Hygiene and Retention
+
+Every log line and every console line is one JSON object carrying `ts`, `rev`
+(running commit), `pid`, `run`, `step`, and `kind`. The default sink stores
+**metadata only**: event kind, tool name, status, duration, and sizes. Raw
+reasoning, tool arguments, tool results, and user text have no route into it,
+and raw reasoning is not sent to Discord either — progress is reported as a
+bounded status line instead.
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `LOG_MAX_BYTES` | `1048576` | A run log rotates to `<run-id>.1.jsonl` past this size. One previous generation is kept. |
+| `LOG_RETENTION_DAYS` | `14` | Startup deletes run logs and inactive run workspaces older than this. |
+| `LOG_CONTENT_DEBUG` | `false` | Turning this on writes raw reasoning, tool arguments, and tool results to `SYSTEM_LOG_DIR/content-debug/<run-id>.jsonl`. |
+| `LOG_CONTENT_DEBUG_RETENTION_HOURS` | `24` | Retention for that content sink — hours, not days. |
+
+Directories are `0700` and files are `0600` regardless of the umask, and paths
+that predate this are corrected in place. `LOG_CONTENT_DEBUG` is the one setting
+that puts content back on disk, so it is deny-by-default and its state is printed
+in the startup diagnostics.
+
+---
+
+## 💾 Durable Run State and Restart Recovery
+
+**The 10-step Discord interim progress report is a briefing, not a recovery
+point.** It is sent to a channel and recorded in the log, and nothing ever read
+it back. Recovery uses one separate durable record per run:
+
+- Record: `WORKSPACE_DIR/runs/<run-id>/state.json`, inside the run's own `0700`
+  workspace next to `run.json`, written with the same temp-file/fsync/replace
+  used for canonical files — so an interrupt during a write cannot truncate it.
+- Contents: run id, originating Discord message id, run state, next step cursor,
+  the bounded cumulative summary, a bounded tail of recent payload messages, the
+  interrupt state (cancellation reason and steering queue counters), the full
+  ledger, and the ids of the tool calls already executed.
+- Write boundaries: before the first model call, after every completed
+  assistant/tool group, right after an interim report's ledger corrections are
+  applied, and right after a rollover writes its new summary back. A record is
+  **never** written across a parallel call/result group — a tail whose last group
+  is missing results is dropped whole, because restoring half a group both breaks
+  the next request and would re-run side effects that already happened.
+- Bound: the tail keeps 12 messages of at most 2,000 characters each. Anything
+  older is represented by the cumulative summary, which is what the summary is
+  for.
+
+On startup every unterminated record (`state` still `running`) is settled
+exactly once. Either the run is re-selected for its owner and channel, so the
+next accepted goal consumes the same run id and continues at its next cursor, or
+exactly one `run_abort` record is written and the record is deleted. A record
+that does not match the schema is discarded, never migrated. There is no third
+path: silently restarting at Step 1 is what made a restart indistinguishable
+from a new request. A resumed run announces itself in the channel and logs a
+`run_resumed` record before its first step, and a tool call whose id already ran
+is answered with a deterministic `already_executed` result instead of being
+dispatched again.
+
+A run that ends normally marks its record ended, so startup leaves it alone
+while `!resume <run-id>` can still pick it up. `!reset`, `!new`, `!clear` and
+`!delete` delete the record, so a discarded run cannot come back after a
+restart.
+
+---
+
 ## 🏁 Run Outcomes
 
 A run settles on exactly one terminal reason, and that single value decides
-everything after it — whether nudges, tool dispatch, checkpoints and rollover
+everything after it — whether nudges, tool dispatch, interim reports and rollover
 continue, which synthesis prompt is used, and what label the user sees.
 
 | Reason | Reached by | User-facing |
@@ -163,7 +236,7 @@ continue, which synthesis prompt is used, and what label the user sees.
 | `completed` | `finish_task`, or a tool-free direct answer on the first call | `✅ 조사 완료` + 완료 시간 footer |
 | `stopped` | `!stop` / `/stop` | `🛑 사용자 중단 — 미완료`, no completion footer |
 | `exhausted` | Step budget spent, or too many consecutive tool-free responses | `⚠️ 스텝 소진 — 미완료` |
-| `failed` | A model/tool/checkpoint stage exceeds its deadline, or an unhandled upstream exception occurs | `❌ 실패 — 미완료` |
+| `failed` | A model, tool, interim-report or rollover stage exceeds its deadline, or an unhandled upstream exception occurs | `❌ 실패 — 미완료` |
 
 **Completion intent is a structured signal only.** Writing "최종 보고서" in the
 response body does not end a run; `finish_task` does. Previously a run counted as
@@ -177,8 +250,8 @@ decision. The refused tool names are recorded in the session log and listed in
 the final message, so nothing is silently dropped.
 
 **Stop and deadline policy:** `!stop` and `/stop` cancel the currently awaited
-model, stream, tool batch, checkpoint, rollover, or synthesis stage and await its
-cleanup. No retry, tool, checkpoint, rollover, or model synthesis starts after
+model, stream, tool batch, interim report, rollover, or synthesis stage and await
+its cleanup. No retry, tool, interim report, rollover, or model synthesis starts after
 cancellation. Stopped and deadline-failed runs use a deterministic bounded
 partial report from preserved state; an exhausted run may use one bounded final
 synthesis. A rollover summary timeout is handled inside that bounded stage with
@@ -188,7 +261,9 @@ upstream failure, exhaustion, and normal completion remain distinct in the final
 status.
 
 **Tool execution guardrails:** ordinary tool calls are filtered only after the
-post-dashboard cancellation checkpoint and before dispatch. A signature is the
+post-dashboard cancellation check and before dispatch. A call whose id already
+executed before a restart is answered with a deterministic `already_executed`
+result and never dispatched. A signature is the
 tool name plus its compact, key-sorted JSON arguments. Within one model response,
 only the first identical signature can execute; every original call ID still gets
 a tool result, with blocked calls receiving deterministic structured JSON. The
@@ -211,7 +286,7 @@ surface.
 fresh opaque run:
 
 - Workspace: `WORKSPACE_DIR/runs/<random-run-id>/`
-- Log: `SYSTEM_LOG_DIR/runs/<random-run-id>.md`
+- Log: `SYSTEM_LOG_DIR/runs/<random-run-id>.jsonl`
 - Metadata: atomic `run.json` containing owner, channel, lifecycle status, and
   timestamps. Startup changes stale `active` metadata to resumable
   `interrupted`; legacy root files are not migrated or used as a fallback.
@@ -222,8 +297,9 @@ direct-answer fallback into autonomous mode keeps the same run. Cleanup persists
 workspace bytes. `!new`/`!reset` prepare a blank run and keep old bytes; `!stop`
 retains the stopped run; `!resume <run-id>` selects an exact inactive owned run
 with an empty read cache; and `!delete <run-id>` removes an inactive owned
-workspace and log. `!clear` purges Discord first and performs the same reset only
-on success. A selected run is consumed once, and one run cannot be active twice.
+workspace and log, including rotated log generations. `!clear` purges Discord
+first and performs the same reset only on success. `!reset`, `!new`, `!clear`
+and `!delete` also delete the run's durable state record. A selected run is consumed once, and one run cannot be active twice.
 There is no list/share surface, and admin control authority is not workspace
 read/delete authority: cross-owner IDs return `run not found`.
 
@@ -301,20 +377,24 @@ leaves your history intact and is reported as a failure.
 
 ```bash
 ./venv/bin/python -m unittest discover -v
-./venv/bin/python -m compileall -q bot.py run_workspace.py config.py authz.py outcome.py ledger.py deadlines.py
-./venv/bin/python tools/check_no_credential_defaults.py bot.py run_workspace.py config.py ledger.py authz.py outcome.py deadlines.py tools
+./venv/bin/python -m compileall -q bot.py run_workspace.py run_state.py config.py authz.py outcome.py ledger.py deadlines.py steering.py session_log.py
+./venv/bin/python tools/check_no_credential_defaults.py bot.py run_workspace.py run_state.py config.py ledger.py authz.py outcome.py deadlines.py steering.py session_log.py tools
 ```
 
 `test_config.py` covers configuration loading and deadline defaults,
 `test_deadlines.py` covers cancellation/deadline cleanup, and
 `test_cancellation_flow.py` covers stop latency, shared retry budgets, process
-reclamation, and model/tool/checkpoint/rollover/synthesis boundaries.
+reclamation, and model/tool/interim-report/rollover/synthesis boundaries.
 `test_authz.py` and `test_authz_handlers.py` cover the authorization policy and
 its placement ahead of every side effect, `test_outcome.py` and
 `test_terminal_state.py` cover the terminal state machine and end-of-run
 scenarios, `test_ledger.py` covers the state transition rules,
-`test_state_flow.py` proves state markers survive micro compaction, checkpoints,
-rollover, a following run, and final synthesis, `test_workspace_integrity.py`
+`test_state_flow.py` proves state markers survive micro compaction, interim
+reports, rollover, a following run, and final synthesis,
+`test_durable_state.py` covers the durable run record in `run_state.py`: the
+round trip, the parallel-group save boundary, atomic replacement, restart
+recovery and explicit abort, the rollover write-back, and record deletion on
+reset, `test_workspace_integrity.py`
 covers opaque identity, lifecycle/privacy, lexical paths, canonical CAS, bounded
 hash caching, per-run prompt/log/dispatcher wiring, and concurrent isolation,
 and `test_bot.py` covers request routing. `test_support.py` holds the shared
