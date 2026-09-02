@@ -1,13 +1,11 @@
 """Opaque owner-bound run workspaces and canonical-file integrity."""
 
 import asyncio
-import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
-import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -15,9 +13,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from session_log import secure_directory
+from workspace_io import (
+    CANONICAL_NAMES,
+    REVISION_PATTERN,
+    atomic_write,
+    is_canonical,
+    read_bytes,
+    resolve_path,
+    revision,
+    write_bytes,
+)
 
 
-CANONICAL_NAMES = frozenset(("plan.md", "findings.md"))
 READ_HASH_LIMIT = 128
 TERMINAL_STATUSES = frozenset(
     ("completed", "stopped", "exhausted", "failed", "interrupted")
@@ -50,32 +57,7 @@ def _age_seconds(moment, stamp):
         return float("-inf")
 
 
-def _revision(data):
-    return "sha256:" + hashlib.sha256(data).hexdigest()
-
-
-def atomic_write(path, data):
-    """Temp file → flush → fsync → replace, so an interrupt cannot truncate.
-
-    Public because run state (`run_state.py`) needs the same guarantee for the
-    same reason: a half-written record is worse than no record at all.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".{0}.".format(path.name), dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+_revision = revision
 
 
 class RunWorkspace:
@@ -129,40 +111,10 @@ class RunWorkspace:
         self._read_hashes.clear()
 
     def resolve(self, path):
-        raw_path = os.fspath(path)
-        if not os.path.isabs(raw_path):
-            raw_path = os.path.join(str(self.root), raw_path)
-        # Lexical normalization cannot see a symlink that this run's bash_exec
-        # planted inside the root, and an absolute path only looks contained
-        # until it is resolved, so both sides are realpath'd before comparison.
-        # realpath resolves the existing ancestors and keeps the missing tail, so
-        # a not-yet-created write target is judged on its real parent.
-        real_root = os.path.realpath(str(self.root))
-        real_target = os.path.realpath(raw_path)
-        try:
-            inside = os.path.commonpath((real_root, real_target)) == real_root
-        except ValueError:
-            inside = False
-        if not inside:
-            raise ValueError("path escapes the current run workspace")
-        # ponytail: resolution and use are two steps, so a symlink planted between
-        # them can still redirect a write (TOCTOU). Accepted ceiling: the same
-        # run's bash_exec already writes wherever the process can. Upgrade path is
-        # component-wise openat/O_NOFOLLOW resolution held open across the write.
-        relative = os.path.relpath(real_target, real_root)
-        target = self.root if relative == os.curdir else self.root / relative
-        # Re-expressing every contained target under the run root leaves one
-        # spelling per file, so an absolute or symlinked alias of a canonical file
-        # cannot present itself as an ordinary path and skip CAS.
-        if (
-            target.parent == self.root
-            and target.name.casefold() in CANONICAL_NAMES
-        ):
-            return self.root / target.name.casefold()
-        return target
+        return resolve_path(self.root, path)
 
     def _is_canonical(self, target):
-        return any(target == self.root / name for name in CANONICAL_NAMES)
+        return is_canonical(self.root, target)
 
     def _remember(self, target, revision):
         key = str(target)
@@ -171,19 +123,33 @@ class RunWorkspace:
         while len(self._read_hashes) > READ_HASH_LIMIT:
             self._read_hashes.popitem(last=False)
 
+    def remember_worker_read(self, result):
+        """Merge a worker read into the parent cache without touching the file."""
+        if result.get("status") != "success":
+            return result
+        target = self.resolve(result["path"])
+        file_revision = result["revision"]
+        if self._read_hashes.get(str(target)) == file_revision:
+            self._read_hashes.move_to_end(str(target))
+            return {
+                "status": "unchanged",
+                "path": result["path"],
+                "revision": file_revision,
+                "reference": file_revision,
+            }
+        self._remember(target, file_revision)
+        return result
+
+    def write_lock(self, path):
+        target = self.resolve(path)
+        return self._canonical_locks.get(target.name) if self._is_canonical(target) else None
+
     def read(self, path):
         display_path = os.fspath(path)
         target = self.resolve(path)
-        try:
-            data = target.read_bytes()
-        except FileNotFoundError:
-            return {"status": "error", "path": display_path, "error": "not_found"}
-        except (IsADirectoryError, PermissionError, OSError) as error:
-            return {
-                "status": "error",
-                "path": display_path,
-                "error": type(error).__name__,
-            }
+        status, data = read_bytes(self.root, path)
+        if status != "success":
+            return {"status": "error", "path": display_path, "error": status}
 
         revision = _revision(data)
         key = str(target)
@@ -214,58 +180,20 @@ class RunWorkspace:
         display_path = os.fspath(path)
         target = self.resolve(path)
         data = str(content).encode("utf-8")
-        if not self._is_canonical(target):
-            # Ordinary files replace atomically too: an interrupt mid-write used
-            # to leave a truncated file behind, and the agent's own scripts and
-            # findings live here (issue #6).
-            atomic_write(target, data)
-            revision = _revision(data)
-            self._remember(target, revision)
-            return {
-                "status": "success",
-                "path": display_path,
-                "revision": revision,
-            }
+        lock = self.write_lock(path)
+        if lock is None:
+            result = write_bytes(self.root, path, data, expected_revision)
+            result["path"] = display_path
+            if result.get("status") == "success":
+                self._remember(target, result["revision"])
+            return result
 
-        if expected_revision is None:
-            return {
-                "status": "error",
-                "path": display_path,
-                "error": "expected_revision_required",
-            }
-        if expected_revision != "absent" and not REVISION_PATTERN.fullmatch(
-            str(expected_revision)
-        ):
-            return {
-                "status": "error",
-                "path": display_path,
-                "error": "invalid_expected_revision",
-            }
-
-        lock = self._canonical_locks[target.name]
         async with lock:
-            try:
-                current_bytes = target.read_bytes()
-            except FileNotFoundError:
-                current_revision = "absent"
-            else:
-                current_revision = _revision(current_bytes)
-            if expected_revision != current_revision:
-                return {
-                    "status": "conflict",
-                    "path": display_path,
-                    "expected_revision": expected_revision,
-                    "current_revision": current_revision,
-                }
-
-            atomic_write(target, data)
-            revision = _revision(data)
-            self._remember(target, revision)
-            return {
-                "status": "success",
-                "path": display_path,
-                "revision": revision,
-            }
+            result = write_bytes(self.root, path, data, expected_revision)
+            result["path"] = display_path
+            if result.get("status") == "success":
+                self._remember(target, result["revision"])
+            return result
 
 
 class RunCatalog:
