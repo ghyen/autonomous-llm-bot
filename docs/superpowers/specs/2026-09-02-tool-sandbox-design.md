@@ -1,7 +1,7 @@
 # macOS Tool Sandbox Design
 
-**Date:** 2026-09-02  
-**Issues:** #10, #27  
+**Date:** 2026-09-02
+**Issues:** #10, #27
 **Target:** macOS LaunchAgent deployment described by `README.md`
 
 ## Goal
