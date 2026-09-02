@@ -87,8 +87,12 @@ class FakeAuthor:
 
 
 class FakeMessage:
-    def __init__(self, content, channel_id, author=None, manage_messages=False, purge_error=None):
+    def __init__(self, content, channel_id, author=None, manage_messages=False,
+                 purge_error=None, message_id=700000000000000001):
         self.content = content
+        # Every Discord message has an id, and a run's durable record needs it to
+        # tell a restarted delivery of the same goal from a genuinely new one.
+        self.id = message_id
         self.channel = FakeChannel(
             channel_id, manage_messages=manage_messages, purge_error=purge_error
         )
