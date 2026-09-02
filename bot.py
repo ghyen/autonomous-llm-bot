@@ -1312,7 +1312,7 @@ def extract_discovered_artifacts(text: str, workspace) -> list:
 # --- User's Rolling Compaction (Rollup) Architecture ---
 
 ROLLING_SUMMARY_LABEL = "누적 작업 요약 및 이전 대화 컨텍스트"
-STATE_UPDATE_BLOCK_PATTERN = re.compile(r"```state_update\s*(.*?)```", re.DOTALL)
+STATE_UPDATE_BLOCK_PATTERN = re.compile(r"```state_update\s*(.*?)(?:```|$)", re.DOTALL)
 
 
 def build_system_content(workspace, ledger=None, summary: str = "") -> str:
@@ -3462,7 +3462,7 @@ async def on_message(message: discord.Message):
                             stage="checkpoint",
                             model=MODEL_NAME,
                             messages=inter_payload,
-                            max_tokens=2048,
+                            max_tokens=4096,
                             temperature=0.4,
                             reasoning_effort="none"
                         )
