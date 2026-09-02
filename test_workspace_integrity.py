@@ -437,6 +437,40 @@ class CanonicalIntegrityTest(WorkspaceTestCase):
 
 
 class ToolIntegrationTest(WorkspaceTestCase):
+    async def test_os_facing_tools_use_the_sandbox_supervisor(self):
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        responses = [
+            {"status": "success", "stdout": "ok", "stderr": "", "exit_code": 0},
+            {
+                "status": "success",
+                "path": "note.txt",
+                "revision": sha256(b"inside"),
+                "content": "inside",
+                "truncated": False,
+            },
+            {"status": "success", "path": "note.txt", "revision": sha256(b"inside")},
+            {"status": "success", "results": [{"title": "one", "href": "https://example.com", "body": "result"}]},
+        ]
+        with patch.object(
+            bot.tool_sandbox,
+            "run_worker",
+            AsyncMock(side_effect=responses),
+        ) as run_worker:
+            bash = await bot.tool_bash_exec(workspace, "printf ok")
+            read = await bot.tool_read_file(workspace, "note.txt")
+            write = await bot.tool_write_file(workspace, "note.txt", "inside", None)
+            search = await bot.tool_web_search("one")
+
+        self.assertIn("[exit code: 0]", bash)
+        self.assertEqual(json.loads(read)["status"], "success")
+        self.assertEqual(json.loads(write)["status"], "success")
+        self.assertIn("https://example.com", search)
+        self.assertEqual(run_worker.await_count, 4)
+        self.assertEqual(run_worker.await_args_list[0].args[0], workspace)
+        self.assertEqual(run_worker.await_args_list[1].args[1]["operation"], "read_file")
+        self.assertEqual(run_worker.await_args_list[2].args[1]["operation"], "write_file")
+        self.assertEqual(run_worker.await_args_list[3].args[1]["operation"], "web_search")
+
     async def test_relative_paths_and_bash_use_the_run_root_without_broadening_scope(self):
         # Production mutation caught: retaining the global cwd/path join permits
         # run overlap, while accepting any absolute path lets one line of model

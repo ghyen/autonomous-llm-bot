@@ -14,8 +14,8 @@ import sys
 import re
 import json
 import time
-import signal
 import asyncio
+import tempfile
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
 
@@ -23,7 +23,6 @@ import discord
 from discord.ext import commands
 import httpx
 from openai import AsyncOpenAI
-from duckduckgo_search import DDGS
 from types import SimpleNamespace
 
 import authz
@@ -44,6 +43,7 @@ from ledger import ResearchLedger
 from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
+import tool_sandbox
 
 # Configuration is fully validated before any filesystem or network side effect.
 try:
@@ -61,6 +61,17 @@ FREE_RESPONSE_CHANNEL_IDS = set(CONFIG.free_response_channel_ids)
 ALLOWED_USER_IDS = set(CONFIG.allowed_user_ids)
 ADMIN_USER_IDS = set(CONFIG.admin_user_ids)
 TOOLS_ENABLED = CONFIG.tools_enabled
+TOOL_LIMITS = {
+    "cpu_seconds": CONFIG.tool_cpu_seconds,
+    "memory_bytes": CONFIG.tool_memory_bytes,
+    "process_limit": CONFIG.tool_process_limit,
+    "thread_limit": CONFIG.tool_thread_limit,
+    "open_files": CONFIG.tool_open_files,
+    "file_bytes": CONFIG.tool_file_bytes,
+    "output_bytes": CONFIG.tool_output_bytes,
+    "disk_bytes": CONFIG.tool_disk_bytes,
+}
+TOOL_NETWORK_ALLOWLIST = CONFIG.tool_network_allowlist
 
 # 로그 정책은 어떤 파일 부작용보다 먼저 선다. 바로 아래 RUN_CATALOG 생성이
 # 이미 로그 트리를 만들기 때문에, 모드·회전·보관 정책이 그 전에 있어야 한다.
@@ -489,7 +500,7 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
             return False
         return (
             isinstance(envelope, dict)
-            and envelope.get("status") in ("error", "conflict")
+            and envelope.get("status") in ("error", "conflict", "resource_limit")
         )
     if result.startswith("[Error"):
         return True
@@ -560,76 +571,30 @@ async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
 
 # --- Tool Execution Functions ---
 
-async def _terminate_process_tree(proc, process_group_id: int) -> None:
-    """Kill the child's captured process group and reap its direct child.
-
-    `proc.pid` is the process-group id because the shell is spawned with
-    `start_new_session=True`. Capture it at spawn time: once the shell exits,
-    looking the group up through that dead leader is no longer reliable.
-    """
-    if proc is None:
-        return
-    try:
-        os.killpg(process_group_id, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=5.0)
-    except Exception:
-        pass
-
-def _bash_child_env(workspace) -> Dict[str, str]:
-    """도구 셸에 넘길 환경 변수 허용 목록.
-
-    봇 프로세스 환경에는 config.py가 읽은 Discord 토큰과 LLM 자격 증명이 들어
-    있어서, 자식이 환경을 그대로 상속하면 `env` 한 번으로 전부 노출된다. 그래서
-    명령 실행에 실제로 필요한 변수만 명시적으로 전달한다. HOME/TMPDIR을 런 루트로
-    고정하는 이유는 셸이 `~/.netrc`, `~/.aws/credentials` 같은 홈 자격 증명 파일을
-    조회하지 못하게 하려는 것이다(파일 권한 자체를 막지는 못한다).
-    """
-    return {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "HOME": str(workspace.root),
-        "TMPDIR": str(workspace.root),
-    }
-
-
 async def tool_bash_exec(workspace, command: str) -> str:
-    proc = None
-    process_group_id = None
     try:
-        # 명령어 원문은 표준 출력으로 나가지 않는다. 어떤 도구가 어느 스텝에서
-        # 호출되었는지는 루프가 남기는 tool_call 레코드에 이미 있다(이슈 #11).
-        # start_new_session makes the shell PID the stable process-group id for
-        # descendants, even if the shell exits before its inherited pipes close.
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            cwd=workspace.root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            env=_bash_child_env(workspace),
+        result = await tool_sandbox.run_worker(
+            workspace,
+            {
+                "operation": "bash_exec",
+                "workspace": str(workspace.root),
+                "command": command,
+                "limits": TOOL_LIMITS,
+                "network_allowlist": list(TOOL_NETWORK_ALLOWLIST),
+                "timeout": CONFIG.bash_timeout,
+            },
+            CONFIG.bash_timeout,
         )
-        process_group_id = proc.pid
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=CONFIG.bash_timeout
-            )
-        except asyncio.TimeoutError:
-            await _terminate_process_tree(proc, process_group_id)
-            return f"[Error: Command timed out after {CONFIG.bash_timeout:g} seconds]"
-        except asyncio.CancelledError:
-            await _terminate_process_tree(proc, process_group_id)
-            raise
+        if result.get("status") != "success":
+            if result.get("error") == "worker_timeout":
+                return "[Error: Command timed out after {0:g} seconds]".format(
+                    CONFIG.bash_timeout
+                )
+            return "[Error: {0}]".format(result.get("error", "worker_unavailable"))
 
-        out_str = stdout.decode("utf-8", errors="replace")
-        err_str = stderr.decode("utf-8", errors="replace")
-        code = proc.returncode
+        out_str = str(result.get("stdout", ""))
+        err_str = str(result.get("stderr", ""))
+        code = result.get("exit_code", 1)
 
         payload = ""
         if out_str:
@@ -642,7 +607,7 @@ async def tool_bash_exec(workspace, command: str) -> str:
         payload = payload.strip()
         return f"{payload}\n[exit code: {code}]" if payload else f"[exit code: {code}]"
     except Exception as e:
-        return f"[Error executing bash command: {e}]"
+        return f"[Error: worker_unavailable ({type(e).__name__})]"
 
 
 def _workspace_result(payload) -> str:
@@ -653,12 +618,22 @@ def _workspace_result(payload) -> str:
 
 async def tool_read_file(workspace, path: str) -> str:
     try:
-        return _workspace_result(workspace.read(path))
+        result = await tool_sandbox.run_worker(
+            workspace,
+            {
+                "operation": "read_file",
+                "workspace": str(workspace.root),
+                "path": path,
+                "limits": TOOL_LIMITS,
+            },
+            CONFIG.tool_stage_timeout,
+        )
+        return _workspace_result(workspace.remember_worker_read(result))
     except Exception as e:
         return _workspace_result({
             "status": "error",
             "path": path,
-            "error": str(e),
+            "error": type(e).__name__,
         })
 
 
@@ -666,29 +641,50 @@ async def tool_write_file(
     workspace, path: str, content: str, expected_revision
 ) -> str:
     try:
-        return _workspace_result(
-            await workspace.write(path, content, expected_revision)
-        )
+        request = {
+            "operation": "write_file",
+            "workspace": str(workspace.root),
+            "path": path,
+            "content": content,
+            "expected_revision": expected_revision,
+            "limits": TOOL_LIMITS,
+        }
+        lock = workspace.write_lock(path)
+        if lock is None:
+            result = await tool_sandbox.run_worker(
+                workspace, request, CONFIG.tool_stage_timeout
+            )
+        else:
+            async with lock:
+                result = await tool_sandbox.run_worker(
+                    workspace, request, CONFIG.tool_stage_timeout
+                )
+        return _workspace_result(workspace.remember_worker_write(result))
     except Exception as e:
         return _workspace_result({
             "status": "error",
             "path": path,
-            "error": str(e),
+            "error": type(e).__name__,
         })
+
 
 async def tool_web_search(query: str) -> str:
     try:
-        def _search():
-            # ponytail: to_thread cannot be interrupted, so the DDGS timeout is
-            # the real bound here. On cancellation the worker thread may outlive
-            # the run briefly; it holds no run state. Upgrade path is a
-            # cancellable HTTP client instead of the blocking DDGS call.
-            with DDGS(timeout=int(CONFIG.tool_stage_timeout)) as ddgs:
-                return list(ddgs.text(query, max_results=5))
-
-        results = await asyncio.wait_for(
-            asyncio.to_thread(_search), timeout=CONFIG.tool_stage_timeout
-        )
+        with tempfile.TemporaryDirectory(prefix=".tool-web-") as root:
+            result = await tool_sandbox.run_worker(
+                root,
+                {
+                    "operation": "web_search",
+                    "query": query,
+                    "limits": TOOL_LIMITS,
+                    "network_allowlist": list(TOOL_NETWORK_ALLOWLIST),
+                    "timeout": CONFIG.tool_stage_timeout,
+                },
+                CONFIG.tool_stage_timeout,
+            )
+        if result.get("status") != "success":
+            return "[Error: {0}]".format(result.get("error", "worker_unavailable"))
+        results = result.get("results") or []
         if not results:
             return (
                 "검색 결과가 없습니다.\n\n"
@@ -700,7 +696,7 @@ async def tool_web_search(query: str) -> str:
             formatted.append(f"{i}. [{r.get('title')}]({r.get('href')})\n   {r.get('body')}")
         return "\n\n".join(formatted)
     except Exception as e:
-        return f"[Error performing web search: {e}]"
+        return f"[Error: worker_unavailable ({type(e).__name__})]"
 
 async def tool_record_state(ledger, updates) -> str:
     if ledger is None:

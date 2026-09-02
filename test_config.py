@@ -193,6 +193,38 @@ class LoadConfigTest(unittest.TestCase):
             self.assertFalse(os.path.exists(workspace))
             self.assertFalse(os.path.exists(logs))
 
+    def test_tool_limits_have_bounded_defaults(self):
+        config = load_config(env=env(), env_file=None)
+        self.assertEqual(config.tool_cpu_seconds, 30.0)
+        self.assertEqual(config.tool_memory_bytes, 268435456)
+        self.assertEqual(config.tool_process_limit, 32)
+        self.assertEqual(config.tool_thread_limit, 64)
+        self.assertEqual(config.tool_open_files, 64)
+        self.assertEqual(config.tool_file_bytes, 10485760)
+        self.assertEqual(config.tool_output_bytes, 65536)
+        self.assertEqual(config.tool_disk_bytes, 52428800)
+        self.assertEqual(config.tool_network_allowlist, ())
+
+    def test_network_allowlist_accepts_origins_and_rejects_ambiguous_values(self):
+        config = load_config(
+            env=env(TOOL_NETWORK_ALLOWLIST="https://example.com:443,http://127.0.0.1:8080"),
+            env_file=None,
+        )
+        self.assertEqual(
+            config.tool_network_allowlist,
+            (("https", "example.com", 443), ("http", "127.0.0.1", 8080)),
+        )
+        for raw in (
+            "example.com:443",
+            "ftp://example.com",
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com:0",
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ConfigError):
+                    load_config(env=env(TOOL_NETWORK_ALLOWLIST=raw), env_file=None)
+
 
 class DiagnosticsTest(unittest.TestCase):
     def test_diagnostics_never_echo_the_token(self):
