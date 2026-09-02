@@ -25,8 +25,8 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
   - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
 - 💬 **Mid-Flight Dynamic User Steering**: Users can send messages into the channel while the agent is running; instructions are automatically queued and injected into the agent's next step without restarting.
-- 🛡️ **Chat Template Sanitizer (400 Error Immunity)**: Automatically cleanses multi-system messages to adhere strictly to Qwen/DeepSeek Jinja chat templates (`System message must be at the beginning`).
-- ⚡ **Streaming Completion Delta Collector**: Reconstructs tool calls and reasoning deltas on the fly.
+- 🛡️ **Pre-Send Payload Validator**: One local validator checks every outgoing payload before it leaves — tool_call ids non-empty and unique, exactly one result per announced call, groups adjacent, no orphan results, `system` only at index 0 — and repairs the live history in place. A tool-correlation error retries once with the tool protocol erased; other 400s settle like any other failure and leave a masked role/id fingerprint.
+- ⚡ **Streaming Completion Delta Collector**: Reconstructs tool calls and reasoning deltas on the fly. Index-less fragments continue the call in progress instead of splitting it, fallback ids are unique for the whole process, and a fragment that never named a function is refused before dispatch.
 
 ---
 
@@ -130,9 +130,9 @@ LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 The wait budgets are separate: connection establishment is 15 seconds, the
 maximum idle gap between stream chunks is 120 seconds, one model stage totals
 600 seconds, a tool batch totals 120 seconds, and a shell process totals 60
-seconds. A 400 recovery retry consumes only the remaining time from the original
-model-stage budget. Timed-out or cancelled shell commands kill and reap their
-whole process group.
+seconds. A tool-correlation recovery retry consumes only the remaining time from
+the original model-stage budget. Timed-out or cancelled shell commands kill and
+reap their whole process group.
 
 Startup fails, loudly, when:
 
