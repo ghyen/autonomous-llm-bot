@@ -27,7 +27,7 @@ LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"})
 # Per-stage deadlines. Separated on purpose: connecting, waiting for the next
 # stream chunk, and the whole stage are different failure modes.
 DEFAULT_CONNECT_TIMEOUT = 15.0
-DEFAULT_IDLE_TIMEOUT = 120.0
+DEFAULT_IDLE_TIMEOUT = 300.0
 DEFAULT_MODEL_STAGE_TIMEOUT = 600.0
 DEFAULT_TOOL_STAGE_TIMEOUT = 120.0
 DEFAULT_BASH_TIMEOUT = 60.0
