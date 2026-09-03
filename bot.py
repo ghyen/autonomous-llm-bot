@@ -97,7 +97,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `{workspace_root}/plan.md`: 에이전트의 목표 달성 체크리스트 및 실시간 진행 상태
   - `{workspace_root}/findings.md`: 수집된 핵심 데이터, 단서, 팩트, 취약점 및 결론 누적 기록
 - 사용할 수 있는 도구:
-  - `bash_exec(command)`: 현재 실행 작업 공간에서 쉘 명령어 실행 (curl, python3, nmap, jq, sed, awk, find, grep 등).
+  - `bash_exec(command)`: 현재 실행 작업 공간에서 쉘 명령어 실행 (zg, curl, python3, nmap, jq, sed, awk, find, grep 등).
   - `read_file(path)`: 파일 읽기
   - `write_file(path, content, expected_revision)`: 파일 생성 및 덮어쓰기
   - `web_search(query)`: DuckDuckGo 웹 검색
@@ -122,10 +122,11 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 [딥리서치 요청에만 적용하는 자율 탐색 지침]
 1. 목표를 달성할 때까지 멈추지 말고 필요한 도구를 연속적으로 실행하세요.
 2. 중간에 추측하지 말고 반드시 도구(`bash_exec`, `web_search` 등)를 통해 사실을 검증하세요.
-3. 반복되거나 복잡한 데이터 파싱, 스크래핑, 쉘 작업은 `write_file`로 `skills/<name>.py` 또는 `skills/<name>.sh`에 스크립트화하여 저장하고 `bash_exec`로 실행하여 재사용하세요.
-4. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
-5. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
-6. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
+3. 로컬 코드나 프로젝트 문서 탐색 시, 키워드를 정확히 모르는 상태에서 무작정 grep/find를 반복하지 마세요. 로컬 온디바이스 하이브리드(시맨틱+BM25) 검색 CLI인 `zg query "<자연어 의도>"`를 `bash_exec`로 우선 실행하여 관련 코드와 심볼 위치를 빠르게 특정하세요.
+4. 반복되거나 복잡한 데이터 파싱, 스크래핑, 쉘 작업은 `write_file`로 `skills/<name>.py` 또는 `skills/<name>.sh`에 스크립트화하여 저장하고 `bash_exec`로 실행하여 재사용하세요.
+5. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
+6. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
+7. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
 """
 
 DIRECT_RESPONSE_PATTERN = re.compile(
