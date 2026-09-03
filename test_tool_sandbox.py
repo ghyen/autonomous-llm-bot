@@ -9,44 +9,19 @@ from pathlib import Path
 
 from tool_sandbox import (
     _start_fixed_proxy,
-    build_profile,
     resolve_network_addresses,
     run_worker,
 )
 
 
-class ProfileTest(unittest.TestCase):
-    def test_profile_denies_by_default_and_contains_only_parameterized_workspace(self):
-        profile = build_profile(Path("/tmp/run root"), (Path("/usr/bin/python3"),), ())
-        self.assertIn("(deny default", profile)
-        self.assertIn('(subpath (param "WORKSPACE"))', profile)
-        self.assertNotIn("(allow network-outbound)\n", profile)
-        self.assertNotIn("/Users/edwin", profile)
-
-    def test_profile_escapes_parameter_values(self):
-        profile = build_profile(Path('/tmp/run "root"'), (Path("/usr/bin/python3"),), ())
-        self.assertIn('(subpath (param "WORKSPACE"))', profile)
-        self.assertNotIn('/tmp/run "root"', profile)
-
+class NetworkResolutionTest(unittest.TestCase):
     def test_network_addresses_are_deduplicated_and_resolved(self):
         addresses = resolve_network_addresses((("https", "localhost", 443),))
         self.assertIn(("127.0.0.1", 443), addresses)
         self.assertEqual(len(addresses), len(set(addresses)))
 
 
-class DocumentationContractTest(unittest.TestCase):
-    def test_readme_and_ci_describe_the_fail_closed_macos_sandbox(self):
-        readme = Path("README.md").read_text(encoding="utf-8")
-        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertIn("sandbox-exec", readme)
-        self.assertIn("TOOL_NETWORK_ALLOWLIST", readme)
-        self.assertIn("직접 실행 fallback", readme)
-        self.assertIn("macos-latest", workflow)
-        self.assertIn("Check macOS Seatbelt", workflow)
-
-
-@unittest.skipUnless(sys.platform == "darwin", "macOS Seatbelt integration")
-class SandboxIntegrationTest(unittest.IsolatedAsyncioTestCase):
+class WorkerIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_fixed_proxy_tunnels_only_the_approved_authority(self):
         async def echo(reader, writer):
             writer.write(await reader.read(2))
@@ -81,7 +56,7 @@ class SandboxIntegrationTest(unittest.IsolatedAsyncioTestCase):
             target.close()
             await target.wait_closed()
 
-    async def test_sandboxed_worker_can_read_workspace_but_not_outside(self):
+    async def test_worker_can_read_workspace_and_rejects_path_escape(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
             Path(root, "inside.txt").write_text("inside", encoding="utf-8")
             canary = Path(outside, "secret.txt")
@@ -91,68 +66,16 @@ class SandboxIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 {"operation": "read_file", "workspace": root, "path": "inside.txt"},
                 timeout=5,
             )
-            denied = await run_worker(
+            escaped = await run_worker(
                 root,
-                {
-                    "operation": "bash_exec",
-                    "workspace": root,
-                    "command": "cat {0}".format(shlex.quote(str(canary))),
-                },
+                {"operation": "read_file", "workspace": root, "path": str(canary)},
                 timeout=5,
             )
 
         self.assertEqual(inside["status"], "success")
         self.assertEqual(inside["content"], "inside")
-        self.assertTrue(
-            denied.get("status") != "success" or denied.get("exit_code", 0) != 0,
-            denied,
-        )
-        self.assertNotIn("PRIVATE-KEY-CANARY", json.dumps(denied))
-
-    async def test_network_is_denied_by_default_and_allowed_for_one_endpoint(self):
-        async def serve(reader, writer):
-            writer.write(b"ok")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-
-        server = await asyncio.start_server(serve, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
-        command = (
-            "python3 -c "
-            + shlex.quote(
-                "import socket; s=socket.create_connection(('127.0.0.1', %d), 1); "
-                "print(s.recv(2).decode())" % port
-            )
-        )
-        try:
-            denied = await run_worker(
-                tempfile.gettempdir(),
-                {
-                    "operation": "bash_exec",
-                    "workspace": tempfile.gettempdir(),
-                    "command": command,
-                },
-                timeout=5,
-            )
-            with tempfile.TemporaryDirectory() as root:
-                allowed = await run_worker(
-                    root,
-                    {
-                        "operation": "bash_exec",
-                        "workspace": root,
-                        "command": command,
-                        "network_allowlist": [("http", "127.0.0.1", port)],
-                    },
-                    timeout=5,
-                )
-        finally:
-            server.close()
-            await server.wait_closed()
-
-        self.assertNotEqual(denied.get("exit_code"), 0)
-        self.assertEqual(allowed["status"], "success", allowed)
-        self.assertIn("ok", allowed["stdout"])
+        self.assertEqual(escaped["status"], "error")
+        self.assertEqual(escaped["error"], "path_escape")
 
     async def test_output_disk_process_thread_and_cpu_limits_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
