@@ -27,7 +27,15 @@ _WORKSPACE_IO_SPEC.loader.exec_module(workspace_io)
 _VIRTUALENV_BIN = Path(sys.prefix) / "bin"
 FIXED_PATH = os.pathsep.join(
     str(path)
-    for path in (_VIRTUALENV_BIN, Path("/usr/bin"), Path("/bin"), Path("/usr/sbin"), Path("/sbin"))
+    for path in (
+        _VIRTUALENV_BIN,
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("/bin"),
+        Path("/usr/sbin"),
+        Path("/sbin"),
+    )
     if path.is_dir()
 )
 DEFAULT_TIMEOUT = 60.0
