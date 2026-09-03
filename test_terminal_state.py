@@ -144,21 +144,37 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
         self.assertIn("완료 시간", self.final_reply)
         self.assertNotIn("미완료", self.final_reply)
 
-    async def test_2_short_completion_text_after_tools_does_not_end_the_run(self):
-        """The keyword+length guess is gone. Only finish_task completes a run."""
+    async def test_2_completion_text_after_tools_does_not_stall_and_continues_until_budget(self):
+        """Completion text without finish_task continues autonomously without stall until step budget."""
         await self.drive(
             [
                 _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
                 _response(content="최종 결론 보고서: " + ("정리 완료. " * 60)),
             ],
-            max_loops=12,
+            max_loops=3,
         )
 
         self.assertEqual(len(self.recorder.settled), 1)
         self.assertEqual(self.recorder.reason, outcome_mod.EXHAUSTED)
-        self.assertIn(outcome_mod.DETAIL_NO_TOOL_STALL, self.recorder.detail)
+        self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_STEP_BUDGET)
         self.assertIn("미완료", self.final_reply)
-        self.assertNotIn("완료 시간", self.final_reply)
+
+    async def test_2b_internal_thought_without_tools_continues_to_next_step(self):
+        """Pure internal reasoning (<think> only) proceeds without stall or nudge until finish_task."""
+        await self.drive(
+            [
+                _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                _response(content="<think>추가 단서를 위해 README를 확인해야겠다.</think>"),
+                _response(tool_calls=[_tool_call("c2", "bash_exec", {"command": "cat README.md"})]),
+                _response(tool_calls=[_tool_call("c3", "finish_task", {"report": "완료 보고서"})]),
+            ],
+            max_loops=12,
+        )
+
+        self.assertEqual(len(self.recorder.settled), 1)
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_FINISH_TASK)
+        self.assertIn("완료 시간", self.final_reply)
 
     # Mutation caught: omitting the post-model cancellation checkpoint lets
     # the response returned after cancellation start its second tool, probe2.
