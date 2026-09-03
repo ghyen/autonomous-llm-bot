@@ -71,7 +71,7 @@ def _worker_limits(request):
 def _worker_environment(workspace):
     root = str(Path(os.path.realpath(os.fspath(workspace))))
     return {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "C",
         "LC_ALL": "C",
         "HOME": root,
