@@ -23,14 +23,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Check macOS Seatbelt
-        run: |
-          profile='(version 1) (deny default) (allow file-read*) (allow file-map-executable) (allow process-exec*)'
-          if ! test -x /usr/bin/sandbox-exec || ! /usr/bin/sandbox-exec -p "$profile" /usr/bin/true; then
-            echo "::error::macOS sandbox-exec is unavailable or refused a minimal Seatbelt profile"
-            exit 1
-          fi
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

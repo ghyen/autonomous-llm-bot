@@ -85,8 +85,6 @@ User Prompt (Discord) ────────┐
 ### 1. Prerequisites
 
 - Python 3.10+
-- macOS with executable `/usr/bin/sandbox-exec` for OS-facing tools. On other
-  platforms, or when Seatbelt is unavailable, those tools fail closed.
 - A running OpenAI-compatible local LLM server (e.g. [Rapid-MLX](https://github.com/alexw/rapid-mlx) with Qwen 2.5 / Qwen 3.8 / DeepSeek, Ollama, or vLLM)
 - A Discord Bot Token ([Discord Developer Portal](https://discord.com/developers/applications))
 
@@ -352,16 +350,14 @@ files are not handed to the shell. `record_state` and `finish_task` are the
 explicit parent-process exceptions because they own the live ledger and
 terminal state; they do not run shell commands or open arbitrary files.
 
-### macOS tool-worker contract
+### Tool-worker contract
 
 Every `bash_exec`, `read_file`, `write_file`, and `web_search` call starts a new
-`sandbox-exec` worker and sends exactly one JSON request. There is no direct
-execution fallback (직접 실행 fallback 없음): missing Seatbelt, an invalid profile, an unresolved network
-destination, a malformed response, or an unsupported platform returns a
-deterministic tool error.
+disposable tool worker and sends exactly one JSON request. Tool operations execute
+directly through the dedicated worker process without macOS Seatbelt (`sandbox-exec`)
+kernel restrictions, eliminating operation-not-permitted errors while preserving
+resource limits and structured execution envelopes.
 
-The worker permits only the current run workspace, the Python runtime needed to
-start it, and the fixed system files required for DNS/TLS and process startup.
 Shell descendants stay in a dedicated process group and are reaped on
 cancellation, timeout, output overflow, or a resource violation.
 
@@ -372,12 +368,6 @@ resource limits. macOS rejects lowering `RLIMIT_AS`, so the worker enforces the
 memory ceiling with a fail-closed RSS monitor over the worker and its child
 tree. Workspace bytes are sampled every 50 ms; this is a bounded monitoring
 ceiling, not a filesystem quota.
-
-`sandbox-exec` and its SBPL language are deprecated/undocumented macOS
-interfaces. This deployment therefore keeps the profile small, runs real
-Seatbelt integration tests on macOS CI, and does not claim portability to Linux
-or Windows. The broker/network and monitor limitations are recorded in
-[`docs/adr/2026-09-02-macos-seatbelt-tool-sandbox.md`](docs/adr/2026-09-02-macos-seatbelt-tool-sandbox.md).
 
 Only root `plan.md` and `findings.md` are canonical. Their revision is
 `sha256:<64 lowercase hex>` over exact bytes, or `absent` before creation. A

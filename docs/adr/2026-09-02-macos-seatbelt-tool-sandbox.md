@@ -1,6 +1,6 @@
 # ADR: macOS Seatbelt tool workers
 
-- Status: accepted
+- Status: superseded by Issue #34 (switched to direct disposable worker execution)
 - Date: 2026-09-02
 - Scope: issues #10 and #27
 - Deployment target: macOS LaunchAgent
