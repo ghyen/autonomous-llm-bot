@@ -1,4 +1,4 @@
-"""macOS Seatbelt supervisor for disposable tool workers."""
+"""Direct process supervisor for disposable tool workers."""
 
 import asyncio
 import ipaddress
@@ -7,13 +7,11 @@ import math
 import os
 import socket
 import sys
-import sysconfig
 from pathlib import Path
 
 import workspace_io
 
 
-SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 WORKER_PATH = Path(__file__).resolve().with_name("tool_worker.py")
 DEFAULT_LIMITS = {
     "cpu_seconds": 30.0,
@@ -27,70 +25,8 @@ DEFAULT_LIMITS = {
 }
 
 
-def _sbpl_param(name):
-    return '(param "{0}")'.format(name)
-
-
-def _remote_address(address, port):
-    try:
-        if ipaddress.ip_address(address).is_loopback:
-            return "localhost:{0}".format(port)
-    except ValueError:
-        raise RuntimeError("network address is not numeric")
-    if ":" in address:
-        raise RuntimeError("macOS Seatbelt cannot filter IPv6 network destinations")
-    raise RuntimeError("macOS Seatbelt cannot filter non-local network destinations")
-
-
-def build_profile(workspace, runtime_paths, network_addresses):
-    """Build a deny-by-default profile without interpolating model input."""
-    del workspace
-    del runtime_paths  # Values are passed with -D; profile text stays constant.
-    lines = [
-        "(version 1)",
-        "(deny default (with no-callout))",
-        # Reading the root vnode lets dyld/Python traverse approved paths; it
-        # does not grant file contents outside the rules below.
-        "(allow file-read* (literal \"/\"))",
-        "(allow file-read-metadata)",
-        "(allow file-read* (subpath {0}))".format(_sbpl_param("WORKSPACE")),
-        "(allow file-write* (subpath {0}))".format(_sbpl_param("WORKSPACE")),
-        "(allow file-read* (literal {0}) (literal {1}))".format(
-            _sbpl_param("WORKER"), _sbpl_param("WORKSPACE_IO")
-        ),
-        "(allow file-read-metadata (subpath {0}))".format(_sbpl_param("WORKER_DIR")),
-        "(allow file-read* (subpath {0}))".format(_sbpl_param("PYTHON_PREFIX")),
-        "(allow file-read* (subpath {0}))".format(_sbpl_param("PYTHON_LIBDIR")),
-        "(allow file-read* (subpath {0}))".format(_sbpl_param("PYTHON_STDLIB")),
-        "(allow file-read* (subpath {0}))".format(_sbpl_param("PYTHON_SITE")),
-        "(allow file-read* (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/opt/homebrew\"))",
-        "(allow file-read* file-write-data (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/random\") (literal \"/dev/zero\"))",
-        "(allow file-read* (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/etc/protocols\") (literal \"/private/etc/services\") (literal \"/private/etc/ssl/cert.pem\"))",
-        "(allow file-read* file-write-data (literal \"/private/var/run/mDNSResponder\"))",
-        "(allow file-map-executable (literal {0}) (subpath {1}) (subpath \"/System\") (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/opt/homebrew\"))".format(
-            _sbpl_param("PYTHON_EXECUTABLE"), _sbpl_param("PYTHON_PREFIX")
-        ),
-        "(allow process-fork)",
-        "(allow process-exec*)",
-        "(allow signal (target same-sandbox))",
-        "(allow process-info* (target self))",
-        "(allow process-info-listpids)",
-        "(allow process-info-pidinfo)",
-        "(allow sysctl-read)",
-        "(allow ipc-posix-shm)",
-        "(allow mach-lookup (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.system.logger\"))",
-    ]
-    for address, port in network_addresses:
-        lines.append(
-            '(allow network-outbound (remote tcp "{0}"))'.format(
-                _remote_address(address, port)
-            )
-        )
-    return "\n".join(lines) + "\n"
-
-
 def resolve_network_addresses(entries):
-    """Resolve operator-approved origins before compiling the profile."""
+    """Resolve operator-approved origins before starting the worker proxy."""
     addresses = set()
     for _scheme, host, port in entries:
         try:
@@ -112,25 +48,6 @@ def resolve_network_addresses(entries):
         if not results:
             raise RuntimeError("network destination could not be resolved")
     return tuple(sorted(addresses))
-
-
-def _runtime_parameters():
-    stdlib = sysconfig.get_path("stdlib")
-    site = sysconfig.get_path("purelib") or sysconfig.get_path("platlib")
-    libdir = sysconfig.get_config_var("LIBDIR")
-    values = {
-        "PYTHON_EXECUTABLE": str(Path(sys.executable).resolve()),
-        "PYTHON_PREFIX": str(Path(sys.prefix).resolve()),
-        "PYTHON_LIBDIR": str(Path(libdir).resolve()) if libdir else "",
-        "PYTHON_STDLIB": str(Path(stdlib).resolve()) if stdlib else "",
-        "PYTHON_SITE": str(Path(site).resolve()) if site else "",
-        "WORKER": str(WORKER_PATH),
-        "WORKSPACE_IO": str(Path(workspace_io.__file__).resolve()),
-        "WORKER_DIR": str(WORKER_PATH.parent),
-    }
-    if not all(values.values()):
-        raise RuntimeError("python runtime paths are unavailable")
-    return values
 
 
 def _worker_limits(request):
@@ -341,11 +258,9 @@ async def _collect_process(proc, timeout, token, response_limit):
 
 
 async def run_worker(workspace, request, timeout, token=None):
-    """Run exactly one request in a fresh Seatbelt process; never falls back."""
-    if sys.platform != "darwin" or not SANDBOX_EXEC.is_file() or not os.access(
-        str(SANDBOX_EXEC), os.X_OK
-    ):
-        return {"status": "error", "error": "sandbox_unavailable"}
+    """Run exactly one request in a fresh worker process."""
+    if not WORKER_PATH.is_file():
+        return {"status": "error", "error": "worker_unavailable"}
     if not isinstance(request, dict):
         return {"status": "error", "error": "invalid_request"}
     try:
@@ -370,16 +285,7 @@ async def run_worker(workspace, request, timeout, token=None):
             proxy_server = await _start_fixed_proxy(
                 target_addresses, target_entry[1], target_entry[2]
             )
-            addresses = (("127.0.0.1", proxy_server.sockets[0].getsockname()[1]),)
-        else:
-            addresses = resolve_network_addresses(entries)
-        parameters = _runtime_parameters()
-        parameters["WORKSPACE"] = str(root)
-        profile = build_profile(root, tuple(Path(value) for value in parameters.values()), addresses)
-        command = [str(SANDBOX_EXEC)]
-        for key, value in parameters.items():
-            command.extend(("-D", "{0}={1}".format(key, value)))
-        command.extend(("-p", profile, sys.executable, "-B", str(WORKER_PATH)))
+        command = [sys.executable, "-B", str(WORKER_PATH)]
         payload = dict(request)
         payload["workspace"] = str(root)
         payload["display_workspace"] = display_root
@@ -417,7 +323,7 @@ async def run_worker(workspace, request, timeout, token=None):
     except (OSError, TypeError, ValueError, RuntimeError):
         if process is not None:
             await _kill_process_group(process)
-        return {"status": "error", "error": "sandbox_unavailable"}
+        return {"status": "error", "error": "worker_unavailable"}
     finally:
         if proxy_server is not None:
             proxy_server.close()
