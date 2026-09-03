@@ -457,8 +457,6 @@ MAX_TOOL_EXECUTIONS_PER_RUN = 250
 # 한 채널이 이후 모든 스텝의 프롬프트를 대기 깊이만큼 부풀릴 수 있다.
 STEERING_QUEUE_MAX = 8
 
-MAX_NO_TOOL_RESPONSES = 6
-
 
 def _robust_json_loads(raw: str):
     """Parse JSON with resilience to markdown fences, unescaped newlines, and trailing commas."""
@@ -2892,7 +2890,6 @@ async def on_message(message: discord.Message):
 
     final_raw = ""
     refused_companion_calls = []
-    consecutive_no_tool_responses = 0
     # 업스트림 예외 본문은 사용자에게는 필요하고 로그에는 위험하다. 종료 사유는
     # 종류만 담아 로그로 가고, 잘라낸 본문은 사용자 보고서에만 붙는다(이슈 #11).
     stage_failure_note = ""
@@ -3532,8 +3529,6 @@ async def on_message(message: discord.Message):
                             f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
                         )})
 
-                consecutive_no_tool_responses = 0
-
                 # 마지막 스텝이면 여기서 소진으로 확정한다. 불필요한 롤오버를
                 # 한 번 더 돌리고 나서 루프 경계로 조용히 끝나지 않도록.
                 if token.cancelled:
@@ -3550,19 +3545,9 @@ async def on_message(message: discord.Message):
                     break
                 continue
 
-            # [도구 호출 없는 응답] 완료 의사는 문구로 추정하지 않는다.
-            # finish_task만이 완료 신호이며, 여기서는 그것을 요구하고 계속 진행한다.
-            consecutive_no_tool_responses += 1
+            # [도구 호출 없는 내부 추론 응답]
             if token.cancelled:
                 outcome.settle(outcome_mod.STOPPED, token.reason)
-                final_raw = full_raw_thought or content_text
-                break
-
-            if consecutive_no_tool_responses >= MAX_NO_TOOL_RESPONSES:
-                outcome.settle(
-                    outcome_mod.EXHAUSTED,
-                    f"{outcome_mod.DETAIL_NO_TOOL_STALL} {consecutive_no_tool_responses}회",
-                )
                 final_raw = full_raw_thought or content_text
                 break
 
@@ -3571,29 +3556,20 @@ async def on_message(message: discord.Message):
                 final_raw = full_raw_thought or content_text
                 break
 
-            nudge_content = (
-                "[🤖 시스템 자율 루프 유지 안내: 도구가 호출되지 않았습니다. "
-                "사용자의 목표를 100% 달성하기 위해 필요한 bash_exec 명령어를 계속 실행하세요. "
-                "조사가 완전히 끝났다면 반드시 finish_task(report=...)를 호출하세요. "
-                "본문에 '최종 보고서'라고 쓰는 것만으로는 종료되지 않습니다.]"
-            )
+            # 모델이 도구 없이 내부 추론(thought/plan)만 진행한 경우:
+            # 강제 넛지나 정체(stall) 실패 없이 자율적으로 다음 스텝으로 추론을 잇는다.
             messages_payload.append({
                 "role": "assistant",
-                "content": content_text or "[중간 진행 계획]"
-            })
-            messages_payload.append({
-                "role": "user",
-                "content": nudge_content
+                "content": content_text or "[자율 내부 추론]",
             })
             log_session_event(
                 workspace,
-                "nudge",
+                "internal_thought",
                 step=iteration + 1,
-                no_tool_streak=consecutive_no_tool_responses,
-                content_chars=len(content_text),
+                content_chars=len(content_text or ""),
             )
             try:
-                await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 루프 가속 진행 중... ▌")
+                await status_msg.edit(content=f"🧠 **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 내부 추론 및 분석 진행 중... ▌")
             except Exception:
                 pass
             try:
