@@ -2002,55 +2002,6 @@ def build_incomplete_report(outcome, ledger, rolling_summary: str, messages_payl
     return "\n\n".join(sections)
 
 
-def extract_thought_monologue(reasoning_text: str, content_text: str) -> str:
-    """스레드 타임라인에 기록할 모델의 원문 사고 독백을 추출한다."""
-    snippet = ""
-    if reasoning_text and reasoning_text.strip():
-        snippet = reasoning_text.strip()
-    elif content_text and "<think>" in content_text:
-        think_match = re.search(r"<think>(.*?)(?:</think>|$)", content_text, flags=re.DOTALL)
-        if think_match:
-            snippet = think_match.group(1).strip()
-    elif content_text:
-        cleaned = re.sub(
-            r"</?(function|parameter|tool_call)[^>]*>|<tool_call>.*?</tool_call>",
-            "",
-            content_text,
-            flags=re.DOTALL,
-        ).strip()
-        if cleaned and not (cleaned.startswith("{") and cleaned.endswith("}")):
-            snippet = cleaned
-
-    return snippet.strip() if snippet else ""
-
-
-async def send_thought_to_thread(thread, step_num: int, thought_text: str):
-    """모델의 사고 독백을 스레드 타임라인에 안전하게 분할 전송한다."""
-    if not thread or not thought_text:
-        return
-
-    text = thought_text.strip().replace("`" * 3, "'''")
-    if not text:
-        return
-
-    max_chunk = 1800
-    if len(text) <= max_chunk:
-        msg = f"🧠 **[Step {step_num} 사고 독백 / 판단 근거]**\n```text\n{text}\n```"
-        try:
-            await thread.send(msg)
-        except Exception:
-            pass
-    else:
-        chunks = [text[i:i + max_chunk] for i in range(0, len(text), max_chunk)]
-        for idx, chunk in enumerate(chunks):
-            chunk_header = f"🧠 **[Step {step_num} 사고 독백]** *(Part {idx+1}/{len(chunks)})*\n"
-            msg = f"{chunk_header}```text\n{chunk}\n```"
-            try:
-                await thread.send(msg)
-            except Exception:
-                pass
-
-
 def format_full_discord_output(text: str) -> str:
     if not text:
         return ""
@@ -2858,20 +2809,6 @@ async def on_message(message: discord.Message):
         release_run()
         raise
 
-    reasoning_thread = None
-    if isinstance(message.channel, discord.Thread):
-        reasoning_thread = message.channel
-    elif hasattr(message, "create_thread") and callable(getattr(message, "create_thread", None)):
-        try:
-            clean_prompt = re.sub(r"\s+", " ", message.content or "").strip()
-            thread_title = (clean_prompt[:25] + "…") if len(clean_prompt) > 25 else (clean_prompt or "자율 탐색")
-            reasoning_thread = await message.create_thread(
-                name=f"💭 추론 타임라인 - {thread_title}",
-                auto_archive_duration=60,
-            )
-        except Exception:
-            reasoning_thread = None
-
     def apply_steering(step_num: int):
         """대기 중인 지시를 도착 순서대로 흡수한다.
 
@@ -3136,23 +3073,19 @@ async def on_message(message: discord.Message):
             )
 
             # [실시간 진행 상황 디스코드 카드 라이브 업데이트]
-            thread_guide = f"> 💭 **실시간 추론**: <#{reasoning_thread.id}> 스레드에 독백 기록 중\n" if reasoning_thread else f"> 🧠 **실시간 추론 규모**: 추론 `{len(reasoning_text)}자` / 본문 `{len(content_text)}자` (추론 원문은 스레드에 보존됩니다)\n"
+            # 추론 스니펫은 더 이상 싣지 않는다. 로그에서 원문을 지워도 같은
+            # 내용이 채널에 남으면 아무것도 해결되지 않는다(이슈 #11).
             elapsed_live = format_elapsed_time(time.time() - start_time)
             status_live_text = (
                 f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
                 f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 실행 도구: `{total_tools_executed}개`)\n"
-                f"{thread_guide}"
+                f"> 🧠 **실시간 추론 규모**: 추론 `{len(reasoning_text)}자` / 본문 `{len(content_text)}자` (추론 원문은 공개하지 않습니다)\n"
                 f"> ⚡ *자율 탐색 및 추론 진행 중... (실시간 지시/피드백 가능 / 중단: `!stop`)*"
             )
             try:
                 await status_msg.edit(content=status_live_text)
             except Exception:
                 pass
-
-            # [작업 전용 스레드에 실시간 사고 독백 전송]
-            thought_monologue = extract_thought_monologue(reasoning_text, content_text)
-            if thought_monologue and reasoning_thread:
-                await send_thought_to_thread(reasoning_thread, iteration + 1, thought_monologue)
 
             # Discord I/O above can yield to !stop after the model-stage check.
             # Cancellation must win before any terminal decision or dispatch.
@@ -3880,11 +3813,6 @@ async def on_message(message: discord.Message):
 
         history.append({"role": "assistant", "content": final_text})
         log_run_end(outcome, chars=len(final_text), chunks=len(chunks))
-        if reasoning_thread:
-            try:
-                await reasoning_thread.send(f"🏁 **[탐색 완료]** 작업이 완료되어 메인 채널에 보고서가 전달되었습니다. (`{outcome.label}`)")
-            except Exception:
-                pass
 
     except Exception as e:
         outcome.settle(outcome_mod.FAILED, f"예외: {type(e).__name__}")
