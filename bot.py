@@ -448,7 +448,7 @@ def steering_receipt_notice(receipt, text: str) -> str:
 
 
 MAX_RECENT_TURNS = 8
-CHECKPOINT_INTERVAL = 10
+CHECKPOINT_INTERVAL = 30
 MAX_AGENT_LOOPS = 250
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = 250
@@ -3378,7 +3378,7 @@ async def on_message(message: discord.Message):
                 # 저장 경계는 여기이며, 병렬 호출/결과 그룹 중간이 아니다.
                 save_snapshot(iteration + 2, "tool_group")
 
-                # [매 10스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
+                # [매 30스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
                 # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
                 # 쓰이는 것은 바로 위 save_snapshot이 남긴 durable 레코드다.
                 if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
