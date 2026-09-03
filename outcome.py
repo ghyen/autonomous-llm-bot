@@ -30,7 +30,6 @@ DETAIL_FINISH_TASK = "finish_task 호출"
 DETAIL_DIRECT_ANSWER = "도구 없이 직접 답변"
 DETAIL_USER_STOP = "사용자 중단 요청"
 DETAIL_STEP_BUDGET = "스텝 예산 소진"
-DETAIL_NO_TOOL_STALL = "도구 호출 없이 연속 응답"
 
 
 class RunOutcome:
