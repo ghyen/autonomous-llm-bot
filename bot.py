@@ -453,6 +453,7 @@ CHECKPOINT_INTERVAL = 50
 MAX_AGENT_LOOPS = 350
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = 350
+AGENT_STEP_MAX_TOKENS = 8192
 
 # 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
 # 한 채널이 이후 모든 스텝의 프롬프트를 대기 깊이만큼 부풀릴 수 있다.
@@ -3074,7 +3075,7 @@ async def on_message(message: discord.Message):
                     deadline=model_stage_deadline,
                     model=MODEL_NAME,
                     messages=compacted_payload,
-                    max_tokens=1024 if iteration == 0 else 4096,
+                    max_tokens=1024 if iteration == 0 else AGENT_STEP_MAX_TOKENS,
                     temperature=0.7,
                     **agent_tool_params(),
                     **extra_params
@@ -3118,7 +3119,7 @@ async def on_message(message: discord.Message):
                         deadline=model_stage_deadline,
                         model=MODEL_NAME,
                         messages=retry_payload,
-                        max_tokens=1024 if iteration == 0 else 4096,
+                        max_tokens=1024 if iteration == 0 else AGENT_STEP_MAX_TOKENS,
                         temperature=0.7,
                         **extra_params
                     )
