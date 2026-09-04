@@ -1100,8 +1100,9 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             if bot._msg_role(payload_message) == "tool"
             and payload_message.get("tool_call_id") == "older-call"
         )
-        self.assertIn("실행 결과 생략", older_tool["content"])
-        self.assertNotEqual(older_tool["content"], SUCCESS_RESULT)
+        # 불변(Append-only) 컨텍스트: 과거 도구 결과를 사후 변조하지 않고 보존하여 Prefix Cache HIT를 유지한다.
+        self.assertNotIn("실행 결과 생략", older_tool["content"])
+        self.assertEqual(older_tool["content"], SUCCESS_RESULT)
 
     # Mutation caught: preserving only two results from a 101-call group makes
     # 96 of its 98 structured run-budget blocks non-JSON in the next payload.
