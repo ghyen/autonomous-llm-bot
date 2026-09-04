@@ -9,6 +9,7 @@ from pathlib import Path
 
 CANONICAL_NAMES = frozenset(("plan.md", "findings.md"))
 REVISION_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
 
 
 def revision(data):
@@ -105,8 +106,8 @@ def read_file(root, path, max_bytes=None):
     file_revision = revision(data)
     content = data.decode("utf-8", errors="replace")
     truncated = False
-    if not is_canonical(root, target) and len(content) > 4000:
-        content = content[:4000]
+    if not is_canonical(root, target) and len(content) > DEFAULT_TOOL_OUTPUT_MAX_CHARS:
+        content = content[:DEFAULT_TOOL_OUTPUT_MAX_CHARS]
         truncated = True
     return {
         "status": "success",

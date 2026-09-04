@@ -19,6 +19,7 @@ from test_support import (
 )
 
 import bot
+import workspace_io
 
 try:
     import run_workspace
@@ -343,7 +344,7 @@ class CanonicalIntegrityTest(WorkspaceTestCase):
         self.assertEqual(changed["content"], changed_bytes.decode())
         self.assertEqual(changed["revision"], sha256(changed_bytes))
         self.assertTrue(ordinary["truncated"])
-        self.assertEqual(len(ordinary["content"]), 4000)
+        self.assertEqual(len(ordinary["content"]), workspace_io.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
         self.assertEqual(ordinary["revision"], sha256(b"x" * 5001))
 
     async def test_canonical_cas_is_atomic_and_concurrent_writers_have_one_winner(self):
