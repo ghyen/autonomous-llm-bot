@@ -1891,18 +1891,191 @@ LOCAL_FALLBACK_OMISSION_MARKER = (
 )
 
 
+def get_open_code_fence(text: str) -> Optional[str]:
+    """Return the opening fence string if the text ends inside a code block, else None."""
+    open_fence = None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if open_fence is None:
+            match = re.match(r"^(`{3,}|~{3,})(\S*)", stripped)
+            if match:
+                f_chars = match.group(1)
+                rest = stripped[match.end():]
+                if f_chars not in rest:
+                    open_fence = match.group(0)
+        else:
+            c_chars = open_fence[:3]
+            match = re.match(r"^(`{3,}|~{3,})\s*$", stripped)
+            if match and match.group(1).startswith(c_chars) and len(match.group(1)) >= len(c_chars):
+                open_fence = None
+    return open_fence
+
+
+def split_markdown_chunks(text: str, max_chars: int = DISCORD_CHUNK_MAX_CHARS) -> List[str]:
+    """Split text into Discord chunks while preserving and balancing markdown code fences."""
+    text = str(text or "")
+    if not text:
+        return [""]
+    if len(text) <= max_chars:
+        open_fence = get_open_code_fence(text)
+        if open_fence:
+            return [text + "\n" + open_fence[:3]]
+        return [text]
+
+    lines = text.split("\n")
+    chunks = []
+    current_lines = []
+    current_len = 0
+    active_fence = None
+
+    def close_fence_str(fence: Optional[str]) -> str:
+        return fence[:3] if fence else "```"
+
+    for line in lines:
+        stripped = line.strip()
+        is_opening_fence = False
+        is_closing_fence = False
+        new_fence = None
+
+        if active_fence is None:
+            match = re.match(r"^(`{3,}|~{3,})(\S*)", stripped)
+            if match:
+                f_chars = match.group(1)
+                rest = stripped[match.end():]
+                if f_chars not in rest:
+                    is_opening_fence = True
+                    new_fence = match.group(0)
+        else:
+            c_chars = close_fence_str(active_fence)
+            match = re.match(r"^(`{3,}|~{3,})\s*$", stripped)
+            if match and match.group(1).startswith(c_chars) and len(match.group(1)) >= len(c_chars):
+                is_closing_fence = True
+
+        line_cost = len(line) + (1 if current_lines else 0)
+        fence_overhead = (1 + len(close_fence_str(active_fence))) if active_fence is not None else 0
+
+        if current_lines and (current_len + line_cost + fence_overhead > max_chars):
+            chunk_text = "\n".join(current_lines)
+            if active_fence is not None:
+                chunk_text += "\n" + close_fence_str(active_fence)
+            chunks.append(chunk_text)
+
+            current_lines = []
+            current_len = 0
+            if active_fence is not None:
+                current_lines.append(active_fence)
+                current_len = len(active_fence)
+
+        avail = max_chars - current_len - (1 if current_lines else 0) - fence_overhead
+        if len(line) > avail and len(line) > (max_chars // 2):
+            if current_lines:
+                chunk_text = "\n".join(current_lines)
+                if active_fence is not None:
+                    chunk_text += "\n" + close_fence_str(active_fence)
+                chunks.append(chunk_text)
+                current_lines = []
+                current_len = 0
+                if active_fence is not None:
+                    current_lines.append(active_fence)
+                    current_len = len(active_fence)
+
+            rem_line = line
+            while len(rem_line) > (max_chars - (1 + len(close_fence_str(active_fence)) if active_fence else 0)):
+                chunk_budget = max_chars - current_len - (1 if current_lines else 0) - (
+                    (1 + len(close_fence_str(active_fence))) if active_fence else 0
+                )
+                if chunk_budget <= 100:
+                    chunk_text = "\n".join(current_lines)
+                    if active_fence is not None:
+                        chunk_text += "\n" + close_fence_str(active_fence)
+                    chunks.append(chunk_text)
+                    current_lines = []
+                    current_len = 0
+                    if active_fence is not None:
+                        current_lines.append(active_fence)
+                        current_len = len(active_fence)
+                    chunk_budget = max_chars - current_len - (1 if current_lines else 0) - (
+                        (1 + len(close_fence_str(active_fence))) if active_fence else 0
+                    )
+
+                split_at = rem_line.rfind(" ", 0, chunk_budget)
+                if split_at == -1 or split_at < chunk_budget // 3:
+                    split_at = chunk_budget
+
+                piece = rem_line[:split_at]
+                rem_line = rem_line[split_at:].lstrip(" ")
+                current_lines.append(piece)
+                chunk_text = "\n".join(current_lines)
+                if active_fence is not None:
+                    chunk_text += "\n" + close_fence_str(active_fence)
+                chunks.append(chunk_text)
+                current_lines = []
+                current_len = 0
+                if active_fence is not None:
+                    current_lines.append(active_fence)
+                    current_len = len(active_fence)
+
+            line = rem_line
+
+        if line or not current_lines:
+            if current_lines:
+                current_len += 1 + len(line)
+            else:
+                current_len += len(line)
+            current_lines.append(line)
+
+        if is_opening_fence:
+            active_fence = new_fence
+        elif is_closing_fence:
+            active_fence = None
+
+    if current_lines:
+        chunk_text = "\n".join(current_lines)
+        if active_fence is not None:
+            chunk_text += "\n" + close_fence_str(active_fence)
+        chunks.append(chunk_text)
+
+    return chunks if chunks else [text]
+
+
 def bound_local_fallback_output(text: str) -> str:
     """Bound user-facing fallback without mutating its authoritative sources."""
     text = str(text or "")
     if len(text) <= LOCAL_FALLBACK_MAX_CHARS:
         return text
-    available = LOCAL_FALLBACK_MAX_CHARS - len(LOCAL_FALLBACK_OMISSION_MARKER)
+    available = LOCAL_FALLBACK_MAX_CHARS - len(LOCAL_FALLBACK_OMISSION_MARKER) - 64
     head_chars = available // 2
     tail_chars = available - head_chars
+
+    head_cut = text.rfind("\n", 0, head_chars)
+    if head_cut == -1 or head_cut < head_chars // 2:
+        head_cut = head_chars
+    head = text[:head_cut]
+
+    head_fence = get_open_code_fence(head)
+    if head_fence:
+        head += "\n" + head_fence[:3]
+
+    tail_start = len(text) - tail_chars
+    tail_cut = text.find("\n", tail_start)
+    if tail_cut == -1 or tail_cut > tail_start + (tail_chars // 2):
+        tail_cut = tail_start
+    else:
+        tail_cut += 1
+    tail = text[tail_cut:]
+
+    prefix_fence = get_open_code_fence(text[:tail_cut])
+    if prefix_fence:
+        tail = prefix_fence + "\n" + tail
+
+    tail_fence = get_open_code_fence(tail)
+    if tail_fence:
+        tail += "\n" + tail_fence[:3]
+
     return (
-        text[:head_chars]
+        head
         + LOCAL_FALLBACK_OMISSION_MARKER
-        + text[-tail_chars:]
+        + tail
     )
 
 
@@ -2510,10 +2683,7 @@ async def on_message(message: discord.Message):
     async def send_reply_chunks(text, local_fallback=False):
         if local_fallback:
             text = bound_local_fallback_output(text)
-        chunks = [
-            text[i:i + DISCORD_CHUNK_MAX_CHARS]
-            for i in range(0, len(text), DISCORD_CHUNK_MAX_CHARS)
-        ]
+        chunks = split_markdown_chunks(text, max_chars=DISCORD_CHUNK_MAX_CHARS)
         await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
@@ -3688,22 +3858,7 @@ async def on_message(message: discord.Message):
 
         if uses_local_fallback:
             final_text_with_footer = bound_local_fallback_output(final_text_with_footer)
-            chunks = [
-                final_text_with_footer[i:i + DISCORD_CHUNK_MAX_CHARS]
-                for i in range(0, len(final_text_with_footer), DISCORD_CHUNK_MAX_CHARS)
-            ]
-        else:
-            chunks = []
-            remaining = final_text_with_footer
-            while remaining:
-                if len(remaining) <= DISCORD_CHUNK_MAX_CHARS:
-                    chunks.append(remaining)
-                    break
-                split_idx = remaining.rfind("\n", 0, DISCORD_CHUNK_MAX_CHARS)
-                if split_idx == -1 or split_idx < 1000:
-                    split_idx = DISCORD_CHUNK_MAX_CHARS
-                chunks.append(remaining[:split_idx])
-                remaining = remaining[split_idx:].lstrip("\n")
+        chunks = split_markdown_chunks(final_text_with_footer, max_chars=DISCORD_CHUNK_MAX_CHARS)
 
         try:
             await status_msg.delete()
