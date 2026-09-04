@@ -544,6 +544,7 @@ ROLLING_COMPACTION_INTERVAL = 10
 KEEP_RECENT_TOOL_MESSAGES = 8
 ROLLING_SUMMARY_SOURCE_MAX_CHARS = 24000
 ROLLING_SUMMARY_MAX_CHARS = 10000
+DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
 
 # Transport-level bounds. Application-level stage budgets live in deadlines.py;
 # these stop a request from hanging below the layer those budgets can see.
@@ -630,8 +631,11 @@ async def tool_bash_exec(workspace, command: str) -> str:
         if err_str:
             payload += f"[stderr]\n{strip_ansi(err_str)}\n"
 
-        if len(payload) > 4000:
-            payload = payload[:4000] + "\n... [출력 결과가 너무 길어 4000자로 잘렸습니다. 필요한 경우 grep이나 head/tail로 조회하세요.]"
+        if len(payload) > DEFAULT_TOOL_OUTPUT_MAX_CHARS:
+            payload = (
+                payload[:DEFAULT_TOOL_OUTPUT_MAX_CHARS]
+                + f"\n... [출력 결과가 너무 길어 {DEFAULT_TOOL_OUTPUT_MAX_CHARS}자로 잘렸습니다. 필요한 경우 grep이나 head/tail로 조회하세요.]"
+            )
         payload = payload.strip()
         return f"{payload}\n[exit code: {code}]" if payload else f"[exit code: {code}]"
     except Exception as e:
