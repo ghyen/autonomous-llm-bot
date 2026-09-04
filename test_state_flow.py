@@ -123,8 +123,8 @@ def refuted_ledger():
     return ledger
 
 
-class MicroCompactionTest(unittest.TestCase):
-    def test_state_block_survives_micro_compaction(self):
+class ImmutableContextTest(unittest.TestCase):
+    def test_context_remains_immutable_for_prefix_cache(self):
         ledger = refuted_ledger()
         payload = [{"role": "system", "content": bot.build_system_content(TEST_WORKSPACE, ledger, SEED_SUMMARY)}]
         for step in range(6):
@@ -141,14 +141,13 @@ class MicroCompactionTest(unittest.TestCase):
                 "role": "tool", "tool_call_id": f"c{step}", "name": "bash_exec", "content": BASH_RESULT,
             })
 
-        compacted = bot.validate_chat_payload(
-            bot.apply_micro_compaction(payload, preserve_recent_tool_groups=1)
-        ).messages
-        text = serialize(compacted)
+        validated = bot.validate_chat_payload(payload).messages
+        text = serialize(validated)
 
-        # Old tool results really are gutted - that is the point of compaction.
-        self.assertIn("실행 결과 생략", text)
-        # The authoritative state is not.
+        # Prefix Cache 보존을 위해 과거 도구 결과를 임의로 변조/생략하지 않는다.
+        self.assertNotIn("실행 결과 생략", text)
+        # BASH_RESULT 원문과 권위 있는 상태가 온전히 보존된다.
+        self.assertIn("E_NEG: A 경로를 차단한 뒤에도 장애가 그대로 재현되었다", text)
         for marker in ("H_A=rejected@v2", "C_A=무효", "E_NEG"):
             self.assertIn(marker, text)
 
