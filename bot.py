@@ -103,7 +103,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `web_search(query)`: DuckDuckGo 웹 검색
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
-- 루트 `plan.md`와 `findings.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 없을 때 최초 생성은 `absent`를 사용하세요.
+- 루트 `plan.md`와 `findings.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`와 `findings.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
 - 두 파일의 변경된 읽기는 전체 내용과 revision을 반환하고, 변경 없는 재읽기는 내용 대신 hash reference만 반환합니다. conflict이면 최신 내용을 다시 읽고 병합하세요.
 
 [상태 관리 - 자율 탐색의 절대 규칙]
@@ -124,7 +124,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 2. 중간에 추측하지 말고 반드시 도구(`bash_exec`, `web_search` 등)를 통해 사실을 검증하세요.
 3. 로컬 코드나 프로젝트 문서 탐색 시, 키워드를 정확히 모르는 상태에서 무작정 grep/find를 반복하지 마세요. 로컬 온디바이스 하이브리드(시맨틱+BM25) 검색 CLI인 `zg query "<자연어 의도>"`를 `bash_exec`로 우선 실행하여 관련 코드와 심볼 위치를 빠르게 특정하세요.
 4. 반복되거나 복잡한 데이터 파싱, 스크래핑, 쉘 작업은 `write_file`로 `skills/<name>.py` 또는 `skills/<name>.sh`에 스크립트화하여 저장하고 `bash_exec`로 실행하여 재사용하세요.
-5. 발견된 사실은 `findings.md`에 지속적으로 기록하고 `plan.md`의 진행 상태를 업데이트하세요.
+5. 기존 `plan.md`와 `findings.md`가 존재하면 먼저 읽어 이전 작업 맥락을 파악하고, 발견된 사실은 `findings.md`에 지속적으로 누적 기록하며 `plan.md`의 진행 상태를 업데이트하세요. 기존 내용을 빈 템플릿으로 초기화하지 마세요.
 6. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
 7. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
 """
@@ -449,10 +449,11 @@ def steering_receipt_notice(receipt, text: str) -> str:
 
 
 MAX_RECENT_TURNS = 8
-CHECKPOINT_INTERVAL = 30
-MAX_AGENT_LOOPS = 250
+CHECKPOINT_INTERVAL = 50
+MAX_AGENT_LOOPS = 350
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
-MAX_TOOL_EXECUTIONS_PER_RUN = 250
+MAX_TOOL_EXECUTIONS_PER_RUN = 350
+AGENT_STEP_MAX_TOKENS = 8192
 
 # 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
 # 한 채널이 이후 모든 스텝의 프롬프트를 대기 깊이만큼 부풀릴 수 있다.
@@ -3074,7 +3075,7 @@ async def on_message(message: discord.Message):
                     deadline=model_stage_deadline,
                     model=MODEL_NAME,
                     messages=compacted_payload,
-                    max_tokens=1024 if iteration == 0 else 4096,
+                    max_tokens=1024 if iteration == 0 else AGENT_STEP_MAX_TOKENS,
                     temperature=0.7,
                     **agent_tool_params(),
                     **extra_params
@@ -3118,7 +3119,7 @@ async def on_message(message: discord.Message):
                         deadline=model_stage_deadline,
                         model=MODEL_NAME,
                         messages=retry_payload,
-                        max_tokens=1024 if iteration == 0 else 4096,
+                        max_tokens=1024 if iteration == 0 else AGENT_STEP_MAX_TOKENS,
                         temperature=0.7,
                         **extra_params
                     )

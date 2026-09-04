@@ -8,7 +8,7 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 
 ## ✨ Key Features
 
-- 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 250 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
+- 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 350 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
 - 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, interim report, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves. The whole ledger round-trips through the run's durable record, so a restart cannot resurrect a rejected hypothesis as fact.
 - 💾 **Durable Run State**: Each run keeps one atomic record (`runs/<run-id>/state.json`) carrying its run id, originating message id, state, next step cursor, bounded summary and tail, interrupt state, ledger, and the ids of the tool calls already executed. It is written before the first model call and after every completed assistant/tool group, never mid-group. A restart resumes the same run id at its next step or records exactly one explicit abort.
 - 📁 **Owner-Bound Run Workspaces**: Every accepted top-level request receives an opaque `runs/<run-id>/` directory and opaque per-run log. Runs never derive paths from Discord IDs; exact owners can resume or delete inactive runs, while admins receive no implicit workspace access.
@@ -41,7 +41,7 @@ User Prompt (Discord) ────────┐
                               │
                ┌──────────────▼──────────────┐
                │   Autonomous Agent Loop     │◄────── Dynamic User Steering Queue
-               │   (Max 250 Steps)           │
+               │   (Max 350 Steps)           │
                └──────────────┬──────────────┘
                               │
           ┌───────────────────┼───────────────────┐
@@ -301,10 +301,10 @@ same unchanged call may fail twice consecutively, but its third and later
 immediately consecutive attempts are blocked until a different signature is
 dispatched or a call succeeds. Failures are limited to the existing explicit
 contracts: a leading `[Error`, a nonzero `bash_exec` exit-code marker, or a
-`record_state` refusal. Each run dispatches at most 250 actual tool executions;
+`record_state` refusal. Each run dispatches at most 350 actual tool executions;
 blocked calls consume no budget. These fixed code-level limits are
 `MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2` and
-`MAX_TOOL_EXECUTIONS_PER_RUN = 250`; they intentionally have no configuration
+`MAX_TOOL_EXECUTIONS_PER_RUN = 350`; they intentionally have no configuration
 surface.
 
 ---
