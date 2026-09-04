@@ -12,6 +12,7 @@ Integrated with:
 import os
 import sys
 import re
+import hashlib
 import json
 import time
 import asyncio
@@ -44,6 +45,7 @@ from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
 import tool_sandbox
+import workspace_io
 
 # Configuration is fully validated before any filesystem or network side effect.
 try:
@@ -545,7 +547,9 @@ ROLLING_COMPACTION_INTERVAL = 10
 KEEP_RECENT_TOOL_MESSAGES = 8
 ROLLING_SUMMARY_SOURCE_MAX_CHARS = 24000
 ROLLING_SUMMARY_MAX_CHARS = 10000
-DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
+# 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
+# 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
+DEFAULT_TOOL_OUTPUT_MAX_CHARS = workspace_io.DEFAULT_TOOL_OUTPUT_MAX_CHARS
 
 # Transport-level bounds. Application-level stage budgets live in deadlines.py;
 # these stop a request from hanging below the layer those budgets can see.
@@ -601,7 +605,80 @@ async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
 
 # --- Tool Execution Functions ---
 
-async def tool_bash_exec(workspace, command: str) -> str:
+ARTIFACT_DIR_NAME = "artifacts"
+ARTIFACT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+ARTIFACT_PREVIEW_LINES = 20
+ARTIFACT_PREVIEW_MAX_CHARS = 800
+# ponytail: 런당 산출물 예산을 디스크 한도의 1/8로 고정한다. 산출물은 런 루트
+# 안에 쌓이므로 bash 워커의 workspace_disk_limit 감시에 함께 잡히고, 예산이 없으면
+# 긴 출력이 이어질 때 뒤쪽 bash 호출이 굶는다. 실행별 조정이 필요해지면 설정
+# 값으로 승격한다.
+ARTIFACT_RUN_BYTE_BUDGET = TOOL_LIMITS["disk_bytes"] // 8
+
+
+def _artifact_name(call_id) -> str:
+    """모델이 준 호출 id는 신뢰할 수 없다. 안전하지 않으면 다이제스트로 바꾼다."""
+    token = str(call_id or "")
+    if not ARTIFACT_ID_PATTERN.fullmatch(token):
+        token = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
+    return f"out_{token}.log"
+
+
+def _artifact_usage(directory) -> int:
+    # ponytail: 저장할 때마다 디렉터리를 훑는다(O(n)). 런당 산출물이 수백 개를
+    # 넘기면 워크스페이스에 누적 바이트 카운터를 두는 쪽으로 올린다.
+    total = 0
+    with os.scandir(str(directory)) as entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat().st_size
+    return total
+
+
+def _store_tool_artifact(workspace, call_id, text: str) -> Optional[str]:
+    """도구 출력 전문을 런 루트 안에 남기고 상대 경로를 돌려준다."""
+    data = text.encode("utf-8")
+    name = _artifact_name(call_id)
+    try:
+        directory = session_log.secure_directory(
+            os.path.join(str(workspace.root), ARTIFACT_DIR_NAME)
+        )
+        if _artifact_usage(directory) + len(data) > ARTIFACT_RUN_BYTE_BUDGET:
+            return None
+        workspace_io.atomic_write(os.path.join(str(directory), name), data)
+    except (OSError, ValueError):
+        # 저장에 실패해도 도구 결과 자체는 살려야 한다. 여기서 예외를 올리면
+        # 호출자의 포괄 except가 종료 코드까지 지운 실패 문자열로 바꿔 버린다.
+        return None
+    return f"{ARTIFACT_DIR_NAME}/{name}"
+
+
+def _encapsulate_tool_output(workspace, call_id, text: str) -> str:
+    """긴 출력을 잘라 버리는 대신 파일 경로와 앞부분 미리보기로 바꾼다.
+
+    결과 문자열 끝에 무엇이 와야 하는지는 호출자가 안다. 그래서 이 함수는 자체로
+    완결된 블록만 돌려주고 종료 표시 같은 꼬리를 붙이지 않는다.
+    """
+    if len(text) <= DEFAULT_TOOL_OUTPUT_MAX_CHARS:
+        return text
+    preview = "\n".join(text.split("\n")[:ARTIFACT_PREVIEW_LINES])
+    preview = preview[:ARTIFACT_PREVIEW_MAX_CHARS]
+    stored = _store_tool_artifact(workspace, call_id, text)
+    if stored is None:
+        return (
+            f"[출력 {len(text)}자: 이 런의 산출물 예산을 넘어 파일로 남기지 못했습니다."
+            f" 아래 미리보기가 남은 전부이므로 필요한 범위를 좁혀 다시 실행하세요.]\n"
+            f"{preview}"
+        )
+    return (
+        f"[출력 {len(text)}자 전문을 {stored}에 저장했습니다. 아래는 앞"
+        f" {ARTIFACT_PREVIEW_LINES}줄 미리보기입니다. 나머지는"
+        f" grep -n '패턴' {stored} 이나 python3로 직접 조회하세요.]\n"
+        f"{preview}"
+    )
+
+
+async def tool_bash_exec(workspace, command: str, call_id: str) -> str:
     try:
         result = await tool_sandbox.run_worker(
             workspace,
@@ -632,12 +709,7 @@ async def tool_bash_exec(workspace, command: str) -> str:
         if err_str:
             payload += f"[stderr]\n{strip_ansi(err_str)}\n"
 
-        if len(payload) > DEFAULT_TOOL_OUTPUT_MAX_CHARS:
-            payload = (
-                payload[:DEFAULT_TOOL_OUTPUT_MAX_CHARS]
-                + f"\n... [출력 결과가 너무 길어 {DEFAULT_TOOL_OUTPUT_MAX_CHARS}자로 잘렸습니다. 필요한 경우 grep이나 head/tail로 조회하세요.]"
-            )
-        payload = payload.strip()
+        payload = _encapsulate_tool_output(workspace, call_id, payload.strip())
         return f"{payload}\n[exit code: {code}]" if payload else f"[exit code: {code}]"
     except Exception as e:
         return f"[Error: worker_unavailable ({type(e).__name__})]"
@@ -701,7 +773,7 @@ async def tool_write_file(
         })
 
 
-async def tool_web_search(query: str) -> str:
+async def tool_web_search(workspace, query: str, call_id: str) -> str:
     try:
         with tempfile.TemporaryDirectory(prefix=".tool-web-") as root:
             result = await tool_sandbox.run_worker(
@@ -727,7 +799,9 @@ async def tool_web_search(query: str) -> str:
         formatted = []
         for i, r in enumerate(results, 1):
             formatted.append(f"{i}. [{r.get('title')}]({r.get('href')})\n   {r.get('body')}")
-        return "\n\n".join(formatted)
+        return _encapsulate_tool_output(
+            workspace, call_id, "\n\n".join(formatted)
+        )
     except Exception as e:
         return f"[Error: worker_unavailable ({type(e).__name__})]"
 
@@ -766,7 +840,7 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
         args = tc["arguments"]
         if name == "bash_exec":
             cmd = args.get("command", "")
-            return await tool_bash_exec(workspace, cmd)
+            return await tool_bash_exec(workspace, cmd, tc["id"])
         elif name == "read_file":
             path = args.get("path", "")
             return await tool_read_file(workspace, path)
@@ -779,7 +853,7 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
             )
         elif name == "web_search":
             q = args.get("query", "")
-            return await tool_web_search(q)
+            return await tool_web_search(workspace, q, tc["id"])
         elif name == "record_state":
             return await tool_record_state(ledger, args)
         elif name == "finish_task":

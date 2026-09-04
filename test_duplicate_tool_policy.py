@@ -97,10 +97,10 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         original_bash = bot.tool_bash_exec
         original_dispatch = bot.execute_tools_in_parallel
 
-        async def recording_bash(workspace, command):
+        async def recording_bash(workspace, command, call_id):
             self.executed_commands.append(command)
             if use_real_bash:
-                return await original_bash(workspace, command)
+                return await original_bash(workspace, command, call_id)
             if callable(tool_result):
                 return tool_result(command, len(self.executed_commands))
             return tool_result
@@ -528,9 +528,9 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             bot, workspace
         ):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
-            result = await bot.tool_bash_exec(run, command)
+            result = await bot.tool_bash_exec(run, command, "long-nonzero")
 
-        self.assertIn("출력 결과가 너무 길어", result)
+        self.assertIn("artifacts/out_long-nonzero.log", result)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
     # Mutation caught: hiding a real noisy subprocess's nonzero status from the

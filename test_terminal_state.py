@@ -509,7 +509,7 @@ class FailureTest(TerminalStateTestCase):
                 _tool_call("c2", "bash_exec", {"command": "block"}),
             ])
 
-        async def tool(workspace, command):
+        async def tool(workspace, command, call_id):
             if command == "fail":
                 await sibling_started.wait()
                 raise ValueError(failure)

@@ -457,10 +457,10 @@ class ToolIntegrationTest(WorkspaceTestCase):
             "run_worker",
             AsyncMock(side_effect=responses),
         ) as run_worker:
-            bash = await bot.tool_bash_exec(workspace, "printf ok")
+            bash = await bot.tool_bash_exec(workspace, "printf ok", "c1")
             read = await bot.tool_read_file(workspace, "note.txt")
             write = await bot.tool_write_file(workspace, "note.txt", "inside", None)
-            search = await bot.tool_web_search("one")
+            search = await bot.tool_web_search(workspace, "one", "c4")
 
         self.assertIn("[exit code: 0]", bash)
         self.assertEqual(json.loads(read)["status"], "success")
@@ -489,7 +489,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
         inside = workspace.root / "nested" / "absolute.txt"
         self.assertEqual(workspace.resolve(str(inside)), inside)
 
-        bash_result = await bot.tool_bash_exec(workspace, "pwd")
+        bash_result = await bot.tool_bash_exec(workspace, "pwd", "pwd-call")
         self.assertIn(str(workspace.root), bash_result)
         write_result = json.loads(await bot.tool_write_file(
             workspace, "nested/file.txt", "inside", None
@@ -514,7 +514,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
         canary.write_text("canary-original", encoding="utf-8")
 
         link_result = await bot.tool_bash_exec(
-            workspace, f"ln -s '{self.temp_dir.name}' escape_link"
+            workspace, f"ln -s '{self.temp_dir.name}' escape_link", "link-call"
         )
         self.assertIn("[exit code: 0]", link_result)
         self.assertTrue((workspace.root / "escape_link").is_symlink())
@@ -568,7 +568,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
         )
 
         await bot.tool_bash_exec(
-            workspace, f"ln -s '{workspace.log_path.parent}' log_link"
+            workspace, f"ln -s '{workspace.log_path.parent}' log_link", "log-link-call"
         )
         relative_to_log = os.path.relpath(
             str(workspace.log_path), str(workspace.root)
@@ -603,7 +603,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
             os.environ,
             {"DISCORD_BOT_TOKEN": canary, "OPENAI_API_KEY": canary},
         ):
-            printed = await bot.tool_bash_exec(workspace, "env; echo HOME=$HOME")
+            printed = await bot.tool_bash_exec(workspace, "env; echo HOME=$HOME", "env-call")
 
         self.assertNotIn(canary, printed)
         self.assertNotIn("DISCORD_BOT_TOKEN", printed)
@@ -646,11 +646,11 @@ class ToolIntegrationTest(WorkspaceTestCase):
         )
         self.assertIn("expected_revision", write_schema["parameters"]["properties"])
 
-        calls = [{"name": "bash_exec", "arguments": {"command": "true"}}]
+        calls = [{"id": "ctx-1", "name": "bash_exec", "arguments": {"command": "true"}}]
         with patch.object(bot, "tool_bash_exec", AsyncMock(return_value="ok")) as bash:
             result = await bot.execute_tools_in_parallel(workspace, calls)
         self.assertEqual(result, ["ok"])
-        bash.assert_awaited_once_with(workspace, "true")
+        bash.assert_awaited_once_with(workspace, "true", "ctx-1")
 
         messages = [{"role": "system", "content": prompt}]
         for index in range(10):
