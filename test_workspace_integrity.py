@@ -1153,6 +1153,43 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             )
             self.assertFalse(resumed.root.exists())
 
+    async def test_acquire_inherits_canonical_files_from_prior_run_of_same_owner_and_channel(self):
+        catalog = self.catalog()
+        run1 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        await run1.write("plan.md", "# Plan 1\n- [x] Step 1", "absent")
+        await run1.write("findings.md", "# Findings\nDiscovered secret", "absent")
+        await run1.write("other.txt", "not canonical", None)
+        catalog.finish(run1, "completed")
+
+        run2 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        self.assertNotEqual(run1.run_id, run2.run_id)
+        read_plan = run2.read("plan.md")
+        self.assertEqual(read_plan["status"], "success")
+        self.assertEqual(read_plan["content"], "# Plan 1\n- [x] Step 1")
+        read_findings = run2.read("findings.md")
+        self.assertEqual(read_findings["status"], "success")
+        self.assertEqual(read_findings["content"], "# Findings\nDiscovered secret")
+        self.assertEqual(run2.read("other.txt")["status"], "error")
+
+        # Different channel must not inherit
+        diff_channel = catalog.acquire(TEST_USER_ID, CHANNEL_B)
+        self.assertEqual(diff_channel.read("plan.md")["status"], "error")
+        catalog.finish(diff_channel, "completed")
+
+        # Different owner must not inherit
+        diff_owner = catalog.acquire(TEST_ADMIN_ID, CHANNEL_A)
+        self.assertEqual(diff_owner.read("plan.md")["status"], "error")
+        catalog.finish(diff_owner, "completed")
+
+        # Explicit reset (prepare) must not inherit
+        catalog.finish(run2, "completed")
+        prepared = catalog.prepare(TEST_USER_ID, CHANNEL_A)
+        fresh = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        self.assertEqual(fresh.run_id, prepared.run_id)
+        self.assertEqual(fresh.read("plan.md")["status"], "error")
+        self.assertEqual(fresh.read("findings.md")["status"], "error")
+
 
 if __name__ == "__main__":
+
     unittest.main()
