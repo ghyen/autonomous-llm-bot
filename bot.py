@@ -1348,8 +1348,7 @@ def build_system_content(workspace, ledger=None, summary: str = "") -> str:
     """Compose message 0 for one explicit run workspace.
 
     The state block goes last and message 0 sits before the first tool
-    message, so `apply_micro_compaction` never rewrites it and every request,
-    checkpoint and rollover sees the same authoritative state.
+    message, so every request, checkpoint and rollover sees the same authoritative state.
     """
     parts = [SYSTEM_PROMPT_TEMPLATE.format(workspace_root=workspace.root)]
     skills_block = render_skills_block(workspace)
@@ -1879,75 +1878,6 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
     )
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
-# --- User's Micro Compaction Algorithm ---
-
-def apply_micro_compaction(
-    messages: list, preserve_recent_tool_groups: int = 1
-) -> list:
-    """Compact old history without splitting an assistant/tool-result group."""
-    tool_msg_indices = [i for i, m in enumerate(messages) if _msg_role(m) == "tool"]
-    if not tool_msg_indices:
-        return messages
-
-    preserve_recent_tool_groups = max(0, preserve_recent_tool_groups)
-    tool_group_starts = [
-        i
-        for i, message in enumerate(messages)
-        if _msg_role(message) == "assistant" and _msg_tool_calls(message)
-    ]
-    if preserve_recent_tool_groups:
-        if len(tool_group_starts) <= preserve_recent_tool_groups:
-            return messages
-        compact_before = tool_group_starts[-preserve_recent_tool_groups]
-    else:
-        compact_before = len(messages)
-
-    first_tool_index = tool_msg_indices[0]
-    compressed_messages = []
-
-    for i, msg in enumerate(messages):
-        if i < first_tool_index or i >= compact_before:
-            compressed_messages.append(msg)
-            continue
-
-        role = _msg_role(msg)
-        if role == "tool":
-            compacted = dict(msg)
-            content = _msg_content(msg)
-            first_line = content.split("\n")[0][:160].strip()
-            compacted["content"] = (
-                f"[{_msg_name(msg)} 실행 결과 생략: {first_line}]"
-                if first_line
-                else f"[{_msg_name(msg)} 실행 결과 생략]"
-            )
-            compressed_messages.append(compacted)
-        elif role == "assistant":
-            compacted = dict(msg)
-            if compacted.get("tool_calls"):
-                compacted["content"] = None
-                compacted_calls = []
-                for call in compacted["tool_calls"]:
-                    call_copy = dict(call)
-                    function = dict(call_copy.get("function") or {})
-                    function["arguments"] = "{}"
-                    call_copy["function"] = function
-                    compacted_calls.append(call_copy)
-                compacted["tool_calls"] = compacted_calls
-            else:
-                compacted["content"] = "[이전 단계의 추론 내용 생략]"
-            compressed_messages.append(compacted)
-        elif role == "user":
-            compacted = dict(msg)
-            content = _msg_content(msg)
-            if content.startswith("[🤖") or "중간 진행" in content:
-                compacted["content"] = "[이전 자동 진행 지시 생략]"
-            else:
-                compacted["content"] = content[:400]
-            compressed_messages.append(compacted)
-        else:
-            compressed_messages.append(msg)
-
-    return compressed_messages
 
 DISCORD_CHUNK_MAX_CHARS = 1900
 LOCAL_FALLBACK_MAX_CHUNKS = 3
@@ -2939,7 +2869,6 @@ async def on_message(message: discord.Message):
                 extra_params["reasoning_effort"] = current_effort
 
             # 권위 있는 조사 상태를 매 스텝 0번 메시지에 재고정한다.
-            # 0번은 첫 tool 메시지보다 앞이라 apply_micro_compaction이 건드리지 않는다.
             if messages_payload and _msg_role(messages_payload[0]) == "system":
                 messages_payload[0] = {
                     "role": "system",
@@ -2959,11 +2888,8 @@ async def on_message(message: discord.Message):
                     fingerprint=_payload_fingerprint(messages_payload),
                 )
 
-            compacted_payload = validate_chat_payload(
-                apply_micro_compaction(
-                    messages_payload, preserve_recent_tool_groups=1
-                )
-            ).messages
+            # 불변(Append-only) 컨텍스트 보존: 중간 텍스트를 변조하지 않아 Prefix Cache(KV Cache) HIT를 극대화한다.
+            compacted_payload = validate_chat_payload(messages_payload).messages
             model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
             model_stage_started = time.monotonic()
 
@@ -3005,11 +2931,7 @@ async def on_message(message: discord.Message):
                 # 도구 프로토콜 제거뿐이다. 이 결과도 messages_payload에 남긴다.
                 messages_payload = flatten_tool_protocol(messages_payload)
                 save_snapshot(iteration + 1, "tool_protocol_recovery")
-                retry_payload = validate_chat_payload(
-                    apply_micro_compaction(
-                        messages_payload, preserve_recent_tool_groups=1
-                    )
-                ).messages
+                retry_payload = validate_chat_payload(messages_payload).messages
 
                 # Never restart a stage after cancellation.
                 try:
