@@ -276,7 +276,7 @@ class RunCatalog:
         ):
             self._select_prepared(workspace)
 
-    def _create(self, owner_id, channel_id, status):
+    def _create(self, owner_id, channel_id, status, inherit_canonical=False):
         while True:
             run_id = secrets.token_hex(16)
             if run_id not in self._runs and not (self.runs_root / run_id).exists():
@@ -297,9 +297,42 @@ class RunCatalog:
         # the mode, which mkdir's mode argument cannot do under a loose umask.
         workspace.root.mkdir()
         secure_directory(workspace.root)
+        if inherit_canonical:
+            self._inherit_canonical(workspace)
         workspace.persist()
         self._runs[run_id] = workspace
         return workspace
+
+    def _inherit_canonical(self, workspace):
+        candidates = [
+            w
+            for w in self._runs.values()
+            if w.owner_id == workspace.owner_id
+            and w.channel_id == workspace.channel_id
+            and w.run_id != workspace.run_id
+        ]
+        if not candidates:
+            return
+        candidates.sort(
+            key=lambda item: (
+                str(item.updated_at),
+                str(item.created_at),
+                item.run_id,
+            ),
+            reverse=True,
+        )
+        for name in sorted(CANONICAL_NAMES):
+            dest = workspace.root / name
+            if dest.exists():
+                continue
+            for prior in candidates:
+                src = prior.root / name
+                if src.is_file():
+                    try:
+                        atomic_write(dest, src.read_bytes())
+                        break
+                    except OSError:
+                        continue
 
     def _select_prepared(self, workspace):
         for key, selected_id in tuple(self._selected.items()):
@@ -389,7 +422,9 @@ class RunCatalog:
             selected_id = self._selected.pop((owner_id, channel_id), None)
             workspace = self._runs.get(selected_id) if selected_id else None
             if workspace is None or workspace.status != "prepared":
-                workspace = self._create(owner_id, channel_id, "active")
+                workspace = self._create(
+                    owner_id, channel_id, "active", inherit_canonical=True
+                )
             else:
                 workspace.channel_id = channel_id
                 workspace.status = "active"
