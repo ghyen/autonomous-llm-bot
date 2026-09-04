@@ -15,6 +15,7 @@ from pathlib import Path
 from session_log import secure_directory
 from workspace_io import (
     CANONICAL_NAMES,
+    DEFAULT_TOOL_OUTPUT_MAX_CHARS,
     REVISION_PATTERN,
     atomic_write,
     is_canonical,
@@ -172,8 +173,8 @@ class RunWorkspace:
         self._remember(target, revision)
         content = data.decode("utf-8", errors="replace")
         truncated = False
-        if not self._is_canonical(target) and len(content) > 4000:
-            content = content[:4000]
+        if not self._is_canonical(target) and len(content) > DEFAULT_TOOL_OUTPUT_MAX_CHARS:
+            content = content[:DEFAULT_TOOL_OUTPUT_MAX_CHARS]
             truncated = True
         return {
             "status": "success",
