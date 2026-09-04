@@ -269,6 +269,76 @@ class RobustJSONParsingTest(unittest.TestCase):
         self.assertEqual(extracted[0]["arguments"], {"path": "workspace/a.txt"})
 
 
-if __name__ == "__main__":
+class MarkdownChunkingTest(unittest.TestCase):
+    def test_split_short_text_returns_single_chunk(self):
+        text = "Hello world! This is a short response."
+        chunks = bot.split_markdown_chunks(text, max_chars=100)
+        self.assertEqual(chunks, [text])
 
+    def test_split_preserves_and_balances_code_fences(self):
+        long_code = "```python\n" + "\n".join(f"print({i})" for i in range(200)) + "\n```"
+        chunks = bot.split_markdown_chunks(long_code, max_chars=400)
+        self.assertGreater(len(chunks), 1)
+        for i, chunk in enumerate(chunks):
+            self.assertLessEqual(len(chunk), 400)
+            self.assertEqual(
+                chunk.count("```") % 2,
+                0,
+                f"Chunk {i} has unbalanced code fence:\n{chunk}",
+            )
+            if i > 0:
+                self.assertTrue(chunk.startswith("```python\n"))
+            self.assertTrue(chunk.endswith("\n```"))
+
+    def test_split_oversized_line_within_code_fence(self):
+        huge_line = "x = '" + ("a" * 1500) + "'"
+        text = f"```python\n{huge_line}\n```"
+        chunks = bot.split_markdown_chunks(text, max_chars=500)
+        self.assertGreater(len(chunks), 2)
+        for i, chunk in enumerate(chunks):
+            self.assertLessEqual(len(chunk), 500)
+            self.assertEqual(chunk.count("```") % 2, 0)
+
+    def test_split_unclosed_fence_is_auto_closed(self):
+        text = "```bash\necho hello\necho world"
+        chunks = bot.split_markdown_chunks(text, max_chars=1000)
+        self.assertEqual(len(chunks), 1)
+        self.assertTrue(chunks[0].endswith("\n```"))
+        self.assertEqual(chunks[0].count("```") % 2, 0)
+
+    def test_get_open_code_fence(self):
+        self.assertIsNone(bot.get_open_code_fence("hello world"))
+        self.assertIsNone(bot.get_open_code_fence("```python\nx = 1\n```"))
+        self.assertEqual(bot.get_open_code_fence("```python\nx = 1"), "```python")
+        self.assertEqual(bot.get_open_code_fence("~~~json\n{}"), "~~~json")
+        self.assertIsNone(bot.get_open_code_fence("Inline `code` and ```one line```"))
+
+    def test_bound_local_fallback_output_preserves_fences(self):
+        long_report = (
+            "## 조사 종료 상태\n- 실패\n\n"
+            "## 최근 실행 기록\n```bash\n"
+            + "\n".join(f"cmd_{i} output result line {i}" for i in range(500))
+            + "\n```\n\n## 다음 단계\n확인 필요"
+        )
+        self.assertGreater(len(long_report), bot.LOCAL_FALLBACK_MAX_CHARS)
+        bounded = bot.bound_local_fallback_output(long_report)
+        self.assertLessEqual(len(bounded), bot.LOCAL_FALLBACK_MAX_CHARS)
+        self.assertIn(bot.LOCAL_FALLBACK_OMISSION_MARKER, bounded)
+
+        # Pre-marker and post-marker should both have balanced fences
+        parts = bounded.split(bot.LOCAL_FALLBACK_OMISSION_MARKER)
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0].count("```") % 2, 0)
+        self.assertEqual(parts[1].count("```") % 2, 0)
+
+        # Chunks produced from bounded output should never exceed Discord limit
+        chunks = bot.split_markdown_chunks(bounded, max_chars=bot.DISCORD_CHUNK_MAX_CHARS)
+        self.assertLessEqual(len(chunks), bot.LOCAL_FALLBACK_MAX_CHUNKS)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), bot.DISCORD_CHUNK_MAX_CHARS)
+            self.assertEqual(chunk.count("```") % 2, 0)
+
+
+if __name__ == "__main__":
     unittest.main()
+
