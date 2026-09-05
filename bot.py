@@ -165,6 +165,18 @@ def clean_direct_response(text: str) -> str:
     )
     return text.strip()
 
+
+def clean_internal_thought_content(text: str) -> str:
+    """내부 추론 본문에서 서버 절단 센티널과 퇴화된 반복 문자열을 정제합니다."""
+    if not text:
+        return ""
+    if REASONING_CUTOFF_MARKER in text:
+        cleaned = text.split(REASONING_CUTOFF_MARKER)[0].strip()
+        return cleaned or "[내부 추론 토큰 한도 도달]"
+    # 10회 이상 연속 반복되는 퇴화 문자열(특수문자/알파벳 등) 축약
+    cleaned = re.sub(r"(.)\1{9,}", r"\1", text).strip()
+    return cleaned
+
 TOOLS_SCHEMA = [
     {
         "type": "function",
@@ -345,7 +357,7 @@ bot = CustomBot(command_prefix="!", intents=intents)
 
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
-channel_reasoning = defaultdict(lambda: "high")
+channel_reasoning = defaultdict(lambda: "medium")
 # A run marks its lease active before its first await, so the admission check and
 # the mailbox it publishes are decided in one event-loop turn: a message arriving
 # during a live run is always steering, never a second run. The list keeps every
@@ -454,6 +466,8 @@ MAX_AGENT_LOOPS = 350
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = 350
 AGENT_STEP_MAX_TOKENS = 8192
+MAX_CONSECUTIVE_INTERNAL_THOUGHTS = 3
+REASONING_CUTOFF_MARKER = "[truncated — reasoning incomplete"
 
 # 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
 # 한 채널이 이후 모든 스텝의 프롬프트를 대기 깊이만큼 부풀릴 수 있다.
@@ -2971,6 +2985,7 @@ async def on_message(message: discord.Message):
 
     last_failed_signature = None
     consecutive_failed_tool_calls = 0
+    consecutive_internal_thoughts = 0
 
     async def maybe_roll_context(step_num: int):
         nonlocal messages_payload, rolling_summary
@@ -3276,6 +3291,7 @@ async def on_message(message: discord.Message):
                 break
 
             if tool_calls_to_run:
+                consecutive_internal_thoughts = 0
                 synthetic_tool_calls = [
                     {
                         "id": tc["id"],
@@ -3655,21 +3671,61 @@ async def on_message(message: discord.Message):
                 break
 
             # 모델이 도구 없이 내부 추론(thought/plan)만 진행한 경우:
-            # 강제 넛지나 정체(stall) 실패 없이 자율적으로 다음 스텝으로 추론을 잇는다.
+            consecutive_internal_thoughts += 1
+
+            finish_reason = getattr(choice, "finish_reason", None)
+            is_length_cutoff = (
+                finish_reason == "length"
+                or REASONING_CUTOFF_MARKER in (content_text or "")
+            )
+            cleaned_thought = clean_internal_thought_content(content_text)
+
             messages_payload.append({
                 "role": "assistant",
-                "content": content_text or "[자율 내부 추론]",
+                "content": cleaned_thought or "[자율 내부 추론]",
             })
             log_session_event(
                 workspace,
                 "internal_thought",
                 step=iteration + 1,
-                content_chars=len(content_text or ""),
+                content_chars=len(cleaned_thought or ""),
+                consecutive=consecutive_internal_thoughts,
+                cutoff=is_length_cutoff,
             )
             try:
                 await status_msg.edit(content=f"🧠 **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 내부 추론 및 분석 진행 중... ▌")
             except Exception:
                 pass
+
+            # 연속 도구 미호출 정체 방지 가드레일
+            if consecutive_internal_thoughts >= MAX_CONSECUTIVE_INTERNAL_THOUGHTS:
+                log_session_event(
+                    workspace,
+                    "internal_thought_stall",
+                    step=iteration + 1,
+                    consecutive=consecutive_internal_thoughts,
+                )
+                outcome.settle(outcome_mod.EXHAUSTED, "내부 추론 반복 정체")
+                final_raw = full_raw_thought or content_text
+                break
+
+            # 추론 토큰 한도 초과 절단 또는 연속 정체 시 피드백(Nudge) 주입
+            if is_length_cutoff:
+                nudge_content = (
+                    "[🤖 시스템 안내: 직전 스텝의 내부 추론이 토큰 한도에 도달하여 중단되었습니다. "
+                    "더 이상 장문의 내부 추론(Thinking)을 반복하지 말고, 현재까지 수집된 단서를 바탕으로 "
+                    "필요한 도구(bash_exec, read_file, record_state 등)를 즉시 호출하거나 "
+                    "조사가 완료되었다면 finish_task를 호출하세요.]"
+                )
+                messages_payload.append({"role": "user", "content": nudge_content})
+            elif consecutive_internal_thoughts >= 2:
+                nudge_content = (
+                    f"[🤖 시스템 안내: {consecutive_internal_thoughts}스텝 연속으로 도구 호출 없이 내부 추론만 진행되었습니다. "
+                    "혼자 생각하는 것을 멈추고 실제 행동(도구 실행)을 즉시 수행하세요. "
+                    "필요한 도구를 호출하거나 모든 조사가 끝났다면 finish_task로 결과를 보고하세요.]"
+                )
+                messages_payload.append({"role": "user", "content": nudge_content})
+
             try:
                 await maybe_roll_context(iteration + 1)
             except (RunCancelled, StageTimeout) as stage_error:
