@@ -1387,7 +1387,7 @@ def build_system_content(workspace, ledger=None, summary: str = "") -> str:
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
-    state_block = ledger.render() if ledger is not None else ""
+    state_block = ledger.render(max_chars=12000) if ledger is not None else ""
     if state_block:
         parts.append(state_block)
     return "\n\n".join(parts)
@@ -1634,8 +1634,8 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         log_session_event(workspace, "rollover_skipped", step=step_num, reason="no_new_source")
         return messages, existing_summary
 
-    state_block = ledger.render() if ledger is not None else ""
-    required_markers = ledger.state_markers() if ledger is not None else []
+    state_block = ledger.render(max_chars=12000) if ledger is not None else ""
+    required_markers = [m for m in ledger.state_markers() if f"- {m} ::" in state_block] if ledger is not None else []
     marker_hint = ""
     if required_markers:
         marker_hint = (
@@ -1731,7 +1731,9 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
     dropped_markers = missing_state_markers(new_summary, required_markers)
     if dropped_markers:
         validation_notes.append("누락된 상태 마커를 권위 있는 상태 블록으로 보정했습니다: " + ", ".join(dropped_markers))
-        new_summary = f"{state_block}\n\n{new_summary}".strip()
+        correction = ledger.render(max_chars=4000)
+        new_summary = correction + "\n\n" + _clip_summary_text(
+            new_summary, ROLLING_SUMMARY_MAX_CHARS - len(correction) - 2)
 
     # 400 Chat template error 완벽 방지: 단일 시스템 프롬프트로 병합
     replaced_messages = [
@@ -3542,7 +3544,7 @@ async def on_message(message: discord.Message):
                         "record_state와 같은 형식(goal, evidence, hypotheses, conclusions)의 JSON을 넣으세요. "
                         "이 블록은 사용자에게 보이지 않고 상태에 반영됩니다. 정정할 것이 없으면 붙이지 마세요."
                     )
-                    inter_state_block = ledger.render()
+                    inter_state_block = ledger.render(max_chars=12000)
                     inter_source = build_rollup_source(messages_payload[-16:])
                     inter_context = "\n\n".join(
                         part for part in [
@@ -3808,7 +3810,7 @@ async def on_message(message: discord.Message):
             # 롤오버 이후 누적 요약은 교체된 system 메시지 안에만 남는데
             # build_rollup_source는 system을 건너뛴다. 그래서 상태 블록과 누적 요약을
             # 최신 tail과 함께 명시적으로 넣는다.
-            synth_state_block = ledger.render()
+            synth_state_block = ledger.render(max_chars=12000)
             synth_source = build_rollup_source(messages_payload)
             synth_context = "\n\n".join(
                 part for part in [

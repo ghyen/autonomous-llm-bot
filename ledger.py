@@ -357,13 +357,11 @@ class ResearchLedger:
 
     # --- rendering ---
 
-    def render(self) -> str:
+    def render(self, max_chars=None) -> str:
         """Deterministic state block injected into every payload and report.
 
-        ponytail: length grows linearly with entry count (~300 chars each). The
-        agent is instructed to keep updates few and short; if a run ever needs
-        hundreds of hypotheses, page or archive resolved ones instead of
-        clipping this block, which must never lose a marker.
+        Without a budget this is the full diagnostic view. Model callers use
+        max_chars to select whole records without deleting durable entries.
         """
         if self.is_empty():
             return ""
@@ -416,7 +414,25 @@ class ResearchLedger:
                 lines.append(line)
 
         lines.append(STATE_RULES)
-        return "\n".join(lines)
+        full = "\n".join(lines)
+        if max_chars is None or len(full) <= max_chars:
+            return full
+        header = lines[0] + ("\n목표: " + self.goal if self.goal else "")
+        notice = ("[Partial state: older entries are omitted, not invalidated. "
+                  "Use bash_exec to query the full ledger in state.json before relying "
+                  "on omitted evidence or hypotheses. Current state overrides old summaries.]")
+        selected = []
+        used = len(header) + len(STATE_RULES) + len(notice) + 3
+        # Whole records only, newest first within each section. Reserve room
+        # for hypotheses so a large evidence list cannot hide current decisions.
+        records = [line for line in lines if line.startswith("- ")]
+        hypotheses = [line for line in records if " (전이: " in line]
+        others = [line for line in records if " (전이: " not in line]
+        for line in [*reversed(hypotheses), *reversed(others)]:
+            if used + len(line) + 1 <= max_chars:
+                selected.append(line)
+                used += len(line) + 1
+        return "\n".join([header, *selected, notice, STATE_RULES])[:max_chars]
 
     # --- batch entry point used by the record_state tool and checkpoints ---
 
@@ -500,5 +516,5 @@ class ResearchLedger:
             report.append("거부:\n- " + "\n- ".join(refused))
         if not report:
             report.append("반영할 상태 갱신이 없습니다.")
-        report.append(self.render() or "(상태 비어 있음)")
+        report.append(self.render(max_chars=12000) or "(상태 비어 있음)")
         return "\n\n".join(report), bool(refused)

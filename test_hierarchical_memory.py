@@ -72,6 +72,20 @@ class HierarchicalMemoryTest(unittest.TestCase):
 
 
 class RolloverHierarchicalIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_large_ledger_does_not_expand_rollover_summary_unboundedly(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = SimpleNamespace(root=root)
+            ledger, payload = self._make_payload(workspace)
+            for i in range(2000):
+                ledger.add_evidence(f"E_LARGE_{i}", "x" * 220, "s" * 160)
+            response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=bot.MILESTONES_SECTION_HEADER + "\nsummary without state markers"))])
+            with patch.object(bot, "run_completion_stage", AsyncMock(return_value=response)):
+                rolled, summary = await bot.rollover_agent_context(workspace, payload, "", 10, ledger=ledger)
+            self.assertLessEqual(len(summary), bot.ROLLING_SUMMARY_MAX_CHARS)
+            self.assertLess(len(bot._msg_content(rolled[0])), 30000)
+            self.assertEqual(len(ledger.to_dict()["evidence"]), 2001)
+
     def _make_payload(self, workspace):
         ledger = ResearchLedger()
         ledger.set_goal("보안 취약점 조사")
