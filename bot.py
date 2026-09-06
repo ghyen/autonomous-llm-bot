@@ -357,7 +357,7 @@ bot = CustomBot(command_prefix="!", intents=intents)
 
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
-channel_reasoning = defaultdict(lambda: "medium")
+channel_reasoning = defaultdict(lambda: "none")
 # A run marks its lease active before its first await, so the admission check and
 # the mailbox it publishes are decided in one event-loop turn: a message arriving
 # during a live run is always steering, never a second run. The list keeps every
@@ -462,10 +462,10 @@ def steering_receipt_notice(receipt, text: str) -> str:
 
 MAX_RECENT_TURNS = 8
 CHECKPOINT_INTERVAL = 50
-MAX_AGENT_LOOPS = 350
+MAX_AGENT_LOOPS = int(os.environ.get("MAX_AGENT_LOOPS", 2000))
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
-MAX_TOOL_EXECUTIONS_PER_RUN = 350
-AGENT_STEP_MAX_TOKENS = 8192
+MAX_TOOL_EXECUTIONS_PER_RUN = int(os.environ.get("MAX_TOOL_EXECUTIONS_PER_RUN", 2000))
+AGENT_STEP_MAX_TOKENS = int(os.environ.get("AGENT_STEP_MAX_TOKENS", 8192))
 MAX_CONSECUTIVE_INTERNAL_THOUGHTS = 3
 REASONING_CUTOFF_MARKER = "[truncated — reasoning incomplete"
 
@@ -3053,7 +3053,9 @@ async def on_message(message: discord.Message):
                     pass
 
             extra_params = {}
-            if iteration == 0:
+            if iteration == 0 or consecutive_internal_thoughts > 0:
+                # 0번 스텝 및 직전 스텝에서 내부 추론 정체/절단이 발생한 경우
+                # 생각을 강제 차단(enable_thinking=False)하여 즉시 도구 호출 모드로 진입하도록 강제
                 extra_params["reasoning_effort"] = "none"
             elif current_effort and current_effort != "none":
                 extra_params["reasoning_effort"] = current_effort
