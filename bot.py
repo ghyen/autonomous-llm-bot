@@ -1685,6 +1685,11 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         )
         new_summary = (summary_resp.choices[0].message.content or "").strip()
         new_summary = re.sub(r"<think>.*?</think>", "", new_summary, flags=re.DOTALL).strip()
+        if completion_is_cutoff(summary_resp.choices[0]):
+            log_session_event(workspace, "rollover_cutoff", step=step_num)
+            # Keep the original context for a later attempt; a partial summary
+            # cannot replace facts that have not yet been durably summarized.
+            return messages, existing_summary
     except RunCancelled:
         # Cancellation must not silently degrade into a fallback summary.
         raise

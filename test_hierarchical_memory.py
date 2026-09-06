@@ -72,6 +72,20 @@ class HierarchicalMemoryTest(unittest.TestCase):
 
 
 class RolloverHierarchicalIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_truncated_summary_keeps_original_context(self):
+        for finish, text in (("length", "partial summary"),
+                             ("stop", "[truncated \u2014 reasoning incomplete; raise max_tokens]")):
+            with self.subTest(finish=finish), tempfile.TemporaryDirectory() as root:
+                workspace = SimpleNamespace(root=root)
+                ledger, payload = self._make_payload(workspace)
+                response = SimpleNamespace(choices=[SimpleNamespace(
+                    finish_reason=finish, message=SimpleNamespace(content=text))])
+                with patch.object(bot, "run_completion_stage", AsyncMock(return_value=response)):
+                    rolled, summary = await bot.rollover_agent_context(
+                        workspace, payload, "prior facts", 10, ledger=ledger)
+                self.assertIs(rolled, payload)
+                self.assertEqual(summary, "prior facts")
+
     def _make_payload(self, workspace):
         ledger = ResearchLedger()
         ledger.set_goal("보안 취약점 조사")
