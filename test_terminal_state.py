@@ -685,5 +685,43 @@ class DeliveryFailureLabelTest(TerminalStateTestCase):
         self.assertIn("미완료", failure_notice)
 
 
+    async def test_2f_none_effort_is_consistently_propagated(self):
+        """When reasoning_effort is configured as 'none', subsequent steps continue passing 'none'."""
+        captured_kwargs = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return await original_run(*args, **kwargs)
+
+        bot.channel_reasoning[CHANNEL_ID] = "none"
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                    _response(tool_calls=[_tool_call("c2", "read_file", {"path": "test.txt"})]),
+                    _response(tool_calls=[_tool_call("c3", "finish_task", {"report": "완료"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        # Step 1: "none"
+        self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
+        # Step 2: "none" (not dropped or left empty)
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "none")
+        # Step 3: "none"
+        self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
+
+    def test_2g_unclosed_xml_tool_call_extraction(self):
+        """extract_tool_calls_from_text handles unclosed tags or xml tags without error."""
+        text = "<tool_call>\n<function=bash_exec>\n<parameter=command>\nls -la"
+        extracted = bot.extract_tool_calls_from_text(text)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["name"], "bash_exec")
+        self.assertEqual(extracted[0]["arguments"], {"command": "ls -la"})
+
+
 if __name__ == "__main__":
     unittest.main()
