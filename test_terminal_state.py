@@ -211,6 +211,35 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
         self.assertEqual(self.recorder.detail, "내부 추론 반복 정체")
         self.assertIn("미완료", self.final_reply)
 
+    async def test_2e_internal_thought_stall_forces_none_effort_on_next_step(self):
+        """When an internal thought cutoff or thought without tools occurs, the next step forces reasoning_effort='none'."""
+        captured_kwargs = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return await original_run(*args, **kwargs)
+
+        bot.channel_reasoning[CHANNEL_ID] = "medium"
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                    _response(content="<think>생각만 하고 도구를 부르지 않음</think>"),
+                    _response(tool_calls=[_tool_call("c2", "finish_task", {"report": "완료"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        # Step 1 (iteration 0): always "none"
+        self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
+        # Step 2 (iteration 1): normal configured effort ("medium")
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "medium")
+        # Step 3 (iteration 2): consecutive_internal_thoughts > 0 -> forced fallback to "none"
+        self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
+
     async def test_2_completion_text_after_tools_does_not_stall_and_continues_until_budget(self):
         """Completion text without finish_task continues autonomously without stall until step budget."""
         await self.drive(
