@@ -433,6 +433,11 @@ class RunCatalog:
                 workspace.persist()
             return workspace
 
+    def is_selected(self, workspace):
+        with self._lock:
+            return (workspace.status == "prepared" and
+                    self._selected.get((workspace.owner_id, workspace.channel_id)) == workspace.run_id)
+
     def prepare(self, owner_id, channel_id):
         with self._lock:
             self.ensure_reset_allowed(owner_id, channel_id)

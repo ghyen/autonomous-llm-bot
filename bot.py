@@ -1554,6 +1554,9 @@ def snapshot_tail(messages: list, max_messages: int = None) -> list:
     return [_snapshot_message(message) for message in tail]
 
 
+_startup_resumes = {}
+
+
 def recover_interrupted_runs() -> dict:
     """Settle every unterminated record once, at startup.
 
@@ -1615,7 +1618,35 @@ def recover_interrupted_runs() -> dict:
             calls=len(record["executed_call_ids"]),
         )
         recovered += 1
+        _startup_resumes[workspace.run_id] = workspace
     return {"recovered": recovered, "aborted": aborted}
+
+
+async def resume_startup_runs():
+    pending = list(_startup_resumes.values())
+    _startup_resumes.clear()  # Discord can emit on_ready again after reconnect.
+
+    async def resume_one(workspace):
+        try:
+            if not authorize_caller(authz.ACCESS, workspace.owner_id, channel_id=workspace.channel_id):
+                log_session_event(workspace, "run_auto_resume_blocked", reason="access_revoked")
+                return
+            record = run_state.load(workspace)
+            if not record or record["state"] != run_state.RUNNING or record.get("pending_tools"):
+                return
+            channel = bot.get_channel(workspace.channel_id) or await bot.fetch_channel(workspace.channel_id)
+            message = await channel.fetch_message(record["message_id"])
+            # User activity during fetch wins. Never turn an old goal into
+            # steering for a newer run, or acquire a different prepared run.
+            if (message.author.id != workspace.owner_id or
+                    channel_active_runs.get(workspace.channel_id) or
+                    not RUN_CATALOG.is_selected(workspace)):
+                return
+            await on_message(message)
+        except Exception as error:
+            log_session_event(workspace, "run_auto_resume_failed", error=type(error).__name__)
+
+    await asyncio.gather(*(resume_one(workspace) for workspace in pending))
 
 
 async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, ledger=None, token=None):
@@ -2175,6 +2206,7 @@ async def on_ready():
         run_root=str(RUN_CATALOG.runs_root),
     )
     await bot.change_presence(activity=discord.Game(name="Qwen 27B + Auto-Extension"), status=discord.Status.online)
+    await resume_startup_runs()
 
 # --- Slash Commands ---
 # 슬래시 명령도 텍스트 명령과 동일한 정책 경로(authorize_caller)를 사용한다.
