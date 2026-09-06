@@ -22,9 +22,9 @@ class LocalLLMSmokeTest(unittest.IsolatedAsyncioTestCase):
         channel = 987654999
         message = FakeMessage(
             "Run this local smoke check using tools. First call bash_exec with command "
-            "printf LOCAL_LLM_SMOKE_OK. After receiving the result, call read_file on plan.md. "
+            "printf LOCAL_LLM_SMOKE_OK > smoke.txt. After receiving the result, call read_file on smoke.txt. "
             "After receiving that result, call finish_task with a report containing "
-            "LOCAL_LLM_SMOKE_OK and what you read. Do not modify any files.",
+            "LOCAL_LLM_SMOKE_OK and what you read. Do not modify other files.",
             channel,
         )
         recorder = RunRecorder()

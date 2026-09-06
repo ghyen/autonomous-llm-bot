@@ -472,6 +472,12 @@ and compaction overhead. Cold prompt processing can take longer. Token caps boun
 output size; `MODEL_STAGE_TIMEOUT_SECONDS` bounds request time. A passing smoke
 check does not replace a 24-hour soak test.
 
+For the Qwen hybrid / rapid-mlx 0.12.18 deployment, prefix-cache reuse still
+reproduced a token-exhaustion stall with thinking disabled. The serving host
+currently uses `--disable-prefix-cache`; see the
+[verification report](docs/local-llm-verification-20260906.md) for measurements
+and the successful three-step live check.
+
 ---
 
 ## 🖥️ macOS LaunchAgent Daemon (Optional)
