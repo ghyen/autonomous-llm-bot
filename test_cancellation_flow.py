@@ -467,17 +467,15 @@ class CheckpointBoundaryTest(CancellationTestCase):
         self.assertEqual(self.reason, outcome_mod.STOPPED)
         self.assertIn(outcome_mod.LABELS[outcome_mod.STOPPED], delivered)
 
-    # Mutation caught: a generic checkpoint fallback that swallows StageTimeout
-    # continues the run and can later claim completion after the stage failed.
-    async def test_checkpoint_timeout_propagates_without_another_stage(self):
+    async def test_checkpoint_timeout_does_not_abort_research(self):
         agent_calls, message = await self.run_checkpoint_error(
             StageTimeout("checkpoint", 0.1)
         )
 
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
-        self.assertEqual(agent_calls, ["agent"])
-        self.assertEqual(self.reason, outcome_mod.FAILED)
-        self.assertIn("마감 초과", delivered)
+        self.assertEqual(agent_calls, ["agent", "agent"])
+        self.assertEqual(self.reason, outcome_mod.COMPLETED)
+        self.assertIn(LONG_REPORT.strip(), delivered)
 
 
 class FinalSynthesisBoundaryTest(CancellationTestCase):

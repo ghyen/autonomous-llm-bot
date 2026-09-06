@@ -1785,16 +1785,30 @@ async def run_completion_stage(token=None, stage="agent", deadline=None, **kwarg
     cannot accidentally bypass cancellation or the total deadline. A supplied
     monotonic deadline lets recovery attempts share one stage budget.
     """
-    from openai import APITimeoutError
+    from openai import APIConnectionError, APIStatusError, APITimeoutError
 
     seconds = (
         CONFIG.model_stage_timeout
         if deadline is None
         else max(0.0, deadline - time.monotonic())
     )
+    expires = time.monotonic() + seconds
+
+    async def complete_with_retries():
+        for attempt in range(3):
+            try:
+                return await create_streaming_completion(token=token, stage=stage, **kwargs)
+            except (APIConnectionError, APIStatusError, httpx.TransportError) as error:
+                if isinstance(error, APIStatusError) and error.status_code != 429 and error.status_code < 500:
+                    raise
+                if attempt == 2 or expires - time.monotonic() <= 2 ** attempt:
+                    raise
+                # Backoff and all attempts share the outer deadline and cancellation.
+                await asyncio.sleep(2 ** attempt)
+
     try:
         return await with_deadline(
-            create_streaming_completion(token=token, stage=stage, **kwargs),
+            complete_with_retries(),
             seconds,
             token,
             stage,
@@ -3629,7 +3643,7 @@ async def on_message(message: discord.Message):
                         )
                         checkpoint_ok = True
 
-                    except (RunCancelled, StageTimeout) as stage_error:
+                    except RunCancelled as stage_error:
                         settle_stage_failure(stage_error)
                         break
                     except Exception as cp_err:
