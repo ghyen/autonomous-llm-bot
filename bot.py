@@ -2605,6 +2605,7 @@ async def on_message(message: discord.Message):
     # 이어간다. 신규 런에는 레코드가 없으므로 평소처럼 Step 1부터다.
     restored = run_state.load(workspace)
     resume_from = restored["next_step"] if restored is not None else 1
+    run_step_limit = resume_from - 1 + MAX_AGENT_LOOPS
     same_origin = (
         restored is not None
         and restored.get("message_id") == getattr(message, "id", None)
@@ -3054,7 +3055,7 @@ async def on_message(message: discord.Message):
     try:
         # 다음 커서에서 시작한다. 복원한 런은 Step 1을 다시 내지 않고, 신규 런은
         # resume_from이 1이라 종전과 같다.
-        for iteration in range(resume_from - 1, MAX_AGENT_LOOPS):
+        for iteration in range(resume_from - 1, run_step_limit):
             current_step = iteration + 1
             if token.cancelled:
                 outcome.settle(outcome_mod.STOPPED, token.reason)
@@ -3066,7 +3067,7 @@ async def on_message(message: discord.Message):
                 # 지시 본문은 되돌려 인용하지 않는다. 사용자가 방금 입력한 것이라
                 # 잃는 정보가 없고, 인용하면 채널에 원문이 한 번 더 남는다.
                 try:
-                    await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** 💬 **사용자 실시간 지시사항 {len(applied_steering)}건 반영 중...**")
+                    await status_msg.edit(content=f"🛠️ **[Step {iteration+1}/{run_step_limit}]** 💬 **사용자 실시간 지시사항 {len(applied_steering)}건 반영 중...**")
                 except Exception:
                     pass
 
@@ -3211,7 +3212,7 @@ async def on_message(message: discord.Message):
             elapsed_live = format_elapsed_time(time.time() - start_time)
             status_live_text = (
                 f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
-                f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 실행 도구: `{total_tools_executed}개`)\n"
+                f"> 🔄 **진행 상태**: `Step {iteration+1}/{run_step_limit}` (경과: `{elapsed_live}` | 실행 도구: `{total_tools_executed}개`)\n"
                 f"> 🧠 **실시간 추론 규모**: 추론 `{len(reasoning_text)}자` / 본문 `{len(content_text)}자` (추론 원문은 공개하지 않습니다)\n"
                 f"> ⚡ *자율 탐색 및 추론 진행 중... (실시간 지시/피드백 가능 / 중단: `!stop`)*"
             )
@@ -3333,7 +3334,7 @@ async def on_message(message: discord.Message):
                 tools_display = ", ".join([f"`{tc['name']}`" for tc in tool_calls_to_run[:3]])
                 tool_live_text = (
                     f"🤖 **[Qwen 자율 에이전트 실시간 대시보드]**\n"
-                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{MAX_AGENT_LOOPS}` (경과: `{elapsed_live}` | 현재까지 실행: `{total_tools_executed}개`)\n"
+                    f"> 🔄 **진행 상태**: `Step {iteration+1}/{run_step_limit}` (경과: `{elapsed_live}` | 현재까지 실행: `{total_tools_executed}개`)\n"
                     f"> 🛠️ **요청 도구**: {tools_display}\n"
                     f"> 💭 **판단 규모**: 추론 `{len(reasoning_text)}자` / 본문 `{len(content_text)}자`\n"
                     f"> ⚡ *도구 요청 검토 중... (실시간 지시 가능 / 중단: `!stop`)*"
@@ -3517,7 +3518,7 @@ async def on_message(message: discord.Message):
                 # [매 30스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
                 # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
                 # 쓰이는 것은 바로 위 save_snapshot이 남긴 durable 레코드다.
-                if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
+                if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < run_step_limit and not token.cancelled:
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
                     log_session_event(
                         workspace,
@@ -3673,7 +3674,7 @@ async def on_message(message: discord.Message):
                 if token.cancelled:
                     outcome.settle(outcome_mod.STOPPED, token.reason)
                     break
-                if iteration + 1 >= MAX_AGENT_LOOPS:
+                if iteration + 1 >= run_step_limit:
                     outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
                     break
 
@@ -3690,7 +3691,7 @@ async def on_message(message: discord.Message):
                 final_raw = full_raw_thought or content_text
                 break
 
-            if iteration + 1 >= MAX_AGENT_LOOPS:
+            if iteration + 1 >= run_step_limit:
                 outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
                 final_raw = full_raw_thought or content_text
                 break
