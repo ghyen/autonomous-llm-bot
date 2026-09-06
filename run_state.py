@@ -135,6 +135,35 @@ def discard(workspace):
     return True
 
 
+def mark_pending(workspace, calls):
+    """Persist dispatch intent before any tool can produce side effects."""
+    path = snapshot_path(workspace)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["pending_tools"] = [
+        {"id": c["id"], "name": c["name"], "arguments": c["arguments"]}
+        for c in calls
+    ]
+    atomic_write(path, _dump(record))
+
+
+def resolve_pending(workspace, decision):
+    if decision not in ("retry", "skip"):
+        raise ValueError("pending decision must be retry or skip")
+    path = snapshot_path(workspace)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    pending = record.pop("pending_tools", [])
+    if decision == "skip" and pending:
+        record["executed_call_ids"].extend(c["id"] for c in pending)
+        record["next_step"] += 1
+        record["tail"].append({
+            "role": "user",
+            "content": "Interrupted tool batch was explicitly skipped by the owner. "
+                       "Its effects are unknown, not successful. Inspect current files "
+                       "and state before further changes. Do not replay the batch.",
+        })
+    atomic_write(path, _dump(record))
+
+
 def terminate(workspace, state):
     """Mark the record as ended so startup does not treat it as unfinished.
 

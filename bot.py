@@ -1584,6 +1584,9 @@ def recover_interrupted_runs() -> dict:
             # 종료 이벤트를 남긴 런이다. 명시적 !resume 대상으로는 남지만 자동
             # 복구 대상은 아니다.
             continue
+        if record.get("pending_tools"):
+            log_session_event(workspace, "run_recovery_blocked", reason="uncertain_tool_effects")
+            continue
         key = (workspace.owner_id, workspace.channel_id)
         previous = candidates.get(key)
         if previous is None:
@@ -2211,7 +2214,17 @@ def prepare_new_run(owner_id, channel_id):
     return workspace
 
 
-def resume_run(owner_id, channel_id, run_id):
+def resume_run(owner_id, channel_id, run_id, pending=""):
+    workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if workspace.status == "active":
+        raise RunActiveError("run is active")
+    record = run_state.load(workspace)
+    if record and record.get("pending_tools"):
+        if pending not in ("retry", "skip"):
+            raise RunActiveError(
+                "Interrupted tools have unknown effects. Inspect state.json pending_tools "
+                "and current files, then use !resume <run-id> retry or skip.")
+        run_state.resolve_pending(workspace, pending)
     return RUN_CATALOG.resume(owner_id, channel_id, run_id)
 
 
@@ -2250,7 +2263,7 @@ async def slash_new(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="resume", description="소유한 run을 다음 목표에서 재개합니다.")
-async def slash_resume(interaction: discord.Interaction, run_id: str):
+async def slash_resume(interaction: discord.Interaction, run_id: str, pending: str = ""):
     owner_id = getattr(interaction.user, "id", None)
     decision = authorize_caller(
         authz.CONTROL, owner_id, channel_id=interaction.channel_id
@@ -2259,12 +2272,12 @@ async def slash_resume(interaction: discord.Interaction, run_id: str):
         await deny_interaction(interaction, authz.CONTROL, decision)
         return
     try:
-        workspace = resume_run(owner_id, interaction.channel_id, run_id)
+        workspace = resume_run(owner_id, interaction.channel_id, run_id, pending)
     except RunNotFoundError:
         await interaction.response.send_message("run not found", ephemeral=True)
         return
-    except RunActiveError:
-        await interaction.response.send_message("run is active", ephemeral=True)
+    except RunActiveError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
         return
     await interaction.response.send_message(
         f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다."
@@ -2440,16 +2453,16 @@ async def on_message(message: discord.Message):
         if not control:
             await message.reply(f"⛔ {control.reason}")
             return
-        if len(parts) != 2:
-            await message.reply("사용법: `!resume <run-id>`")
+        if len(parts) not in (2, 3):
+            await message.reply("사용법: `!resume <run-id> [retry|skip]`")
             return
         try:
-            workspace = resume_run(caller_id, message.channel.id, parts[1])
+            workspace = resume_run(caller_id, message.channel.id, parts[1], parts[2] if len(parts) == 3 else "")
         except RunNotFoundError:
             await message.reply("run not found")
             return
-        except RunActiveError:
-            await message.reply("run is active")
+        except RunActiveError as error:
+            await message.reply(str(error))
             return
         await message.reply(f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다.")
         return
@@ -2604,6 +2617,11 @@ async def on_message(message: discord.Message):
     # 재시작 전에 남은 durable 레코드. 있으면 이 런은 같은 런 id로 다음 커서에서
     # 이어간다. 신규 런에는 레코드가 없으므로 평소처럼 Step 1부터다.
     restored = run_state.load(workspace)
+    if restored and restored.get("pending_tools"):
+        RUN_CATALOG.finish(workspace, "interrupted")
+        await message.reply("Uncertain tool effects block this run. Inspect state.json pending_tools, "
+                            "then use !resume <run-id> retry or skip.")
+        return
     resume_from = restored["next_step"] if restored is not None else 1
     same_origin = (
         restored is not None
@@ -2920,7 +2938,7 @@ async def on_message(message: discord.Message):
                 reason=reason,
                 error=type(snapshot_error).__name__,
             )
-            return
+            return False
         log_session_event(
             workspace,
             "snapshot",
@@ -2931,6 +2949,7 @@ async def on_message(message: discord.Message):
             summary_chars=len(rolling_summary),
             calls=len(executed_call_ids),
         )
+        return True
 
     # 여기부터 에이전트 루프가 보장되므로 지시를 받는다. 직접 답변 런은 이 지점에
     # 오지 않으므로 큐가 닫힌 상태로 남고, 반영할 스텝이 없다는 사실이 접수
@@ -3438,6 +3457,7 @@ async def on_message(message: discord.Message):
                 if allowed_calls:
                     tool_batch_started = time.monotonic()
                     try:
+                        run_state.mark_pending(workspace, allowed_calls)
                         parallel_results = await execute_tools_in_parallel(
                             workspace,
                             allowed_calls,
@@ -3512,7 +3532,9 @@ async def on_message(message: discord.Message):
 
                 # 그룹이 완결됐다: 모든 호출에 결과가 붙었고 대기 지시도 흡수됐다.
                 # 저장 경계는 여기이며, 병렬 호출/결과 그룹 중간이 아니다.
-                save_snapshot(iteration + 2, "tool_group")
+                if not save_snapshot(iteration + 2, "tool_group"):
+                    outcome.settle(outcome_mod.FAILED, "Could not persist tool results; execution paused")
+                    break
 
                 # [매 30스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
                 # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
