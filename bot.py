@@ -839,7 +839,7 @@ def extract_tool_calls_from_text(text: str) -> list:
         args_dict = {}
         param_pattern = r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</parameter>"
         # Missing outer tags are recoverable; a partial argument is not.
-        if re.sub(param_pattern, "", inner, flags=re.DOTALL).strip():
+        if not inner or re.sub(param_pattern, "", inner, flags=re.DOTALL).strip():
             continue
         param_matches = re.finditer(param_pattern, inner, re.DOTALL)
         for pm in param_matches:

@@ -232,6 +232,7 @@ class StateUpdateBlockParsingTest(unittest.TestCase):
 class RobustJSONParsingTest(unittest.TestCase):
     def test_incomplete_xml_arguments_are_not_executable(self):
         for text in (
+            "<tool_call><function=finish_task>",
             "<tool_call><function=bash_exec><parameter=command>echo partial",
             "<function=write_file><parameter=path>a.txt</parameter><parameter=content>partial",
         ):
