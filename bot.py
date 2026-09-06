@@ -829,7 +829,7 @@ def extract_tool_calls_from_text(text: str) -> list:
                     args = sub_parsed
             extracted.append({
                 "name": parsed.get("name"),
-                "arguments": args if isinstance(args, dict) else {}
+                "arguments": args
             })
 
     func_matches = re.finditer(r"<function=([a-zA-Z0-9_-]+)>\s*(.*?)\s*(?:</function>|$)", text, re.DOTALL)
@@ -837,7 +837,11 @@ def extract_tool_calls_from_text(text: str) -> list:
         fname = fm.group(1).strip()
         inner = fm.group(2).strip()
         args_dict = {}
-        param_matches = re.finditer(r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*(?:</parameter>|$)", inner, re.DOTALL)
+        param_pattern = r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</parameter>"
+        # Missing outer tags are recoverable; a partial argument is not.
+        if re.sub(param_pattern, "", inner, flags=re.DOTALL).strip():
+            continue
+        param_matches = re.finditer(param_pattern, inner, re.DOTALL)
         for pm in param_matches:
             pname = pm.group(1).strip()
             pval = pm.group(2).strip()
@@ -848,6 +852,13 @@ def extract_tool_calls_from_text(text: str) -> list:
                 extracted.append({"name": fname, "arguments": args_dict})
 
     return extracted
+
+
+def completion_is_cutoff(choice) -> bool:
+    return (
+        getattr(choice, "finish_reason", None) == "length"
+        or REASONING_CUTOFF_MARKER in (choice.message.content or "")
+    )
 
 # --- Helper Functions for Message Roles and Serialization ---
 
@@ -2782,6 +2793,8 @@ async def on_message(message: discord.Message):
             token.raise_if_cancelled()
             direct_text = direct_resp.choices[0].message.content or ""
             direct_text = clean_direct_response(direct_text)
+            if completion_is_cutoff(direct_resp.choices[0]):
+                direct_text = ""
         except RunCancelled as direct_cancelled:
             outcome.settle(outcome_mod.STOPPED, direct_cancelled.reason)
             direct_report = build_incomplete_report(
@@ -3163,6 +3176,7 @@ async def on_message(message: discord.Message):
                 break
             choice = resp.choices[0]
             msg = choice.message
+            is_length_cutoff = completion_is_cutoff(choice)
 
             # [Rapid-MLX / OpenAI Reasoning 필드 추출]
             reasoning_text = (getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) or "")
@@ -3215,7 +3229,7 @@ async def on_message(message: discord.Message):
                 break
 
             tool_calls_to_run = []
-            if msg.tool_calls:
+            if msg.tool_calls and not is_length_cutoff:
                 for tc in msg.tool_calls:
                     raw_value = tc.function.arguments
                     if isinstance(raw_value, str):
@@ -3251,7 +3265,7 @@ async def on_message(message: discord.Message):
                         "argument_error": argument_error,
                     })
 
-            if not tool_calls_to_run and content_text:
+            if not tool_calls_to_run and content_text and not is_length_cutoff:
                 extracted = extract_tool_calls_from_text(content_text)
                 for i, e in enumerate(extracted):
                     args = e["arguments"]
@@ -3269,7 +3283,9 @@ async def on_message(message: discord.Message):
                         ),
                     })
 
-            if iteration == 0 and not direct_call_failed and not tool_calls_to_run and content_text.strip():
+            if (iteration == 0 and not direct_call_failed and not tool_calls_to_run
+                    and content_text.strip() and not is_length_cutoff
+                    and not re.search(r"<(?:tool_call|function=)", content_text)):
                 direct_text = clean_direct_response(content_text)
                 if direct_text:
                     outcome.settle(outcome_mod.COMPLETED, outcome_mod.DETAIL_DIRECT_ANSWER)
@@ -3682,11 +3698,6 @@ async def on_message(message: discord.Message):
             # 모델이 도구 없이 내부 추론(thought/plan)만 진행한 경우:
             consecutive_internal_thoughts += 1
 
-            finish_reason = getattr(choice, "finish_reason", None)
-            is_length_cutoff = (
-                finish_reason == "length"
-                or REASONING_CUTOFF_MARKER in (content_text or "")
-            )
             cleaned_thought = clean_internal_thought_content(content_text)
 
             messages_payload.append({

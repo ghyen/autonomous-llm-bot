@@ -452,6 +452,26 @@ tests is synthetic.
 All three commands also run in CI (`.github/workflows/ci.yml`) on macOS with
 Python 3.10 and 3.12.
 
+### Local LLM Integration Check
+
+With the local server running, use the bot's Python environment:
+
+```bash
+RUN_LOCAL_LLM_SMOKE=1 python -m unittest test_local_llm_smoke -v
+```
+
+This opt-in check uses the configured endpoint and model, real streaming and
+sandboxed tools, a temporary run workspace, and fake Discord messages. It checks
+`bash_exec`, `read_file`, and `finish_task` across multiple steps, including
+`reasoning_effort=none` and the absence of reasoning output. It sends no Discord
+messages and has a ten-minute total timeout. Ordinary test discovery skips it.
+
+The default 2,000-step/tool budgets are ceilings, not a 24-hour runtime guarantee.
+At 15-30 seconds per step, 2,000 steps cover roughly 8-17 hours before checkpoint
+and compaction overhead. Cold prompt processing can take longer. Token caps bound
+output size; `MODEL_STAGE_TIMEOUT_SECONDS` bounds request time. A passing smoke
+check does not replace a 24-hour soak test.
+
 ---
 
 ## 🖥️ macOS LaunchAgent Daemon (Optional)

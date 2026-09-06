@@ -230,6 +230,19 @@ class StateUpdateBlockParsingTest(unittest.TestCase):
 
 
 class RobustJSONParsingTest(unittest.TestCase):
+    def test_incomplete_xml_arguments_are_not_executable(self):
+        for text in (
+            "<tool_call><function=bash_exec><parameter=command>echo partial",
+            "<function=write_file><parameter=path>a.txt</parameter><parameter=content>partial",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(bot.extract_tool_calls_from_text(text), [])
+
+    def test_invalid_json_arguments_are_preserved_for_dispatch_rejection(self):
+        for args in ([], "broken", None):
+            text = "<tool_call>" + json.dumps({"name": "finish_task", "arguments": args}) + "</tool_call>"
+            self.assertEqual(bot.extract_tool_calls_from_text(text)[0]["arguments"], args)
+
     def test_robust_json_loads_markdown_fences(self):
         text = "```json\n{\"name\": \"bash_exec\", \"arguments\": {\"command\": \"ls\"}}\n```"
         parsed = bot._robust_json_loads(text)
@@ -342,4 +355,3 @@ class MarkdownChunkingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
