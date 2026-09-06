@@ -137,7 +137,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(completion.await_count, 3)
             execute_tools.assert_awaited_once()
-            self.assertEqual(completion.await_args_list[1].kwargs["max_tokens"], 8192)
+            self.assertEqual(completion.await_args_list[1].kwargs["max_tokens"], bot.AGENT_STEP_MAX_TOKENS)
             self.assertIn("조사 완료", message.replies[-1])
         finally:
             bot.FREE_RESPONSE_CHANNEL_IDS.discard(channel_id)

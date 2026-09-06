@@ -465,8 +465,8 @@ CHECKPOINT_INTERVAL = 50
 MAX_AGENT_LOOPS = int(os.environ.get("MAX_AGENT_LOOPS", 2000))
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = int(os.environ.get("MAX_TOOL_EXECUTIONS_PER_RUN", 2000))
-AGENT_STEP_MAX_TOKENS = int(os.environ.get("AGENT_STEP_MAX_TOKENS", 8192))
-MAX_CONSECUTIVE_INTERNAL_THOUGHTS = 3
+AGENT_STEP_MAX_TOKENS = int(os.environ.get("AGENT_STEP_MAX_TOKENS", 2048))
+MAX_CONSECUTIVE_INTERNAL_THOUGHTS = int(os.environ.get("MAX_CONSECUTIVE_INTERNAL_THOUGHTS", 3))
 REASONING_CUTOFF_MARKER = "[truncated — reasoning incomplete"
 
 # 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
@@ -817,11 +817,11 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
 
 def extract_tool_calls_from_text(text: str) -> list:
     extracted = []
-    xml_matches = re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+    xml_matches = re.finditer(r"<tool_call>(.*?)(?:</tool_call>|$)", text, re.DOTALL)
     for m in xml_matches:
         raw_json = m.group(1).strip()
         parsed = _robust_json_loads(raw_json)
-        if isinstance(parsed, dict):
+        if isinstance(parsed, dict) and parsed.get("name"):
             args = parsed.get("arguments", {})
             if isinstance(args, str):
                 sub_parsed = _robust_json_loads(args)
@@ -832,19 +832,19 @@ def extract_tool_calls_from_text(text: str) -> list:
                 "arguments": args if isinstance(args, dict) else {}
             })
 
-    if not extracted:
-        func_matches = re.finditer(r"<function=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</function>", text, re.DOTALL)
-        for fm in func_matches:
-            fname = fm.group(1).strip()
-            inner = fm.group(2).strip()
-            args_dict = {}
-            param_matches = re.finditer(r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*</parameter>", inner, re.DOTALL)
-            for pm in param_matches:
-                pname = pm.group(1).strip()
-                pval = pm.group(2).strip()
-                parsed_val = _robust_json_loads(pval)
-                args_dict[pname] = parsed_val if parsed_val is not None else pval
-            if fname:
+    func_matches = re.finditer(r"<function=([a-zA-Z0-9_-]+)>\s*(.*?)\s*(?:</function>|$)", text, re.DOTALL)
+    for fm in func_matches:
+        fname = fm.group(1).strip()
+        inner = fm.group(2).strip()
+        args_dict = {}
+        param_matches = re.finditer(r"<parameter=([a-zA-Z0-9_-]+)>\s*(.*?)\s*(?:</parameter>|$)", inner, re.DOTALL)
+        for pm in param_matches:
+            pname = pm.group(1).strip()
+            pval = pm.group(2).strip()
+            parsed_val = _robust_json_loads(pval)
+            args_dict[pname] = parsed_val if parsed_val is not None else pval
+        if fname:
+            if not any(e["name"] == fname and e["arguments"] == args_dict for e in extracted):
                 extracted.append({"name": fname, "arguments": args_dict})
 
     return extracted
@@ -1811,12 +1811,17 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
     tool_buffers = []
     buffers_by_index = {}
     current = None
+    finish_reason = None
 
     async for chunk in stream_chunks(stream, stage, CONFIG.idle_timeout, token):
         choices = getattr(chunk, "choices", None) or []
         if not choices:
             continue
-        delta = getattr(choices[0], "delta", None)
+        c0 = choices[0]
+        fr = getattr(c0, "finish_reason", None)
+        if fr:
+            finish_reason = fr
+        delta = getattr(c0, "delta", None)
         if delta is None:
             continue
 
@@ -1895,7 +1900,7 @@ async def create_streaming_completion(token=None, stage="agent", **kwargs):
         reasoning="".join(reasoning_parts),
         tool_calls=tool_calls,
     )
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish_reason)])
 
 
 DISCORD_CHUNK_MAX_CHARS = 1900
@@ -3057,8 +3062,10 @@ async def on_message(message: discord.Message):
                 # 0번 스텝 및 직전 스텝에서 내부 추론 정체/절단이 발생한 경우
                 # 생각을 강제 차단(enable_thinking=False)하여 즉시 도구 호출 모드로 진입하도록 강제
                 extra_params["reasoning_effort"] = "none"
-            elif current_effort and current_effort != "none":
+            elif current_effort:
                 extra_params["reasoning_effort"] = current_effort
+            else:
+                extra_params["reasoning_effort"] = "none"
 
             # 권위 있는 조사 상태를 매 스텝 0번 메시지에 재고정한다.
             if messages_payload and _msg_role(messages_payload[0]) == "system":
@@ -3720,10 +3727,10 @@ async def on_message(message: discord.Message):
                     "조사가 완료되었다면 finish_task를 호출하세요.]"
                 )
                 messages_payload.append({"role": "user", "content": nudge_content})
-            elif consecutive_internal_thoughts >= 2:
+            elif consecutive_internal_thoughts >= 1:
                 nudge_content = (
-                    f"[🤖 시스템 안내: {consecutive_internal_thoughts}스텝 연속으로 도구 호출 없이 내부 추론만 진행되었습니다. "
-                    "혼자 생각하는 것을 멈추고 실제 행동(도구 실행)을 즉시 수행하세요. "
+                    f"[🤖 시스템 안내: {consecutive_internal_thoughts}스텝 연속으로 도구 호출 없이 내부 추론/텍스트만 반환되었습니다. "
+                    "혼자 생각하거나 설명하는 것을 멈추고 실제 행동(도구 실행)을 즉시 수행하세요. "
                     "필요한 도구를 호출하거나 모든 조사가 끝났다면 finish_task로 결과를 보고하세요.]"
                 )
                 messages_payload.append({"role": "user", "content": nudge_content})
