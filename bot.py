@@ -30,6 +30,7 @@ import outcome as outcome_mod
 import run_state
 import session_log
 import steering as steering_mod
+import workspace_io
 from deadlines import (
     CancelToken,
     RunCancelled,
@@ -96,14 +97,16 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `{workspace_root}/skills/`: 현재 실행 전용 재사용 스크립트 및 도구 저장소 (`.py`, `.sh`, `.bash`, `.md`)
   - `{workspace_root}/plan.md`: 에이전트의 목표 달성 체크리스트 및 실시간 진행 상태
   - `{workspace_root}/findings.md`: 수집된 핵심 데이터, 단서, 팩트, 취약점 및 결론 누적 기록
+  - `{workspace_root}/playbook.md`: 시행착오로 얻은 환경 제약·무효 경로·성공 패턴 (다음 런에도 상속되며 시스템 프롬프트에 자동 주입됨)
 - 사용할 수 있는 도구:
   - `bash_exec(command)`: 현재 실행 작업 공간에서 쉘 명령어 실행 (zg, curl, python3, nmap, jq, sed, awk, find, grep 등).
   - `read_file(path)`: 파일 읽기
   - `write_file(path, content, expected_revision)`: 파일 생성 및 덮어쓰기
   - `web_search(query)`: DuckDuckGo 웹 검색
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
+  - `record_playbook(rule_type, rule_content)`: 환경 제약·무효 경로·검증된 성공 패턴을 다음 런에도 남기는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
-- 루트 `plan.md`와 `findings.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`와 `findings.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
+- 루트 `plan.md`, `findings.md`, `playbook.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`와 `findings.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
 - 두 파일의 변경된 읽기는 전체 내용과 revision을 반환하고, 변경 없는 재읽기는 내용 대신 hash reference만 반환합니다. conflict이면 최신 내용을 다시 읽고 병합하세요.
 
 [상태 관리 - 자율 탐색의 절대 규칙]
@@ -126,7 +129,8 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 4. 반복되거나 복잡한 데이터 파싱, 스크래핑, 쉘 작업은 `write_file`로 `skills/<name>.py` 또는 `skills/<name>.sh`에 스크립트화하여 저장하고 `bash_exec`로 실행하여 재사용하세요.
 5. 기존 `plan.md`와 `findings.md`가 존재하면 먼저 읽어 이전 작업 맥락을 파악하고, 발견된 사실은 `findings.md`에 지속적으로 누적 기록하며 `plan.md`의 진행 상태를 업데이트하세요. 기존 내용을 빈 템플릿으로 초기화하지 마세요.
 6. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
-7. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요.
+7. 명령 문법 오류, 지원되지 않는 CLI 옵션, 인증 게이트웨이로 막힌 경로, 사람을 속이는 데이터 필드를 만나거나 재사용할 성공 패턴을 검증하면 그 스텝에 `record_playbook`으로 한 줄 규칙을 남기세요. `[상속된 실행 플레이북]`의 환경 제약과 무효 경로는 반복하지 말고, 검증된 성공 패턴은 재사용하세요.
+8. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요. `finish_task`와 다른 도구를 같은 응답에 함께 호출하면 나머지 호출은 폐기되므로, 남길 플레이북 규칙은 `finish_task` 이전 스텝에서 기록하세요.
 """
 
 DIRECT_RESPONSE_PATTERN = re.compile(
@@ -320,6 +324,28 @@ TOOLS_SCHEMA = [
                         }
                     }
                 }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_playbook",
+            "description": "다음 런에도 상속되는 playbook.md에 환경 제약, 무효 경로, 검증된 성공 패턴을 역할별 한 줄 규칙으로 누적 기록합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule_type": {
+                        "type": "string",
+                        "enum": ["environment", "dead_end", "strategy"],
+                        "description": "environment=지원되지 않는 CLI 문법·타임아웃 등 환경 제약, dead_end=속임수 데이터나 실패한 인증 경로, strategy=검증된 성공 패턴"
+                    },
+                    "rule_content": {
+                        "type": "string",
+                        "description": "다음 런이 그대로 활용할 수 있는 1~2줄 규칙 (예: Mac 기본 grep은 BSD라 -P를 지원하지 않는다)"
+                    }
+                },
+                "required": ["rule_type", "rule_content"]
             }
         }
     },
@@ -536,7 +562,7 @@ def _invalid_tool_arguments_result(reason: str, tool_name: str) -> str:
 
 
 def _tool_result_failed(tool_name: str, result: str) -> bool:
-    if tool_name in ("read_file", "write_file"):
+    if tool_name in ("read_file", "write_file", "record_playbook"):
         try:
             envelope = json.loads(result)
         except (TypeError, ValueError):
@@ -715,6 +741,143 @@ async def tool_write_file(
         })
 
 
+# --- Playbook: inherited constraints, dead ends, and effective strategies ---
+
+PLAYBOOK_FILE_NAME = "playbook.md"
+PLAYBOOK_LABEL = "상속된 실행 플레이북"
+# The block is re-pinned into message 0 on every step, so an unbounded playbook
+# would tax every request. Growth is refused at record time rather than clipped
+# silently, and the renderer clips defensively in case write_file bypassed that.
+PLAYBOOK_MAX_CHARS = 4000
+PLAYBOOK_SECTIONS = {
+    "environment": "## 환경 및 도구 제약 (Environment Rules)",
+    "dead_end": "## 확인된 무효 경로 (Dead Ends & Traps)",
+    "strategy": "## 검증된 성공 패턴 (Effective Strategies)",
+}
+
+
+def read_playbook_text(workspace) -> str:
+    """Read playbook.md without touching the run's read-hash cache.
+
+    build_system_content runs for callers whose workspace root may not even
+    exist, so an unreadable playbook degrades to an empty string and never
+    raises. The cache-free read also keeps a repeat read from collapsing into
+    an "unchanged" reference that carries no content.
+    """
+    try:
+        envelope = workspace_io.read_file(workspace.root, PLAYBOOK_FILE_NAME)
+    except Exception:
+        return ""
+    if envelope.get("status") != "success":
+        return ""
+    return str(envelope.get("content") or "")
+
+
+def render_playbook_block(workspace) -> str:
+    text = read_playbook_text(workspace).strip()
+    if not text:
+        return ""
+    if len(text) > PLAYBOOK_MAX_CHARS:
+        text = (
+            text[:PLAYBOOK_MAX_CHARS]
+            + "\n...[플레이북이 상한을 넘어 생략됨. write_file로 규칙을 통합하세요.]"
+        )
+    return f"[{PLAYBOOK_LABEL}]\n{text}"
+
+
+def _playbook_rule_key(value) -> str:
+    stripped = str(value or "").strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    return " ".join(re.sub(r"^[-*+]\s+", "", stripped, count=1).split())
+
+
+def _merge_playbook_rule(text: str, section: str, rule: str) -> str:
+    """Append one globally unique rule, keeping a stable section order."""
+    rule_key = _playbook_rule_key(rule)
+    bullet = f"- {rule_key}"
+    order = list(PLAYBOOK_SECTIONS.values())
+    buckets = {header: [] for header in order}
+    preamble = []
+    existing_rules = set()
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in buckets:
+            current = stripped
+            continue
+        if not stripped:
+            continue
+        existing_key = _playbook_rule_key(line)
+        if existing_key:
+            existing_rules.add(existing_key)
+        if current is None:
+            preamble.append(line.rstrip())
+        else:
+            buckets[current].append(line.rstrip())
+    if rule_key and rule_key not in existing_rules:
+        buckets[section].append(bullet)
+    parts = ["\n".join(preamble)] if preamble else []
+    for header in order:
+        if buckets[header]:
+            parts.append(header + "\n" + "\n".join(buckets[header]))
+    return "\n\n".join(parts) + "\n"
+
+
+async def tool_record_playbook(workspace, rule_type, rule_content) -> str:
+    section = PLAYBOOK_SECTIONS.get(str(rule_type or "").strip().lower())
+    if section is None:
+        return _workspace_result({
+            "status": "error",
+            "path": PLAYBOOK_FILE_NAME,
+            "error": "unknown_rule_type",
+            "allowed": sorted(PLAYBOOK_SECTIONS),
+        })
+    rule = _playbook_rule_key(rule_content)
+    if not rule:
+        return _workspace_result({
+            "status": "error",
+            "path": PLAYBOOK_FILE_NAME,
+            "error": "empty_rule",
+        })
+    result = None
+    try:
+        # The canonical lock covers a single write, not a read-modify-write, so
+        # another canonical writer can land between the two. Retry once against
+        # the revision that beat us instead of dropping the lesson.
+        for _ in range(2):
+            envelope = workspace_io.read_file(workspace.root, PLAYBOOK_FILE_NAME)
+            if envelope.get("status") == "success":
+                current = str(envelope.get("content") or "")
+                expected = envelope["revision"]
+            elif envelope.get("error") == "not_found":
+                current = ""
+                expected = "absent"
+            else:
+                return _workspace_result(envelope)
+            merged = _merge_playbook_rule(current, section, rule)
+            if len(merged) > PLAYBOOK_MAX_CHARS:
+                return _workspace_result({
+                    "status": "error",
+                    "path": PLAYBOOK_FILE_NAME,
+                    "error": "playbook_full",
+                    "limit": PLAYBOOK_MAX_CHARS,
+                    "directive": (
+                        "write_file로 오래된 규칙을 통합하거나 삭제한 뒤 다시 기록하세요."
+                    ),
+                })
+            result = await workspace.write(PLAYBOOK_FILE_NAME, merged, expected)
+            if result.get("status") != "conflict":
+                return _workspace_result(result)
+        return _workspace_result(result)
+    except Exception as e:
+        return _workspace_result({
+            "status": "error",
+            "path": PLAYBOOK_FILE_NAME,
+            "error": type(e).__name__,
+        })
+
+
 async def tool_web_search(query: str) -> str:
     try:
         with tempfile.TemporaryDirectory(prefix=".tool-web-") as root:
@@ -794,6 +957,10 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
         elif name == "web_search":
             q = args.get("query", "")
             return await tool_web_search(q)
+        elif name == "record_playbook":
+            return await tool_record_playbook(
+                workspace, args.get("rule_type", ""), args.get("rule_content", "")
+            )
         elif name == "record_state":
             return await tool_record_state(ledger, args)
         elif name == "finish_task":
@@ -1384,6 +1551,9 @@ def build_system_content(workspace, ledger=None, summary: str = "") -> str:
     skills_block = render_skills_block(workspace)
     if skills_block:
         parts.append(skills_block)
+    playbook_block = render_playbook_block(workspace)
+    if playbook_block:
+        parts.append(playbook_block)
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
