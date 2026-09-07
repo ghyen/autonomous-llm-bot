@@ -221,6 +221,10 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 "steering": {"depth": 2, "applied": 1},
             },
             executed_call_ids=["c1", "c2"],
+            tool_fingerprints=[
+                ["a" * 64, 3],
+                ["b" * 64, 6],
+            ],
         )
         payload.update(overrides)
         return run_state.save(workspace, **payload)
@@ -246,6 +250,10 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         self.assertEqual(restored["tail"], saved["tail"])
         self.assertEqual(restored["interrupt"], saved["interrupt"])
         self.assertEqual(restored["executed_call_ids"], ["c1", "c2"])
+        self.assertEqual(
+            restored["tool_fingerprints"],
+            [["a" * 64, 3], ["b" * 64, 6]],
+        )
 
         ledger = restored["ledger"]
         self.assertEqual(ledger.goal, "장애 원인 규명")
@@ -468,6 +476,37 @@ class RestartRecoveryTest(DurableStateTestCase):
             killed=True,
         )
         return self.only_run(catalog)
+
+    async def test_1_restart_restores_the_fingerprint_window_for_a_new_call_id(self):
+        # Production mutation caught: restoring only executed call ids lets the
+        # model issue the same successful action under a new id after restart.
+        crashed = await self._crash_after_one_group(self.catalog())
+        saved = run_state.load(crashed)
+        self.assertTrue(saved["tool_fingerprints"])
+
+        self.restart()
+        fresh = self.catalog()
+        self.assertEqual(self.recover(fresh)["recovered"], 1)
+
+        await self.drive(
+            fresh,
+            [
+                _response(tool_calls=[
+                    _tool_call("c-new", "bash_exec", {"command": "reproduce.sh"})
+                ]),
+                _response(tool_calls=[
+                    _tool_call("c-finish", "finish_task", {"report": LONG_REPORT})
+                ]),
+            ],
+            message_id=ORIGIN_MESSAGE_ID,
+        )
+
+        resumed = self.only_run(fresh)
+        self.assertEqual(resumed.run_id, crashed.run_id)
+        self.assertEqual(self.bash_exec.await_count, 0)
+        blocked = json.loads(self.bash_result_of(self.stub, "c-new", resumed))
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["first_step"], 1)
 
     async def test_1_restart_resumes_the_same_run_at_the_next_step(self):
         # Production mutation caught: rebuilding the payload and the step cursor

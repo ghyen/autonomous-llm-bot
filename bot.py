@@ -14,6 +14,7 @@ import sys
 import re
 import json
 import time
+import hashlib
 import asyncio
 import tempfile
 from collections import defaultdict
@@ -103,6 +104,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `web_search(query)`: DuckDuckGo 웹 검색
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
+- `bash_exec`, `read_file`, `web_search`에서 최근 8스텝 안에 이미 성공한 동일 인자 호출은 Loop Guard가 실행 전에 차단합니다. 기존 결과를 가공하거나 다른 가설을 시도하세요. 백그라운드 작업 완료 확인처럼 의도적인 재시도일 때만 `force=true`를 추가하세요. `force`는 한 번의 재실행만 허용하며 호출의 동일성 자체를 바꾸지 않습니다.
 - 루트 `plan.md`와 `findings.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`와 `findings.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
 - 두 파일의 변경된 읽기는 전체 내용과 revision을 반환하고, 변경 없는 재읽기는 내용 대신 hash reference만 반환합니다. conflict이면 최신 내용을 다시 읽고 병합하세요.
 
@@ -177,6 +179,10 @@ TOOLS_SCHEMA = [
                     "command": {
                         "type": "string",
                         "description": "실행할 bash 쉘 명령어 (예: curl, python3, find, grep, cat 등)"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "최근 8스텝 안에 성공한 동일 명령을 의도적으로 다시 실행할 때만 true"
                     }
                 },
                 "required": ["command"]
@@ -194,6 +200,10 @@ TOOLS_SCHEMA = [
                     "path": {
                         "type": "string",
                         "description": "읽을 파일 경로 (현재 실행 작업 공간 기준 상대경로)"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "최근 8스텝 안에 읽은 동일 경로를 의도적으로 다시 확인할 때만 true"
                     }
                 },
                 "required": ["path"]
@@ -236,6 +246,10 @@ TOOLS_SCHEMA = [
                     "query": {
                         "type": "string",
                         "description": "검색할 키워드 또는 질문"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "최근 8스텝 안에 성공한 동일 검색을 의도적으로 다시 실행할 때만 true"
                     }
                 },
                 "required": ["query"]
@@ -453,6 +467,13 @@ CHECKPOINT_INTERVAL = 50
 MAX_AGENT_LOOPS = 350
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = 350
+# 최근 N스텝 안에 이미 성공한 동일 호출을 다시 실행하지 않는다. 추론이 잘리면
+# 모델은 방금 얻은 결과를 잊고 같은 명령을 토씨 하나 안 틀리고 다시 낸다.
+TOOL_LOOP_GUARD_WINDOW = 8
+# 결과를 다시 긁어오는 데 시간과 자원이 드는 도구만 대상이다. record_state는
+# 권위 있는 상태 갱신이라 막으면 상태 기록이 멈추고, write_file은 CAS가 이미
+# 두 번째 동일 쓰기를 conflict로 돌려세운다.
+TOOL_LOOP_GUARD_TOOLS = ("bash_exec", "read_file", "web_search")
 AGENT_STEP_MAX_TOKENS = 8192
 
 # 대기 중인 지시는 각각 별도의 steering 블록으로 프롬프트에 실린다. 상한이 없으면
@@ -489,18 +510,54 @@ def _robust_json_loads(raw: str):
     return None
 
 
-def _blocked_tool_result(reason: str, tool_name: str, limit: int, count: int) -> str:
+def _tool_fingerprint(tool_name: str, arguments: dict) -> str:
+    """Stable non-reversible identity for one effective tool action.
+
+    `force` authorizes one retry; it is policy metadata, not part of the action.
+    Hashing it would make the escape hatch produce a different action identity
+    and disable future loop detection.
+    """
+    normalized = {
+        key: value for key, value in dict(arguments or {}).items()
+        if key != "force"
+    }
+    canonical = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    source = f"{tool_name}\0{canonical}".encode("utf-8")
+    return hashlib.sha256(source).hexdigest()
+
+
+def _blocked_tool_result(
+    reason: str,
+    tool_name: str,
+    limit: int,
+    count: int,
+    first_step=None,
+) -> str:
+    payload = {
+        "blocked": True,
+        "reason": reason,
+        "tool": tool_name,
+        "limit": limit,
+        "count": count,
+        "directive": (
+            "Change the arguments or use a different approach before retrying."
+        ),
+    }
+    if reason == "loop_guard_repeat" and first_step is not None:
+        payload["first_step"] = int(first_step)
+        payload["directive"] = (
+            f"[Loop Guard 차단]: 이 호출은 Step {int(first_step)}에서 이미 "
+            "성공하여 결과가 확보되어 있습니다. 동일한 조회를 반복하지 말고 "
+            "확보된 데이터를 가공하거나 새로운 가설을 시도하세요. 의도적인 "
+            "재시도라면 force=true를 사용하세요."
+        )
     return json.dumps(
-        {
-            "blocked": True,
-            "reason": reason,
-            "tool": tool_name,
-            "limit": limit,
-            "count": count,
-            "directive": (
-                "Change the arguments or use a different approach before retrying."
-            ),
-        },
+        payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -2625,6 +2682,11 @@ async def on_message(message: discord.Message):
     # 이미 실행한 호출 식별자. 재시작 뒤 모델이 같은 호출을 다시 요청해도 부작용을
     # 두 번 일으키지 않는다.
     executed_call_ids = list(restored["executed_call_ids"]) if restored is not None else []
+    recent_tool_fingerprints = (
+        [list(item) for item in restored["tool_fingerprints"]]
+        if restored is not None
+        else []
+    )
     run_end_logged = False
     released = False
 
@@ -2877,6 +2939,7 @@ async def on_message(message: discord.Message):
                     "steering": lease["steering"].stats(),
                 },
                 executed_call_ids=executed_call_ids,
+                tool_fingerprints=recent_tool_fingerprints,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -3308,10 +3371,21 @@ async def on_message(message: discord.Message):
                     settle_stage_failure(stage_error)
                     break
 
+                # Window semantics are step-based, not call-count based: a
+                # parallel batch may contain many calls but still represents one
+                # model step. Future/corrupt entries are dropped as well.
+                current_tool_step = iteration + 1
+                recent_tool_fingerprints[:] = [
+                    [fingerprint, seen_step]
+                    for fingerprint, seen_step in recent_tool_fingerprints
+                    if 0 <= current_tool_step - seen_step <= TOOL_LOOP_GUARD_WINDOW
+                ]
                 batch_signatures = set()
+                batch_fingerprints = set()
                 allowed_calls = []
                 allowed_indexes = []
                 allowed_signatures = []
+                allowed_fingerprints = []
                 merged_results = [None] * len(tool_calls_to_run)
                 for call_index, tc in enumerate(tool_calls_to_run):
                     if tc["argument_error"] is not None:
@@ -3333,7 +3407,22 @@ async def on_message(message: discord.Message):
                             ensure_ascii=False,
                         ),
                     )
+                    guarded_fingerprint = (
+                        _tool_fingerprint(tc["name"], tc["arguments"])
+                        if tc["name"] in TOOL_LOOP_GUARD_TOOLS
+                        else None
+                    )
                     if signature in batch_signatures:
+                        merged_results[call_index] = _blocked_tool_result(
+                            "same_batch_duplicate", tc["name"], 1, 1
+                        )
+                        continue
+                    if (
+                        guarded_fingerprint is not None
+                        and guarded_fingerprint in batch_fingerprints
+                        and tc["arguments"].get("force") is not True
+                    ):
+                        batch_signatures.add(signature)
                         merged_results[call_index] = _blocked_tool_result(
                             "same_batch_duplicate", tc["name"], 1, 1
                         )
@@ -3344,11 +3433,44 @@ async def on_message(message: discord.Message):
                         >= MAX_CONSECUTIVE_FAILED_TOOL_CALLS
                     ):
                         batch_signatures.add(signature)
+                        if guarded_fingerprint is not None:
+                            batch_fingerprints.add(guarded_fingerprint)
                         merged_results[call_index] = _blocked_tool_result(
                             "consecutive_failure_limit",
                             tc["name"],
                             MAX_CONSECUTIVE_FAILED_TOOL_CALLS,
                             consecutive_failed_tool_calls,
+                        )
+                        continue
+                    prior_step = next(
+                        (
+                            seen_step
+                            for fingerprint, seen_step in recent_tool_fingerprints
+                            if fingerprint == guarded_fingerprint
+                        ),
+                        None,
+                    )
+                    if (
+                        guarded_fingerprint is not None
+                        and prior_step is not None
+                        and tc["arguments"].get("force") is not True
+                    ):
+                        batch_signatures.add(signature)
+                        batch_fingerprints.add(guarded_fingerprint)
+                        merged_results[call_index] = _blocked_tool_result(
+                            "loop_guard_repeat",
+                            tc["name"],
+                            TOOL_LOOP_GUARD_WINDOW,
+                            1,
+                            first_step=prior_step,
+                        )
+                        log_session_event(
+                            workspace,
+                            "tool_loop_blocked",
+                            step=current_tool_step,
+                            tool=tc["name"],
+                            fingerprint=guarded_fingerprint[:16],
+                            first_step=prior_step,
                         )
                         continue
                     if (
@@ -3363,9 +3485,12 @@ async def on_message(message: discord.Message):
                         )
                         continue
                     batch_signatures.add(signature)
+                    if guarded_fingerprint is not None:
+                        batch_fingerprints.add(guarded_fingerprint)
                     allowed_calls.append(tc)
                     allowed_indexes.append(call_index)
                     allowed_signatures.append(signature)
+                    allowed_fingerprints.append(guarded_fingerprint)
                     if (
                         last_failed_signature is not None
                         and signature != last_failed_signature
@@ -3374,7 +3499,9 @@ async def on_message(message: discord.Message):
                         consecutive_failed_tool_calls = 0
 
                 total_tools_executed += len(allowed_calls)
-                for tc in allowed_calls:
+                for tc, guarded_fingerprint in zip(
+                    allowed_calls, allowed_fingerprints
+                ):
                     executed_call_ids.append(tc["id"])
                     # 인자 원문 대신 어떤 인자가 왔는지만 남긴다. 도구 인자 JSON을
                     # 그대로 적는 것이 셸 명령과 파일 내용이 로그로 들어온 경로였다.
@@ -3383,6 +3510,7 @@ async def on_message(message: discord.Message):
                         "tool_call",
                         step=iteration + 1,
                         tool=tc["name"],
+                        fingerprint=(guarded_fingerprint or "")[:16],
                         arg_keys=sorted(tc["arguments"].keys()),
                         args_chars=len(tc["raw_arguments"] or ""),
                     )
@@ -3427,8 +3555,12 @@ async def on_message(message: discord.Message):
                     "content": content_text or None,
                     "tool_calls": synthetic_tool_calls,
                 })
-                for call_index, tc, signature, tool_result in zip(
-                    allowed_indexes, allowed_calls, allowed_signatures, parallel_results
+                for call_index, tc, signature, guarded_fingerprint, tool_result in zip(
+                    allowed_indexes,
+                    allowed_calls,
+                    allowed_signatures,
+                    allowed_fingerprints,
+                    parallel_results,
                 ):
                     merged_results[call_index] = tool_result
                     if _tool_result_failed(tc["name"], tool_result):
@@ -3440,6 +3572,16 @@ async def on_message(message: discord.Message):
                     else:
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
+                        if (
+                            guarded_fingerprint is not None
+                            and all(
+                                fingerprint != guarded_fingerprint
+                                for fingerprint, _ in recent_tool_fingerprints
+                            )
+                        ):
+                            recent_tool_fingerprints.append(
+                                [guarded_fingerprint, current_tool_step]
+                            )
 
                 for tc, tool_result in zip(tool_calls_to_run, merged_results):
                     if not isinstance(tool_result, str):

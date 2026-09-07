@@ -30,7 +30,7 @@ from pathlib import Path
 from ledger import ResearchLedger
 from run_workspace import atomic_write
 
-SCHEMA = 1
+SCHEMA = 2
 FILE_NAME = "state.json"
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
@@ -45,6 +45,7 @@ _REQUIRED = (
     "ledger",
     "interrupt",
     "executed_call_ids",
+    "tool_fingerprints",
 )
 
 
@@ -65,6 +66,7 @@ def save(
     ledger,
     interrupt,
     executed_call_ids,
+    tool_fingerprints,
     state=RUNNING,
 ):
     """Replace the run's record atomically.
@@ -87,6 +89,10 @@ def save(
         "ledger": ledger.to_dict(),
         "interrupt": dict(interrupt or {}),
         "executed_call_ids": [str(call_id) for call_id in executed_call_ids or ()],
+        "tool_fingerprints": [
+            [str(fingerprint), int(step)]
+            for fingerprint, step in tool_fingerprints or ()
+        ],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -116,6 +122,22 @@ def load(workspace):
         return None
     if not isinstance(payload["executed_call_ids"], list):
         return None
+    if not isinstance(payload["tool_fingerprints"], list):
+        return None
+    normalized_fingerprints = []
+    for item in payload["tool_fingerprints"]:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or len(item[0]) != 64
+            or any(char not in "0123456789abcdef" for char in item[0])
+            or not isinstance(item[1], int)
+            or isinstance(item[1], bool)
+            or item[1] < 1
+        ):
+            return None
+        normalized_fingerprints.append([item[0], item[1]])
     try:
         payload["ledger"] = ResearchLedger.from_dict(payload["ledger"])
     except ValueError:
@@ -123,6 +145,7 @@ def load(workspace):
     payload["summary"] = str(payload["summary"] or "")
     payload["tail"] = [item for item in payload["tail"] if isinstance(item, dict)]
     payload["executed_call_ids"] = [str(item) for item in payload["executed_call_ids"]]
+    payload["tool_fingerprints"] = normalized_fingerprints
     return payload
 
 
