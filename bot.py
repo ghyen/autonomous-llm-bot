@@ -606,7 +606,6 @@ async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
 # --- Tool Execution Functions ---
 
 ARTIFACT_DIR_NAME = "artifacts"
-ARTIFACT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 ARTIFACT_PREVIEW_LINES = 20
 ARTIFACT_PREVIEW_MAX_CHARS = 800
 # ponytail: 런당 산출물 예산을 디스크 한도의 1/8로 고정한다. 산출물은 런 루트
@@ -616,13 +615,10 @@ ARTIFACT_PREVIEW_MAX_CHARS = 800
 ARTIFACT_RUN_BYTE_BUDGET = TOOL_LIMITS["disk_bytes"] // 8
 
 
-def _artifact_name(call_id) -> str:
-    """모델이 준 호출 id는 신뢰할 수 없다. 안전하지 않으면 별도 이름공간에 둔다."""
-    token = str(call_id or "")
-    if not ARTIFACT_ID_PATTERN.fullmatch(token):
-        # 점은 안전한 원문 id에 허용되지 않으므로 다이제스트 이름과 충돌하지 않는다.
-        token = "." + hashlib.sha256(token.encode("utf-8")).hexdigest()
-    return f"out_{token}.log"
+def _artifact_name(call_id: str) -> str:
+    """호출 id의 전체 다이제스트를 대소문자 비의존 산출물 identity로 쓴다."""
+    digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
+    return f"out_.{digest}.log"
 
 
 def _artifact_usage(directory_descriptor) -> int:
@@ -3442,16 +3438,38 @@ async def on_message(message: discord.Message):
                     settle_stage_failure(stage_error)
                     break
 
+                batch_call_ids = set()
                 batch_signatures = set()
                 allowed_calls = []
                 allowed_indexes = []
                 allowed_signatures = []
                 merged_results = [None] * len(tool_calls_to_run)
                 for call_index, tc in enumerate(tool_calls_to_run):
+                    call_id = tc["id"]
+                    if not isinstance(call_id, str) or not call_id:
+                        merged_results[call_index] = json.dumps(
+                            {
+                                "error": "invalid_tool_call_id",
+                                "reason": "missing_or_non_string",
+                                "tool": tc["name"],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        continue
+                    if call_id in batch_call_ids:
+                        merged_results[call_index] = _blocked_tool_result(
+                            "same_batch_duplicate_id", tc["name"], 1, 1
+                        )
+                        continue
+                    # 첫 등장을 먼저 예약해야 그 호출이 다른 검사를 통과하지 못해도
+                    # 같은 응답의 뒤쪽 호출이 그 id로 부작용을 만들지 않는다.
+                    batch_call_ids.add(call_id)
                     if tc["argument_error"] is not None:
                         merged_results[call_index] = tc["argument_error"]
                         continue
-                    if tc["id"] in executed_call_ids:
+                    if call_id in executed_call_ids:
                         # 재시작 이전에 이미 실행한 호출이다. 다시 보내면 같은
                         # 부작용이 두 번 일어난다.
                         merged_results[call_index] = _blocked_tool_result(
@@ -3500,6 +3518,9 @@ async def on_message(message: discord.Message):
                     allowed_calls.append(tc)
                     allowed_indexes.append(call_index)
                     allowed_signatures.append(signature)
+                    # 승인된 id를 실행 전에 기록하는 기존 재시작 중복 방지 정책은
+                    # 유지한다.
+                    executed_call_ids.append(call_id)
                     if (
                         last_failed_signature is not None
                         and signature != last_failed_signature
@@ -3509,7 +3530,6 @@ async def on_message(message: discord.Message):
 
                 total_tools_executed += len(allowed_calls)
                 for tc in allowed_calls:
-                    executed_call_ids.append(tc["id"])
                     # 인자 원문 대신 어떤 인자가 왔는지만 남긴다. 도구 인자 JSON을
                     # 그대로 적는 것이 셸 명령과 파일 내용이 로그로 들어온 경로였다.
                     log_session_event(

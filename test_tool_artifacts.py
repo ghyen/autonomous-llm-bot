@@ -20,6 +20,11 @@ import bot
 
 
 CHANNEL_ID = 987654830
+ARTIFACT_PATH_PATTERN = r"artifacts/out_[A-Za-z0-9_.-]+\.log"
+
+
+def artifact_path(result):
+    return re.search(ARTIFACT_PATH_PATTERN, result).group(0)
 
 
 def long_bash_command(character="x"):
@@ -76,10 +81,11 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             self.run, long_bash_command(), "bash-call-1"
         )
 
+        path = artifact_path(result)
         self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-        self.assertIn("artifacts/out_bash-call-1.log", result)
-        artifact = self.run.root / "artifacts" / "out_bash-call-1.log"
-        self.assertEqual(artifact.read_text(encoding="utf-8").count("x"), 5001)
+        self.assertEqual(
+            (self.run.root / path).read_text(encoding="utf-8").count("x"), 5001
+        )
 
     # Mutation caught: appending the artifact path or the grep hint after the
     # exit marker unanchors _tool_result_failed and disables the failure brake.
@@ -136,6 +142,28 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
+    # Mutation caught: preserving case-sensitive IDs verbatim makes distinct
+    # calls alias the same artifact on a case-insensitive filesystem.
+    async def test_case_variant_call_ids_have_distinct_artifacts(self):
+        first = await bot.tool_bash_exec(
+            self.run, long_bash_command("x"), "CallA"
+        )
+        second = await bot.tool_bash_exec(
+            self.run, long_bash_command("y"), "calla"
+        )
+
+        first_path = artifact_path(first)
+        second_path = artifact_path(second)
+        self.assertNotEqual(first_path.casefold(), second_path.casefold())
+        self.assertEqual(
+            (self.run.root / first_path).read_text(encoding="utf-8").count("x"),
+            5001,
+        )
+        self.assertEqual(
+            (self.run.root / second_path).read_text(encoding="utf-8").count("y"),
+            5001,
+        )
+
     # Mutation caught: raw safe IDs and hashed unsafe IDs sharing one namespace
     # lets a second, distinct call silently replace the first call's full text.
     async def test_safe_call_id_cannot_overwrite_hashed_call_id_artifact(self):
@@ -149,9 +177,8 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             self.run, long_bash_command("y"), colliding_safe_id
         )
 
-        path_pattern = r"artifacts/out_[A-Za-z0-9_.-]+\.log"
-        first_path = re.search(path_pattern, first).group(0)
-        second_path = re.search(path_pattern, second).group(0)
+        first_path = artifact_path(first)
+        second_path = artifact_path(second)
         self.assertNotEqual(first_path, second_path)
         self.assertEqual(
             (self.run.root / first_path).read_text(encoding="utf-8").count("x"),
@@ -168,10 +195,9 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot.tool_sandbox, "run_worker", search_worker(20)):
             result = await bot.tool_web_search(self.run, "질의", "search-call-1")
 
+        path = artifact_path(result)
         self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-        self.assertIn("artifacts/out_search-call-1.log", result)
-        artifact = self.run.root / "artifacts" / "out_search-call-1.log"
-        stored = artifact.read_text(encoding="utf-8")
+        stored = (self.run.root / path).read_text(encoding="utf-8")
         self.assertIn("https://example.com/19", stored)
 
     # Mutation caught: writing an artifact per call with no run-level budget
@@ -182,10 +208,10 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             first = await bot.tool_bash_exec(self.run, command, "budget-1")
             second = await bot.tool_bash_exec(self.run, command, "budget-2")
 
-        self.assertIn("artifacts/out_budget-1.log", first)
-        self.assertNotIn("artifacts/out_budget-2.log", second)
+        first_path = artifact_path(first)
+        self.assertNotIn("artifacts/out_", second)
         self.assertEqual(
-            [path.name for path in self.artifact_files()], ["out_budget-1.log"]
+            [path.name for path in self.artifact_files()], [Path(first_path).name]
         )
         for result in (first, second):
             self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
@@ -214,7 +240,7 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
     # reach makes the grep hint a lie and the stored output unreadable.
     async def test_the_next_bash_call_can_read_the_artifact_it_was_pointed_at(self):
         stored = await bot.tool_bash_exec(self.run, long_bash_command(), "grep-me")
-        path = re.search(r"artifacts/out_grep-me\.log", stored).group(0)
+        path = artifact_path(stored)
 
         counted = await bot.tool_bash_exec(
             self.run, f"wc -c < {path}", "count-call"

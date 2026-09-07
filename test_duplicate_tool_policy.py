@@ -207,6 +207,84 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             json.dumps(blocked, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
 
+    # Mutation caught: reserving accepted IDs only after scanning the whole
+    # batch lets a second call with the same protocol ID reach dispatch.
+    async def test_same_batch_duplicate_id_is_rejected_before_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("duplicate-id", "bash_exec", {"command": "printf first"}),
+                _tool_call("duplicate-id", "bash_exec", {"command": "printf second"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf first"])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["duplicate-id"]],
+        )
+        next_payload = self.model.agent_payloads[1]
+        self.assertEqual(self._assistant_call_ids(next_payload), ["duplicate-id"])
+        self.assertEqual(
+            [message["tool_call_id"] for message in self._tool_messages(next_payload)],
+            ["duplicate-id"],
+        )
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+
+    # Mutation caught: validating IDs only in the next model payload lets calls
+    # with IDs that cannot participate in the tool protocol execute first.
+    async def test_invalid_ids_are_rejected_before_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call(None, "bash_exec", {"command": "printf none"}),
+                _tool_call("", "bash_exec", {"command": "printf empty"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        next_payload = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+        self.assertFalse(any(
+            bot._msg_tool_calls(message) for message in next_payload
+        ))
+
+    # Mutation caught: reserving an ID only after every other admission check
+    # lets a later duplicate execute when the first occurrence is malformed.
+    async def test_malformed_first_duplicate_id_blocks_later_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("duplicate-id", "bash_exec", "{bad"),
+                _tool_call(
+                    "duplicate-id", "bash_exec", {"command": "printf hidden"}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        next_payload = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+        self.assertEqual(self._assistant_call_ids(next_payload), ["duplicate-id"])
+        tool_messages = self._tool_messages(next_payload)
+        self.assertEqual(
+            [message["tool_call_id"] for message in tool_messages],
+            ["duplicate-id"],
+        )
+        self.assertEqual(
+            json.loads(tool_messages[0]["content"])["error"],
+            "invalid_tool_arguments",
+        )
+
     # Mutation caught: canonicalizing arguments without sorted keys treats the
     # same JSON object in a different key order as a second side effect.
     async def test_same_batch_key_order_variant_is_the_same_signature(self):
@@ -530,7 +608,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
             result = await bot.tool_bash_exec(run, command, "long-nonzero")
 
-        self.assertIn("artifacts/out_long-nonzero.log", result)
+        self.assertIn("artifacts/out_", result)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
     # Mutation caught: hiding a real noisy subprocess's nonzero status from the
