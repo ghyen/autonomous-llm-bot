@@ -472,6 +472,29 @@ class ToolIntegrationTest(WorkspaceTestCase):
         self.assertEqual(run_worker.await_args_list[2].args[1]["operation"], "write_file")
         self.assertEqual(run_worker.await_args_list[3].args[1]["operation"], "web_search")
 
+    async def test_write_file_cannot_replace_supervisor_owned_root_files(self):
+        # Production mutation caught: the model-facing ordinary-file path can
+        # atomically replace trajectory, durable state, or run metadata bytes.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        protected = {
+            "run.json": (workspace.root / "run.json").read_bytes(),
+            "state.json": b"state-sentinel",
+            "traj.jsonl": b"trajectory-sentinel\n",
+        }
+        for name, content in protected.items():
+            path = workspace.root / name
+            if name != "run.json":
+                path.write_bytes(content)
+            before = path.read_bytes()
+
+            result = json.loads(
+                await bot.tool_write_file(workspace, name, "model-overwrite", None)
+            )
+
+            self.assertEqual(result["status"], "error", (name, result))
+            self.assertEqual(result["error"], "reserved_path", (name, result))
+            self.assertEqual(path.read_bytes(), before)
+
     async def test_relative_paths_and_bash_use_the_run_root_without_broadening_scope(self):
         # Production mutation caught: retaining the global cwd/path join permits
         # run overlap, while accepting any absolute path lets one line of model
@@ -834,20 +857,36 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             self.assertEqual((retained.root / "notes.txt").read_text(), "retained")
             catalog.finish(selected, "completed")
 
+            # A valid explicit-resume target must carry a current durable record.
+            # reset/new deliberately deleted the older channel-A records.
+            resumable = catalog.acquire(TEST_USER_ID, CHANNEL_B)
+            bot.run_state.save(
+                resumable,
+                message_id=None,
+                next_step=1,
+                summary="",
+                tail=[],
+                ledger=bot.ResearchLedger(),
+                interrupt={},
+                executed_call_ids=[],
+                state="stopped",
+            )
+            catalog.finish(resumable, "stopped")
+
             cross_owner = FakeMessage(
-                f"!resume {retained.run_id}", CHANNEL_A,
+                f"!resume {resumable.run_id}", CHANNEL_A,
                 author=FakeAuthor(TEST_ADMIN_ID, "admin"),
             )
             await bot.on_message(cross_owner)
             self.assertIn("not found", cross_owner.replies[-1].lower())
 
             resume = FakeMessage(
-                f"!resume {retained.run_id}", CHANNEL_B,
+                f"!resume {resumable.run_id}", CHANNEL_B,
                 author=FakeAuthor(TEST_USER_ID),
             )
             await bot.on_message(resume)
             resumed = catalog.acquire(TEST_USER_ID, CHANNEL_B)
-            self.assertEqual(resumed.run_id, retained.run_id)
+            self.assertEqual(resumed.run_id, resumable.run_id)
             catalog.finish(resumed, "completed")
 
             failed_clear = FakeMessage(
@@ -878,11 +917,11 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             catalog.finish(cleared, "completed")
 
             delete = FakeMessage(
-                f"!delete {retained.run_id}", CHANNEL_B,
+                f"!delete {resumable.run_id}", CHANNEL_B,
                 author=FakeAuthor(TEST_USER_ID),
             )
             await bot.on_message(delete)
-            self.assertFalse(retained.root.exists())
+            self.assertFalse(resumable.root.exists())
 
     async def test_clear_reserves_admission_across_text_and_slash_purge(self):
         # Production mutation caught: a goal admitted while clear awaits purge

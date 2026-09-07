@@ -58,26 +58,6 @@ class TieredMemoryFormatTest(unittest.TestCase):
         self.assertFalse(hasattr(bot, "parse_hierarchical_summary"))
         self.assertFalse(hasattr(bot, "update_hierarchical_summary"))
 
-    def test_merge_procedural_note_preserves_tiers_without_claiming_authority(self):
-        initial = bot.format_tiered_summary(
-            tier3="- Step 1-10: API 인증 경로를 시도했으나 401로 중단됨.",
-            tier3_through=10,
-            tier2_lines=["[Step 11: bash_exec({}) -> ok]"],
-            discoveries=["- 파일: `findings.md`"],
-        )
-
-        merged = bot.merge_tier3_procedure(
-            initial,
-            "이전 대화 구간: 사용자가 캐시 우회도 확인하라고 지시함.",
-        )
-        parsed = bot.parse_tiered_summary(merged)
-
-        self.assertIn("API 인증 경로", parsed["tier3"])
-        self.assertIn("캐시 우회", parsed["tier3"])
-        self.assertEqual(parsed["tier3_through"], 10)
-        self.assertEqual(parsed["tier2"], ["[Step 11: bash_exec({}) -> ok]"])
-        self.assertNotIn("rejected@", parsed["tier3"])
-
     def test_summary_clipping_reserves_space_for_omission_marker(self):
         summary = bot._clip_summary_text(
             "x" * (bot.ROLLING_SUMMARY_MAX_CHARS + 1),
@@ -87,33 +67,62 @@ class TieredMemoryFormatTest(unittest.TestCase):
         self.assertLessEqual(len(summary), bot.ROLLING_SUMMARY_MAX_CHARS)
         self.assertTrue(summary.endswith(" ...[생략]"))
 
-    def test_tier1_split_keeps_ten_complete_tool_groups_verbatim(self):
+    def test_tier1_split_keeps_ten_complete_parallel_tool_groups_verbatim(self):
+        # Production mutation caught: counting tool result messages instead of
+        # assistant/tool groups makes parallel calls consume the retention budget.
         messages = [{"role": "system", "content": "system"}]
         for step in range(1, 13):
-            messages.extend([
+            call_count = 3 if step % 2 else 2
+            calls = [
                 {
-                    "role": "assistant",
-                    "content": f"Step {step} reasoning",
-                    "tool_calls": [{
-                        "id": f"call-{step}",
-                        "type": "function",
-                        "function": {"name": "bash_exec", "arguments": "{}"},
-                    }],
-                },
+                    "id": f"call-{step}-{index}",
+                    "type": "function",
+                    "function": {"name": "bash_exec", "arguments": "{}"},
+                }
+                for index in range(call_count)
+            ]
+            messages.append({
+                "role": "assistant",
+                "content": f"Step {step} reasoning",
+                "tool_calls": calls,
+            })
+            messages.extend(
                 {
                     "role": "tool",
-                    "tool_call_id": f"call-{step}",
+                    "tool_call_id": call["id"],
                     "name": "bash_exec",
-                    "content": f"verbatim-result-{step}",
-                },
-            ])
+                    "content": f"verbatim-result-{call['id']}",
+                }
+                for call in calls
+            )
 
         old, recent = bot.split_recent_agent_context(messages)
 
-        self.assertEqual(sum(bot._msg_role(item) == "tool" for item in recent), 10)
-        self.assertEqual(bot._msg_role(recent[0]), "assistant")
-        self.assertEqual(bot._msg_content(recent[-1]), "verbatim-result-12")
-        self.assertEqual(sum(bot._msg_role(item) == "tool" for item in old), 2)
+        recent_groups = [
+            item for item in recent
+            if bot._msg_role(item) == "assistant" and bot._msg_tool_calls(item)
+        ]
+        old_groups = [
+            item for item in old
+            if bot._msg_role(item) == "assistant" and bot._msg_tool_calls(item)
+        ]
+        announced = {
+            call["id"]
+            for item in recent_groups
+            for call in bot._msg_tool_calls(item)
+        }
+        settled = {
+            item["tool_call_id"]
+            for item in recent
+            if bot._msg_role(item) == "tool"
+        }
+
+        self.assertEqual(len(recent_groups), 10)
+        self.assertEqual(len(old_groups), 2)
+        self.assertEqual(bot._msg_content(recent[0]), "Step 3 reasoning")
+        self.assertEqual(bot._msg_content(recent[-1]), "verbatim-result-call-12-1")
+        self.assertEqual(len(settled), 25)
+        self.assertEqual(settled, announced)
 
 
 class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -193,6 +202,42 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
         recent_tools = [item for item in rolled if bot._msg_role(item) == "tool"]
         self.assertEqual(len(recent_tools), 10)
         self.assertEqual(bot._msg_content(recent_tools[-1]), "[stdout]\nStep 14 output\n[exit code: 0]")
+
+    async def test_rollover_keeps_a_new_increment_before_advancing_its_watermark(self):
+        # Production mutation caught: appending a new increment after a full
+        # Tier 3 and prefix-clipping it away while still claiming coverage.
+        marker = "NEW-INCREMENT-11-20"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(root=temp_dir)
+            ledger, payload = self._make_payload(workspace)
+            self._seed_trajectory(workspace, through=50)
+            existing = bot.format_tiered_summary(
+                tier3="old-procedure-" + ("x" * bot._TIER3_MAX_CHARS),
+                tier3_through=10,
+                tier2_lines=[],
+                discoveries=[],
+            )
+            completion = AsyncMock(return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=f"- {marker}: 인증 실패 뒤 대체 경로를 시도함."
+                ))]
+            ))
+            with patch.object(bot, "run_completion_stage", completion):
+                rolled, summary = await bot.rollover_agent_context(
+                    workspace,
+                    payload,
+                    existing_summary=existing,
+                    step_num=50,
+                    ledger=ledger,
+                )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(parsed["tier3_through"], 20)
+        self.assertIn(marker, parsed["tier3"])
+        self.assertLessEqual(len(parsed["tier3"]), bot._TIER3_MAX_CHARS)
+        self.assertTrue(
+            bot._msg_content(rolled[0]).rstrip().endswith(ledger.render().rstrip())
+        )
 
     async def test_successful_compactor_receives_no_ledger_facts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -566,7 +566,7 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
 
 
 ROLLING_COMPACTION_INTERVAL = 10
-KEEP_RECENT_TOOL_MESSAGES = 10
+KEEP_RECENT_TOOL_GROUPS = 10
 ROLLING_SUMMARY_MAX_CHARS = 10000
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
 
@@ -1356,20 +1356,6 @@ def parse_tiered_summary(text: str) -> dict:
     }
 
 
-def merge_tier3_procedure(existing_summary: str, note: str) -> str:
-    parsed = parse_tiered_summary(existing_summary)
-    tier3 = parsed["tier3"]
-    note = str(note or "").strip()
-    if note and note not in tier3:
-        tier3 = "\n".join(part for part in (tier3, note) if part)
-    return format_tiered_summary(
-        tier3=tier3,
-        tier3_through=parsed["tier3_through"],
-        tier2_lines=parsed["tier2"],
-        discoveries=parsed["discoveries"],
-    )
-
-
 def _deterministic_tier3_fallback(source: str, start_step: int, end_step: int) -> str:
     groups = {}
     for line in str(source or "").splitlines():
@@ -1495,20 +1481,19 @@ def build_report_source(messages: list, max_chars: int = 24000) -> str:
     return "\n\n".join(blocks)
 
 
-def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = None):
-    """Split at a complete assistant-tool group so tool_call_ids stay valid."""
-    if keep_recent_tool_messages is None:
-        keep_recent_tool_messages = KEEP_RECENT_TOOL_MESSAGES
-    tool_indices = [i for i, m in enumerate(messages) if _msg_role(m) == "tool"]
-    if len(tool_indices) <= keep_recent_tool_messages:
+def split_recent_agent_context(messages: list, keep_recent_tool_groups: int = None):
+    """Split before the oldest retained complete assistant/tool group."""
+    if keep_recent_tool_groups is None:
+        keep_recent_tool_groups = KEEP_RECENT_TOOL_GROUPS
+    group_indices = [
+        index
+        for index, message in enumerate(messages)
+        if _msg_role(message) == "assistant" and _msg_tool_calls(message)
+    ]
+    if len(group_indices) <= keep_recent_tool_groups:
         return messages, []
 
-    boundary = tool_indices[-keep_recent_tool_messages]
-    for i in range(boundary - 1, -1, -1):
-        if _msg_role(messages[i]) == "assistant" and _msg_tool_calls(messages[i]):
-            boundary = i
-            break
-
+    boundary = group_indices[-keep_recent_tool_groups]
     return messages[:boundary], messages[boundary:]
 
 
@@ -1610,8 +1595,12 @@ def recover_interrupted_runs() -> dict:
         record = run_state.load(workspace)
         if record is None:
             # 읽을 수 없거나 스키마가 다른 레코드는 마이그레이션하지 않고 버린다.
-            # 남겨 두면 시작마다 같은 abort를 다시 남긴다.
+            # 남겨 두면 시작마다 같은 abort를 다시 남긴다. 이전 프로세스가 이미
+            # explicit resume로 준비한 런이면 선택도 함께 무효화해야 다음 목표가
+            # 같은 run id를 새 Step 1로 덮어쓰지 않는다.
             if run_state.discard(workspace):
+                if workspace.status == "prepared":
+                    RUN_CATALOG.finish(workspace, "failed")
                 log_session_event(
                     workspace, "run_abort", status="aborted", reason="unusable_record"
                 )
@@ -1672,8 +1661,9 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
     previous_through = parsed["tier3_through"]
     source_start = previous_through + 1
     source = ""
+    covered_through = previous_through
     if source_start <= tier3_end:
-        source = trajectory.procedural_source(
+        source, covered_through = trajectory.procedural_source(
             workspace,
             tier3_end,
             max_chars=ROLLING_SUMMARY_MAX_CHARS,
@@ -1695,7 +1685,7 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
             "아래 실행 기록을 절차 이력으로만 압축하세요. 시도한 방법, 실패·차단 원인, "
             "그 뒤 선택한 대안만 시간순 불릿으로 작성하세요. 사용자 목표, 확인된 사실, "
             "결론, 가설 또는 가설 상태를 쓰지 마세요. 원문에 없는 내용을 추측하지 말고, "
-            f"Step {source_start}-{tier3_end} 범위를 한국어 2,000자 이내로 작성하세요.\n\n"
+            f"Step {source_start}-{covered_through} 범위를 한국어 2,000자 이내로 작성하세요.\n\n"
             f"[절차 실행 기록]\n{source}"
         )
         try:
@@ -1738,16 +1728,23 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
 
         if not new_procedure:
             new_procedure = _deterministic_tier3_fallback(
-                source, source_start, tier3_end
+                source, source_start, covered_through
             )
             validation_notes.append("결정적 Tier 3 절차 폴백을 사용했습니다.")
 
     tier3 = parsed["tier3"]
     if new_procedure and new_procedure not in tier3:
-        tier3 = "\n".join(part for part in (tier3, new_procedure) if part)
+        new_procedure = _clip_summary_text(new_procedure, _TIER3_MAX_CHARS)
+        remaining = _TIER3_MAX_CHARS - len(new_procedure)
+        if tier3 and remaining > 1:
+            tier3 = "\n".join(
+                (_clip_summary_text(tier3, remaining - 1), new_procedure)
+            )
+        else:
+            tier3 = new_procedure
     new_summary = format_tiered_summary(
         tier3=tier3,
-        tier3_through=max(previous_through, tier3_end),
+        tier3_through=max(previous_through, covered_through),
         tier2_lines=tier2_lines,
         discoveries=discoveries,
     )
@@ -1772,7 +1769,7 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         msgs_after=len(replaced_messages),
         chars_before=before_chars,
         chars_after=after_chars,
-        kept_tool_msgs=KEEP_RECENT_TOOL_MESSAGES,
+        kept_tool_groups=KEEP_RECENT_TOOL_GROUPS,
         summary_chars=len(new_summary),
         validation="; ".join(validation_notes) if validation_notes else "pass",
     )
@@ -2223,6 +2220,9 @@ def prepare_new_run(owner_id, channel_id):
 
 
 def resume_run(owner_id, channel_id, run_id):
+    workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if run_state.load(workspace) is None:
+        raise RunNotFoundError("run not found")
     return RUN_CATALOG.resume(owner_id, channel_id, run_id)
 
 
@@ -2772,20 +2772,10 @@ async def on_message(message: discord.Message):
     history.append({"role": "user", "content": content})
 
     if len(history) > MAX_RECENT_TURNS * 2:
-        overflow_turns = history[:-MAX_RECENT_TURNS * 2]
-        recent_turns = history[-MAX_RECENT_TURNS * 2:]
-        summary_snippets = []
-        for msg_item in overflow_turns:
-            role_label = "사용자" if msg_item["role"] == "user" else "AI"
-            snippet = msg_item["content"][:150].replace("\n", " ")
-            summary_snippets.append(f"{role_label}: {snippet}")
-        # 대화 초과분도 절차 메모로 병합하며 Tier 2와 범위 메타데이터는 유지한다.
-        channel_summary[message.channel.id] = merge_tier3_procedure(
-            channel_summary[message.channel.id],
-            "이전 대화 요약: " + " | ".join(summary_snippets[-8:]),
-        )
-        channel_history[message.channel.id] = recent_turns
-        history = recent_turns
+        # Raw conversation is not procedural evidence. Drop the old turns
+        # instead of relabelling goals, claims, or hypotheses as Tier 3.
+        history = history[-MAX_RECENT_TURNS * 2:]
+        channel_history[message.channel.id] = history
 
     direct_call_failed = False
     if wants_short_answer:

@@ -88,6 +88,74 @@ class TrajectoryTest(unittest.TestCase):
             self.assertEqual(record["schema"], trajectory.SCHEMA)
             self.assertRegex(record["id"], r"^[0-9a-f]{64}$")
 
+    def test_read_records_stops_at_the_first_hash_or_parent_break(self):
+        # Production mutations caught: trusting an unchanged id after body
+        # tampering, or accepting a freshly hashed record whose parent skips the
+        # accepted prefix. Either mutation lets forged history feed every tier.
+        for step in range(1, 4):
+            trajectory.append_tool_group(
+                self.workspace,
+                step,
+                [_call(f"c{step}", "bash_exec", {"command": f"probe-{step}"})],
+                [f"result-{step}"],
+                {f"c{step}"},
+            )
+        original = self.records()
+
+        for mutation in ("body", "parent"):
+            with self.subTest(mutation=mutation):
+                records = json.loads(json.dumps(original))
+                if mutation == "body":
+                    records[1]["result"] = "forged-result"
+                else:
+                    records[1]["parent"] = "0" * 64
+                    body = {key: value for key, value in records[1].items() if key != "id"}
+                    encoded = json.dumps(
+                        body,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    records[1]["id"] = __import__("hashlib").sha256(encoded).hexdigest()
+                self.path.write_text(
+                    "".join(
+                        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                        for record in records
+                    ),
+                    encoding="utf-8",
+                )
+
+                trusted = trajectory.read_records(self.workspace)
+
+                self.assertEqual([record["call_id"] for record in trusted], ["c1"])
+                self.assertEqual(trajectory.lookup(self.workspace, 3)["status"], "not_found")
+
+    def test_append_refuses_an_integrity_broken_history(self):
+        # Production mutation caught: deriving the next parent from an invalid
+        # suffix and appending records that no validating reader can ever reach.
+        trajectory.append_tool_group(
+            self.workspace,
+            1,
+            [_call("original", "bash_exec", {"command": "true"})],
+            ["[exit code: 0]"],
+            {"original"},
+        )
+        [record] = self.records()
+        record["result"] = "forged"
+        self.path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        before = self.path.read_bytes()
+
+        with self.assertRaises(ValueError):
+            trajectory.append_tool_group(
+                self.workspace,
+                2,
+                [_call("later", "bash_exec", {"command": "false"})],
+                ["[exit code: 1]"],
+                {"later"},
+            )
+
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_lookup_by_step_and_call_id_is_neutral_when_missing(self):
         # Mutation caught: a lookup that returns an error for a missing step
         # feeds the consecutive-failure brake and can stall the research loop.
@@ -189,28 +257,31 @@ class TrajectoryTest(unittest.TestCase):
         self.assertTrue(all("\n" not in line for line in lines))
         self.assertTrue(all(len(line) <= trajectory.MICRO_LINE_MAX_CHARS for line in lines))
 
-    def test_procedural_source_prioritizes_newer_old_steps_within_budget(self):
-        # Mutation caught: filling oldest-first drops the newest blocker, which
-        # is the exact refutation the next phase needs to avoid reviving a path.
-        for step in range(1, 7):
+    def test_procedural_source_reports_only_a_contiguous_prefix_within_budget(self):
+        # Production mutation caught: selecting newest unseen records and then
+        # advancing through the requested endpoint permanently skips the older
+        # records omitted by the source budget.
+        for step in range(4, 7):
             trajectory.append_tool_group(
                 self.workspace,
                 step,
                 [_call(f"p{step}", "bash_exec", {"command": f"probe-{step}"})],
-                [f"result-{step}-" + (str(step) * 120)],
+                [f"result-{step}"],
                 {f"p{step}"},
             )
 
-        source = trajectory.procedural_source(
-            self.workspace, 6, max_chars=420, start_step=4
+        result = trajectory.procedural_source(
+            self.workspace, 6, max_chars=90, start_step=4
         )
 
-        self.assertLessEqual(len(source), 420)
-        self.assertIn("Step 6", source)
-        self.assertIn("probe-6", source)
-        self.assertNotIn("probe-1", source)
-        self.assertNotIn("probe-3", source)
-        self.assertLess(source.index("Step 5"), source.index("Step 6"))
+        self.assertIsInstance(result, tuple)
+        source, through = result
+        self.assertLessEqual(len(source), 90)
+        self.assertEqual(through, 4)
+        self.assertIn("Step 4", source)
+        self.assertIn("probe-4", source)
+        self.assertNotIn("Step 5", source)
+        self.assertNotIn("Step 6", source)
 
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is unavailable")
     def test_trajectory_path_cannot_be_a_symlink_outside_the_run(self):

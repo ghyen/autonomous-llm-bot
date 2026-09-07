@@ -31,6 +31,7 @@ from ledger import ResearchLedger
 from run_workspace import atomic_write
 
 SCHEMA = 1
+SUMMARY_VERSION = 1
 FILE_NAME = "state.json"
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
@@ -41,6 +42,7 @@ _REQUIRED = (
     "state",
     "next_step",
     "summary",
+    "summary_version",
     "tail",
     "ledger",
     "interrupt",
@@ -76,6 +78,7 @@ def save(
     """
     record = {
         "schema": SCHEMA,
+        "summary_version": SUMMARY_VERSION,
         "run_id": str(workspace.run_id),
         "owner_id": int(workspace.owner_id),
         "channel_id": int(workspace.channel_id),
@@ -102,6 +105,12 @@ def load(workspace):
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         return None
     if any(key not in payload for key in _REQUIRED):
+        return None
+    if (
+        not isinstance(payload["summary_version"], int)
+        or isinstance(payload["summary_version"], bool)
+        or payload["summary_version"] != SUMMARY_VERSION
+    ):
         return None
     if payload["run_id"] != str(workspace.run_id):
         # 다른 런의 레코드다(디렉터리를 복사한 경우). 남의 상태로 이 런을

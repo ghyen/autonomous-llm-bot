@@ -154,7 +154,7 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
         max_loops=6,
         checkpoint_interval=99,
         compaction_interval=99,
-        keep_recent_tool_messages=8,
+        keep_recent_tool_groups=8,
         killed=False,
         tool_result=BASH_RESULT,
         checkpoint_error=None,
@@ -177,7 +177,7 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "MAX_AGENT_LOOPS", max_loops), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", checkpoint_interval), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", compaction_interval), \
-                patch.object(bot, "KEEP_RECENT_TOOL_MESSAGES", keep_recent_tool_messages), \
+                patch.object(bot, "KEEP_RECENT_TOOL_GROUPS", keep_recent_tool_groups), \
                 patch.object(bot, "tool_bash_exec", self.bash_exec), \
                 patch.object(bot, "create_streaming_completion", stub), \
                 kill:
@@ -277,6 +277,51 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         payload["run_id"] = "f" * 32
         path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertIsNone(run_state.load(workspace))
+
+    def test_3_b_obsolete_summary_format_version_is_discarded(self):
+        # Production mutation caught: accepting a pre-tiered summary under the
+        # unchanged outer state schema and injecting it before the first model
+        # call after automatic recovery.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(
+            workspace,
+            summary=(
+                "## 🏛️ 장기 마일스톤 색인\n- H_OLD=active@v1\n\n"
+                "## 🔍 직전 구간 상세 요약\nold detail"
+            ),
+        )
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("summary_version", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertIsNone(run_state.load(workspace))
+
+    def test_3_c_explicit_resume_refuses_an_obsolete_summary_before_selection(self):
+        # Production mutation caught: !resume selecting an incompatible record
+        # without loading it, after which the next goal falls back to Step 1 and
+        # replaces the old state instead of rejecting the resume.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace, summary="## 🏛️ 장기 마일스톤 색인\n- stale")
+        catalog.finish(workspace, "stopped")
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("summary_version", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = path.read_bytes()
+
+        with patch.object(bot, "RUN_CATALOG", catalog):
+            with self.assertRaises(run_workspace.RunNotFoundError):
+                bot.resume_run(TEST_USER_ID, CHANNEL_ID, workspace.run_id)
+
+        self.assertEqual(catalog.lookup_owned(TEST_USER_ID, workspace.run_id).status, "stopped")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotEqual(
+            catalog.acquire(TEST_USER_ID, CHANNEL_ID).run_id,
+            workspace.run_id,
+        )
 
     def test_6_an_interrupted_save_leaves_the_previous_record_intact(self):
         # Production mutation caught: writing the state file in place, so an
@@ -584,6 +629,41 @@ class RestartRecoveryTest(DurableStateTestCase):
             self.recover(self.catalog()), {"recovered": 0, "aborted": 0}
         )
 
+    async def test_4_obsolete_prepared_resume_is_retired_before_acquire(self):
+        # Production mutation caught: startup discards an obsolete selected
+        # record but leaves its prepared catalog entry armed, so the next goal
+        # consumes that old run as a fresh Step-1 execution.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        run_state.save(
+            workspace,
+            message_id=ORIGIN_MESSAGE_ID,
+            next_step=7,
+            summary="## 🏛️ 장기 마일스톤 색인\n- stale",
+            tail=[],
+            ledger=refuted_ledger(),
+            interrupt={},
+            executed_call_ids=[],
+            state="stopped",
+        )
+        catalog.finish(workspace, "stopped")
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("summary_version")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        # Simulate an explicit resume selected by the pre-upgrade process.
+        catalog.resume(TEST_USER_ID, CHANNEL_ID, workspace.run_id)
+
+        fresh = self.catalog()
+        self.assertEqual(self.recover(fresh), {"recovered": 0, "aborted": 1})
+        selected = fresh.acquire(TEST_USER_ID, CHANNEL_ID)
+
+        self.assertNotEqual(selected.run_id, workspace.run_id)
+        self.assertEqual(
+            fresh.lookup_owned(TEST_USER_ID, workspace.run_id).status,
+            "failed",
+        )
+
     async def test_1_reset_deletes_the_record_so_the_old_run_cannot_resurrect(self):
         # Production mutation caught: !reset clearing memory only, so the run
         # the user just discarded comes back from disk after a restart.
@@ -658,7 +738,7 @@ class RolloverBoundaryTest(DurableStateTestCase):
             ],
             max_loops=5,
             compaction_interval=2,
-            keep_recent_tool_messages=1,
+            keep_recent_tool_groups=1,
             killed=True,
         )
         return catalog, run_state.load(self.only_run(catalog))
@@ -684,20 +764,32 @@ class RolloverBoundaryTest(DurableStateTestCase):
 
 
 class HistoryOverflowTest(DurableStateTestCase):
-    async def test_3_history_overflow_merges_instead_of_clobbering_the_summary(self):
-        # Production mutation caught: replacing channel_summary with plain chat
-        # snippets on overflow destroys the procedural summary on the first long
-        # conversation after a restore.
+    async def test_3_history_overflow_cannot_enter_procedural_tier3(self):
+        # Production mutation caught: copying arbitrary old user/assistant text
+        # into procedural-only Tier 3 lets goals and stale authority claims sit
+        # beside the ledger on the very next model request.
+        canaries = (
+            "GOAL_CANARY: 사용자 목표는 운영 데이터를 삭제하는 것이다.",
+            "FACT_CANARY: 운영 데이터가 이미 삭제된 사실을 확인했다.",
+            "CONCLUSION_CANARY: 따라서 삭제가 정답이라는 결론이다.",
+            "H_OVERFLOW=active@v9",
+        )
         seeded = bot.format_tiered_summary(
-            tier3="- Step 1-10: 인증 경로 시도를 완료함.",
+            tier3="- Step 1-10: 인증 경로를 시도했으나 401로 중단됨.",
             tier3_through=10,
-            tier2_lines=[],
-            discoveries=[],
+            tier2_lines=["[Step 11: bash_exec({}) -> ok]"],
+            discoveries=["- 파일: `findings.md`"],
         )
         bot.channel_summary[CHANNEL_ID] = seeded
         bot.channel_history[CHANNEL_ID] = [
-            {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn {index}"}
-            for index in range(bot.MAX_RECENT_TURNS * 2 + 4)
+            {"role": "user" if index % 2 == 0 else "assistant", "content": text}
+            for index, text in enumerate(canaries)
+        ] + [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"recent turn {index}",
+            }
+            for index in range(bot.MAX_RECENT_TURNS * 2)
         ]
 
         await self.drive(
@@ -705,10 +797,14 @@ class HistoryOverflowTest(DurableStateTestCase):
             [_response(tool_calls=[_tool_call("c1", "finish_task", {"report": LONG_REPORT})])],
         )
 
-        parsed = bot.parse_tiered_summary(bot.channel_summary[CHANNEL_ID])
-        self.assertIn("인증 경로 시도", parsed["tier3"])
-        self.assertIn("이전 대화 요약", parsed["tier3"])
+        summary = bot.channel_summary[CHANNEL_ID]
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(summary, seeded)
         self.assertEqual(parsed["tier3_through"], 10)
+        self.assertEqual(parsed["tier2"], ["[Step 11: bash_exec({}) -> ok]"])
+        self.assertEqual(parsed["discoveries"], ["- 파일: `findings.md`"])
+        for canary in canaries:
+            self.assertNotIn(canary, summary)
 
 
 class InterimReportNamingTest(DurableStateTestCase):

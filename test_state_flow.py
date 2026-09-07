@@ -265,7 +265,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 2), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 2), \
-                patch.object(bot, "KEEP_RECENT_TOOL_MESSAGES", 2), \
+                patch.object(bot, "KEEP_RECENT_TOOL_GROUPS", 1), \
                 patch.object(bot, "tool_bash_exec", AsyncMock(return_value=BASH_RESULT)), \
                 patch.object(bot, "create_streaming_completion", stub):
             await bot.on_message(FakeMessage("장애 원인을 조사해줘", self.CHANNEL_ID))

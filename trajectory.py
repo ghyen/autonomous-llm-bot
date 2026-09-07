@@ -79,8 +79,10 @@ def _bounded_value(value, depth=0):
     return _clip_middle(str(value), ARGUMENT_STRING_MAX_CHARS)
 
 
-def _decode_records(data):
+def _decode_records(data, require_complete=False):
     records = []
+    expected_parent = None
+    invalid = False
     text = data.decode("utf-8", errors="replace")
     for line in text.splitlines():
         if not line.strip():
@@ -88,17 +90,27 @@ def _decode_records(data):
         try:
             record = json.loads(line)
         except (TypeError, ValueError):
-            continue
+            invalid = True
+            break
         if not isinstance(record, dict) or record.get("schema") != SCHEMA:
-            continue
-        record_id = record.get("id")
+            invalid = True
+            break
+        body = dict(record)
+        record_id = body.pop("id", None)
         if (
             not isinstance(record_id, str)
             or len(record_id) != 64
             or any(char not in "0123456789abcdef" for char in record_id)
+            or record.get("parent") != expected_parent
+            or hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
+            != record_id
         ):
-            continue
+            invalid = True
+            break
         records.append(record)
+        expected_parent = record_id
+    if invalid and require_complete:
+        raise ValueError("trajectory integrity check failed")
     return records
 
 
@@ -151,7 +163,7 @@ def append_tool_group(workspace, step, tool_calls, results, executed_ids):
         os.fchmod(descriptor, 0o600)
         existing = _read_descriptor(descriptor)
         parent = None
-        prior = _decode_records(existing)
+        prior = _decode_records(existing, require_complete=True)
         if prior:
             parent = prior[-1]["id"]
 
@@ -298,8 +310,8 @@ def procedural_source(workspace, end_step, max_chars, start_step=1):
     max_chars = max(0, int(max_chars))
     start_step = max(1, int(start_step))
     if max_chars == 0 or end_step < start_step:
-        return ""
-    lines = []
+        return "", start_step - 1
+    grouped = OrderedDict()
     for record in read_records(workspace):
         step = record.get("step")
         if (
@@ -315,7 +327,7 @@ def procedural_source(workspace, end_step, max_chars, start_step=1):
             outcome = "failed:" + _result_preview(record, _SOURCE_RESULT_CHARS)
         else:
             outcome = "completed"
-        lines.append(
+        grouped.setdefault(step, []).append(
             f"[Step {step}] {record.get('tool') or 'unknown'} "
             f"args={_arguments_preview(record, _SOURCE_ARGUMENT_CHARS)} -> "
             f"{outcome}"
@@ -323,13 +335,17 @@ def procedural_source(workspace, end_step, max_chars, start_step=1):
 
     selected = []
     used = 0
-    for line in reversed(lines):
-        cost = len(line) + (1 if selected else 0)
+    through = end_step
+    for step, lines in grouped.items():
+        block = "\n".join(lines)
+        cost = len(block) + (1 if selected else 0)
         if cost > max_chars - used:
             if not selected:
-                selected.append(_clip_middle(line, max_chars))
+                selected.append(_clip_middle(block, max_chars))
+                through = step
+            else:
+                through = step - 1
             break
-        selected.append(line)
+        selected.append(block)
         used += cost
-    selected.reverse()
-    return "\n".join(selected)
+    return "\n".join(selected), max(start_step - 1, through)
