@@ -1197,6 +1197,14 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         self.assertEqual(fresh.read("findings.md")["status"], "error")
         self.assertEqual(fresh.read("playbook.md")["status"], "error")
 
+        # Production mutation caught: per-file fallback can skip this blank run
+        # after it is consumed and resurrect pre-reset files on the next acquire.
+        catalog.finish(fresh, "completed")
+        after_reset = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        self.assertEqual(after_reset.read("plan.md")["status"], "error")
+        self.assertEqual(after_reset.read("findings.md")["status"], "error")
+        self.assertEqual(after_reset.read("playbook.md")["status"], "error")
+
 
 if __name__ == "__main__":
 

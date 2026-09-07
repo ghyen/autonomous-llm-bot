@@ -313,26 +313,25 @@ class RunCatalog:
         ]
         if not candidates:
             return
-        candidates.sort(
+        prior = max(
+            candidates,
             key=lambda item: (
                 str(item.updated_at),
                 str(item.created_at),
                 item.run_id,
             ),
-            reverse=True,
         )
+        # Missing canonical files in the newest run are a durable deletion
+        # boundary (including reset); never resurrect them from older runs.
         for name in sorted(CANONICAL_NAMES):
             dest = workspace.root / name
-            if dest.exists():
+            src = prior.root / name
+            if dest.exists() or not src.is_file():
                 continue
-            for prior in candidates:
-                src = prior.root / name
-                if src.is_file():
-                    try:
-                        atomic_write(dest, src.read_bytes())
-                        break
-                    except OSError:
-                        continue
+            try:
+                atomic_write(dest, src.read_bytes())
+            except OSError:
+                continue
 
     def _select_prepared(self, workspace):
         for key, selected_id in tuple(self._selected.items()):

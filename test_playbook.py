@@ -27,21 +27,26 @@ def _section_marker():
 
 
 class PlaybookPromptTest(unittest.TestCase):
-    def test_build_system_content_injects_playbook_as_negative_constraints(self):
-        # Production mutation caught: dropping the injection leaves each new run
-        # blind to environment rules it already paid to learn.
+    def test_build_system_content_injects_playbook_with_distinct_rule_roles(self):
+        # Production mutation caught: a negative-only outer heading tells the
+        # model to avoid a strategy that the inner section says to reuse.
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = SimpleNamespace(root=temp_dir)
             _write_playbook(
                 temp_dir,
-                "## 환경 및 도구 제약 (Environment Rules)\n"
-                "- Mac 기본 grep은 BSD grep이므로 -P를 지원하지 않는다\n",
+                f"{bot.PLAYBOOK_SECTIONS['environment']}\n"
+                "- Mac 기본 grep은 BSD grep이므로 -P를 지원하지 않는다\n\n"
+                f"{bot.PLAYBOOK_SECTIONS['strategy']}\n"
+                "- 구조화된 응답을 먼저 검증한다\n",
             )
 
             content = bot.build_system_content(workspace)
 
             self.assertIn(_section_marker(), content)
-            self.assertIn("Mac 기본 grep은 BSD grep이므로 -P를 지원하지 않는다", content)
+            self.assertNotIn("[반드시 피해야 할 행동 및 환경 제약]", content)
+            self.assertIn(bot.PLAYBOOK_SECTIONS["environment"], content)
+            self.assertIn(bot.PLAYBOOK_SECTIONS["strategy"], content)
+            self.assertIn("구조화된 응답을 먼저 검증한다", content)
 
     def test_playbook_block_precedes_summary_and_state_block(self):
         # Production mutation caught: appending the playbook after the summary or
@@ -147,6 +152,38 @@ class RecordPlaybookTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(second["status"], "success")
         self.assertEqual(self.playbook_text(workspace).count("동일 규칙"), 1)
+
+    async def test_normalized_preamble_rule_is_not_duplicated_in_a_section(self):
+        # Production mutation caught: checking only the target section misses an
+        # equivalent unsectioned rule with another bullet and extra whitespace.
+        workspace = self.workspace()
+        await workspace.write("playbook.md", "*   동일    규칙\n", "absent")
+
+        result = json.loads(
+            await bot.tool_record_playbook(workspace, "environment", "동일 규칙")
+        )
+
+        self.assertEqual(result["status"], "success")
+        text = self.playbook_text(workspace)
+        self.assertEqual(text.count("동일"), 1)
+        self.assertNotIn(bot.PLAYBOOK_SECTIONS["environment"], text)
+
+    async def test_normalized_rule_is_deduplicated_across_sections(self):
+        # Production mutation caught: section-local dedup appends the same rule
+        # under strategy after it was already recorded as an environment rule.
+        workspace = self.workspace()
+        await bot.tool_record_playbook(workspace, "environment", "교차 섹션 규칙")
+
+        result = json.loads(
+            await bot.tool_record_playbook(
+                workspace, "strategy", "  교차   섹션 규칙  "
+            )
+        )
+
+        self.assertEqual(result["status"], "success")
+        text = self.playbook_text(workspace)
+        self.assertEqual(text.count("교차 섹션 규칙"), 1)
+        self.assertNotIn(bot.PLAYBOOK_SECTIONS["strategy"], text)
 
     async def test_unknown_rule_type_is_refused_and_counts_as_a_failed_tool(self):
         # Production mutation caught: silently accepting any rule_type scatters

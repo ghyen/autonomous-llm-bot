@@ -104,7 +104,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `write_file(path, content, expected_revision)`: 파일 생성 및 덮어쓰기
   - `web_search(query)`: DuckDuckGo 웹 검색
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
-  - `record_playbook(rule_type, rule_content)`: 실패 교훈과 환경 제약을 다음 런에도 남기는 전용 도구
+  - `record_playbook(rule_type, rule_content)`: 환경 제약·무효 경로·검증된 성공 패턴을 다음 런에도 남기는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
 - 루트 `plan.md`, `findings.md`, `playbook.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`와 `findings.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
 - 두 파일의 변경된 읽기는 전체 내용과 revision을 반환하고, 변경 없는 재읽기는 내용 대신 hash reference만 반환합니다. conflict이면 최신 내용을 다시 읽고 병합하세요.
@@ -129,7 +129,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 4. 반복되거나 복잡한 데이터 파싱, 스크래핑, 쉘 작업은 `write_file`로 `skills/<name>.py` 또는 `skills/<name>.sh`에 스크립트화하여 저장하고 `bash_exec`로 실행하여 재사용하세요.
 5. 기존 `plan.md`와 `findings.md`가 존재하면 먼저 읽어 이전 작업 맥락을 파악하고, 발견된 사실은 `findings.md`에 지속적으로 누적 기록하며 `plan.md`의 진행 상태를 업데이트하세요. 기존 내용을 빈 템플릿으로 초기화하지 마세요.
 6. 가설을 세우거나 반증하거나 결론을 내린 스텝에서는 같은 스텝에 `record_state`를 호출해 상태를 갱신하세요.
-7. 명령 문법 오류, 지원되지 않는 CLI 옵션, 인증 게이트웨이로 막힌 경로, 사람을 속이는 데이터 필드를 만나면 그 스텝에 `record_playbook`으로 한 줄 규칙을 남기세요. `[반드시 피해야 할 행동 및 환경 제약]` 블록에 이미 있는 제약은 다시 시도하지 마세요.
+7. 명령 문법 오류, 지원되지 않는 CLI 옵션, 인증 게이트웨이로 막힌 경로, 사람을 속이는 데이터 필드를 만나거나 재사용할 성공 패턴을 검증하면 그 스텝에 `record_playbook`으로 한 줄 규칙을 남기세요. `[상속된 실행 플레이북]`의 환경 제약과 무효 경로는 반복하지 말고, 검증된 성공 패턴은 재사용하세요.
 8. 모든 목표가 완전히 해결되었을 때만 `finish_task(report=...)`를 호출하여 최종 보고서를 제출하세요. `finish_task`와 다른 도구를 같은 응답에 함께 호출하면 나머지 호출은 폐기되므로, 남길 플레이북 규칙은 `finish_task` 이전 스텝에서 기록하세요.
 """
 
@@ -319,7 +319,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "record_playbook",
-            "description": "다음 런에도 상속되는 playbook.md에 실패 교훈이나 환경 제약을 한 줄 규칙으로 누적 기록합니다. 같은 실수를 반복하지 않기 위한 전용 도구입니다.",
+            "description": "다음 런에도 상속되는 playbook.md에 환경 제약, 무효 경로, 검증된 성공 패턴을 역할별 한 줄 규칙으로 누적 기록합니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -727,10 +727,10 @@ async def tool_write_file(
         })
 
 
-# --- Playbook: failure lessons and environment constraints inherited per channel ---
+# --- Playbook: inherited constraints, dead ends, and effective strategies ---
 
 PLAYBOOK_FILE_NAME = "playbook.md"
-PLAYBOOK_LABEL = "반드시 피해야 할 행동 및 환경 제약"
+PLAYBOOK_LABEL = "상속된 실행 플레이북"
 # The block is re-pinned into message 0 on every step, so an unbounded playbook
 # would tax every request. Growth is refused at record time rather than clipped
 # silently, and the renderer clips defensively in case write_file bypassed that.
@@ -771,12 +771,21 @@ def render_playbook_block(workspace) -> str:
     return f"[{PLAYBOOK_LABEL}]\n{text}"
 
 
+def _playbook_rule_key(value) -> str:
+    stripped = str(value or "").strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    return " ".join(re.sub(r"^[-*+]\s+", "", stripped, count=1).split())
+
+
 def _merge_playbook_rule(text: str, section: str, rule: str) -> str:
-    """Append one bullet under its section, keeping a stable section order."""
-    bullet = f"- {rule}"
+    """Append one globally unique rule, keeping a stable section order."""
+    rule_key = _playbook_rule_key(rule)
+    bullet = f"- {rule_key}"
     order = list(PLAYBOOK_SECTIONS.values())
     buckets = {header: [] for header in order}
     preamble = []
+    existing_rules = set()
     current = None
     for line in text.splitlines():
         stripped = line.strip()
@@ -785,11 +794,14 @@ def _merge_playbook_rule(text: str, section: str, rule: str) -> str:
             continue
         if not stripped:
             continue
+        existing_key = _playbook_rule_key(line)
+        if existing_key:
+            existing_rules.add(existing_key)
         if current is None:
             preamble.append(line.rstrip())
         else:
             buckets[current].append(line.rstrip())
-    if bullet not in buckets[section]:
+    if rule_key and rule_key not in existing_rules:
         buckets[section].append(bullet)
     parts = ["\n".join(preamble)] if preamble else []
     for header in order:
@@ -807,7 +819,7 @@ async def tool_record_playbook(workspace, rule_type, rule_content) -> str:
             "error": "unknown_rule_type",
             "allowed": sorted(PLAYBOOK_SECTIONS),
         })
-    rule = " ".join(str(rule_content or "").split())
+    rule = _playbook_rule_key(rule_content)
     if not rule:
         return _workspace_result({
             "status": "error",
