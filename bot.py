@@ -3384,7 +3384,7 @@ async def on_message(message: discord.Message):
                 batch_fingerprints = set()
                 allowed_calls = []
                 allowed_indexes = []
-                allowed_signatures = []
+                allowed_failure_signatures = []
                 allowed_fingerprints = []
                 merged_results = [None] * len(tool_calls_to_run)
                 for call_index, tc in enumerate(tool_calls_to_run):
@@ -3412,6 +3412,11 @@ async def on_message(message: discord.Message):
                         if tc["name"] in TOOL_LOOP_GUARD_TOOLS
                         else None
                     )
+                    failure_signature = (
+                        (tc["name"], guarded_fingerprint)
+                        if guarded_fingerprint is not None
+                        else signature
+                    )
                     if signature in batch_signatures:
                         merged_results[call_index] = _blocked_tool_result(
                             "same_batch_duplicate", tc["name"], 1, 1
@@ -3428,7 +3433,7 @@ async def on_message(message: discord.Message):
                         )
                         continue
                     if (
-                        signature == last_failed_signature
+                        failure_signature == last_failed_signature
                         and consecutive_failed_tool_calls
                         >= MAX_CONSECUTIVE_FAILED_TOOL_CALLS
                     ):
@@ -3489,11 +3494,11 @@ async def on_message(message: discord.Message):
                         batch_fingerprints.add(guarded_fingerprint)
                     allowed_calls.append(tc)
                     allowed_indexes.append(call_index)
-                    allowed_signatures.append(signature)
+                    allowed_failure_signatures.append(failure_signature)
                     allowed_fingerprints.append(guarded_fingerprint)
                     if (
                         last_failed_signature is not None
-                        and signature != last_failed_signature
+                        and failure_signature != last_failed_signature
                     ):
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
@@ -3555,30 +3560,29 @@ async def on_message(message: discord.Message):
                     "content": content_text or None,
                     "tool_calls": synthetic_tool_calls,
                 })
-                for call_index, tc, signature, guarded_fingerprint, tool_result in zip(
+                for call_index, tc, failure_signature, guarded_fingerprint, tool_result in zip(
                     allowed_indexes,
                     allowed_calls,
-                    allowed_signatures,
+                    allowed_failure_signatures,
                     allowed_fingerprints,
                     parallel_results,
                 ):
                     merged_results[call_index] = tool_result
                     if _tool_result_failed(tc["name"], tool_result):
-                        if signature == last_failed_signature:
+                        if failure_signature == last_failed_signature:
                             consecutive_failed_tool_calls += 1
                         else:
-                            last_failed_signature = signature
+                            last_failed_signature = failure_signature
                             consecutive_failed_tool_calls = 1
                     else:
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
-                        if (
-                            guarded_fingerprint is not None
-                            and all(
-                                fingerprint != guarded_fingerprint
-                                for fingerprint, _ in recent_tool_fingerprints
-                            )
-                        ):
+                        if guarded_fingerprint is not None:
+                            recent_tool_fingerprints[:] = [
+                                [fingerprint, seen_step]
+                                for fingerprint, seen_step in recent_tool_fingerprints
+                                if fingerprint != guarded_fingerprint
+                            ]
                             recent_tool_fingerprints.append(
                                 [guarded_fingerprint, current_tool_step]
                             )

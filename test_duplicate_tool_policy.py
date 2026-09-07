@@ -278,6 +278,41 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(blocked["blocked"])
         self.assertEqual(blocked["directive"], BLOCK_DIRECTIVE)
 
+    # Mutation caught: treating force as action data lets the model alternate
+    # policy metadata to reset an otherwise consecutive failure streak.
+    async def test_force_metadata_does_not_reset_the_failure_streak(self):
+        attempts = [
+            {"command": "always-fail"},
+            {"command": "always-fail", "force": True},
+            {"command": "always-fail", "force": False},
+        ]
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        f"force-failure-{attempt}", "bash_exec", arguments
+                    ),
+                ])
+                for attempt, arguments in enumerate(attempts, start=1)
+            ] + [
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            tool_result="[Error: synthetic failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["always-fail", "always-fail"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["force-failure-1"], ["force-failure-2"]],
+        )
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[3])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["count"], 2)
+
     # Mutation caught: describing an all-blocked batch as active terminal or
     # network I/O misreports a request that never reaches the dispatcher.
     async def test_all_blocked_status_uses_neutral_request_review_wording(self):
@@ -1257,6 +1292,32 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.executed_commands, ["cat job.log"] * 2)
         self.assertEqual(self._last_blocked(3)["reason"], "loop_guard_repeat")
+
+    # Mutation caught: retaining the original step after a successful forced
+    # repeat lets the refreshed action expire from the window one step later.
+    async def test_successful_forced_repeat_refreshes_the_window(self):
+        filler = [
+            _response(tool_calls=[self._bash(f"refresh-{step}", f"probe-{step}")])
+            for step in range(2, bot.TOOL_LOOP_GUARD_WINDOW + 1)
+        ]
+        await self.run_agent(
+            [_response(tool_calls=[self._bash("refresh-1", "cat refresh.log")])]
+            + filler
+            + [
+                _response(tool_calls=[
+                    self._bash("refresh-forced", "cat refresh.log", force=True)
+                ]),
+                _response(tool_calls=[
+                    self._bash("refresh-blocked", "cat refresh.log")
+                ]),
+                self._finish(),
+            ]
+        )
+
+        self.assertEqual(self.executed_commands.count("cat refresh.log"), 2)
+        blocked = self._last_blocked(-1)
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["first_step"], bot.TOOL_LOOP_GUARD_WINDOW + 1)
 
     # Mutation caught: an unbounded memory of every call ever made turns a
     # long run's legitimate re-check into a permanent refusal.
