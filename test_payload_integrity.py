@@ -89,6 +89,23 @@ async def _collect(chunks):
 
 
 class StreamingToolCallReassemblyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_finish_reason_survives_delta_less_and_usage_chunks(self):
+        stream = FakeToolCallStream([
+            _chunk(content="partial"),
+            SimpleNamespace(choices=[SimpleNamespace(finish_reason="length", delta=None)]),
+            SimpleNamespace(choices=[]),
+        ])
+
+        async def create(**kwargs):
+            return stream
+
+        stub = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.object(bot, "client", stub):
+            response = await bot.create_streaming_completion(model="stub", messages=[])
+        self.assertEqual(response.choices[0].finish_reason, "length")
+        self.assertEqual(response.choices[0].message.content, "partial")
+        self.assertTrue(stream.closed)
+
     async def test_index_less_argument_fragments_join_one_call(self):
         # Production mutation caught: keying an index-less fragment on
         # len(tool_buffers) splits one streamed call into N half-merged calls.

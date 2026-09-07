@@ -716,11 +716,40 @@ class DeliveryFailureLabelTest(TerminalStateTestCase):
 
     def test_2g_unclosed_xml_tool_call_extraction(self):
         """extract_tool_calls_from_text handles unclosed tags or xml tags without error."""
-        text = "<tool_call>\n<function=bash_exec>\n<parameter=command>\nls -la"
+        text = "<tool_call>\n<function=bash_exec>\n<parameter=command>\nls -la</parameter>"
         extracted = bot.extract_tool_calls_from_text(text)
         self.assertEqual(len(extracted), 1)
         self.assertEqual(extracted[0]["name"], "bash_exec")
         self.assertEqual(extracted[0]["arguments"], {"command": "ls -la"})
+
+    async def test_first_step_cutoff_retries_instead_of_completing(self):
+        for response in (
+            _response(content="Partial answer", finish_reason="length"),
+            _response(content="[truncated \u2014 reasoning incomplete; raise max_tokens]"),
+            _response(content="<tool_call><function=bash_exec><parameter=command>echo partial"),
+            _response(content='<tool_call>{"name":"finish_task","arguments":[]}</tool_call>'),
+            _response(tool_calls=[_tool_call("partial", "bash_exec", {"command": "echo partial"})],
+                      finish_reason="length"),
+            _response(tool_calls=[_tool_call("partial", "finish_task", {"report": "partial"})],
+                      finish_reason="length"),
+        ):
+            with self.subTest(response=response):
+                self.recorder = RunRecorder()
+                message = await self.run_agent([
+                    response,
+                    _response(tool_calls=[_tool_call("done", "finish_task", {"report": LONG_REPORT})]),
+                ])
+                self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_FINISH_TASK)
+                self.bash_exec.assert_not_awaited()
+                self.assertIn(LONG_REPORT.strip(), "\n".join(message.replies))
+
+    async def test_short_answer_cutoff_falls_back_to_agent(self):
+        message = await self.run_agent([
+            _response(content="Partial answer", finish_reason="length"),
+            _response(tool_calls=[_tool_call("done", "finish_task", {"report": LONG_REPORT})]),
+        ], request="간단히 답해줘")
+        self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_FINISH_TASK)
+        self.assertIn(LONG_REPORT.strip(), "\n".join(message.replies))
 
 
 if __name__ == "__main__":
