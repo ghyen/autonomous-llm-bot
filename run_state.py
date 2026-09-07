@@ -2,9 +2,9 @@
 
 Every piece of run state used to live in module-global dicts, so a process
 restart lost the step cursor, the cumulative summary, the authoritative ledger,
-and the ids of the tool calls that had already run. The next message then began
-the same goal again at Step 1 - and a Step 1 record on its own cannot be told
-apart from a genuinely new request, so the loss was not even diagnosable
+and the ids of the tool calls that had already been announced. The next message
+then began the same goal again at Step 1 - and a Step 1 record on its own cannot
+be told apart from a genuinely new request, so the loss was not even diagnosable
 afterwards (issue #6).
 
 This module is that missing layer and nothing more. It is not a log: it is the
@@ -30,7 +30,7 @@ from pathlib import Path
 from ledger import ResearchLedger
 from run_workspace import atomic_write
 
-SCHEMA = 2
+SCHEMA = 3
 FILE_NAME = "state.json"
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
@@ -44,7 +44,7 @@ _REQUIRED = (
     "tail",
     "ledger",
     "interrupt",
-    "executed_call_ids",
+    "announced_call_ids",
     "tool_fingerprints",
 )
 
@@ -65,7 +65,7 @@ def save(
     tail,
     ledger,
     interrupt,
-    executed_call_ids,
+    announced_call_ids,
     tool_fingerprints,
     state=RUNNING,
 ):
@@ -88,7 +88,7 @@ def save(
         "tail": list(tail or []),
         "ledger": ledger.to_dict(),
         "interrupt": dict(interrupt or {}),
-        "executed_call_ids": [str(call_id) for call_id in executed_call_ids or ()],
+        "announced_call_ids": list(announced_call_ids or ()),
         "tool_fingerprints": [
             [str(fingerprint), int(step)]
             for fingerprint, step in tool_fingerprints or ()
@@ -120,7 +120,12 @@ def load(workspace):
         return None
     if not isinstance(payload["interrupt"], dict):
         return None
-    if not isinstance(payload["executed_call_ids"], list):
+    announced_call_ids = payload["announced_call_ids"]
+    if (
+        not isinstance(announced_call_ids, list)
+        or any(not isinstance(item, str) or not item for item in announced_call_ids)
+        or len(set(announced_call_ids)) != len(announced_call_ids)
+    ):
         return None
     if not isinstance(payload["tool_fingerprints"], list):
         return None
@@ -144,7 +149,6 @@ def load(workspace):
         return None
     payload["summary"] = str(payload["summary"] or "")
     payload["tail"] = [item for item in payload["tail"] if isinstance(item, dict)]
-    payload["executed_call_ids"] = [str(item) for item in payload["executed_call_ids"]]
     payload["tool_fingerprints"] = normalized_fingerprints
     return payload
 

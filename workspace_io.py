@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 
-CANONICAL_NAMES = frozenset(("plan.md", "findings.md"))
+CANONICAL_NAMES = frozenset(("plan.md", "findings.md", "playbook.md"))
 REVISION_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
 

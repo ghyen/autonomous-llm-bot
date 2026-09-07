@@ -273,6 +273,7 @@ class CanonicalIntegrityTest(WorkspaceTestCase):
         for canonical_name, alias_name in (
             ("plan.md", "PLAN.MD"),
             ("findings.md", "FINDINGS.MD"),
+            ("playbook.md", "PLAYBOOK.MD"),
         ):
             original = f"original-{canonical_name}"
             created = await workspace.write(
@@ -399,7 +400,7 @@ class CanonicalIntegrityTest(WorkspaceTestCase):
         )
         workspace = catalog.acquire(TEST_USER_ID, CHANNEL_A)
 
-        for name in ("plan.md", "findings.md"):
+        for name in ("plan.md", "findings.md", "playbook.md"):
             created = await workspace.write(name, f"first-{name}", "absent")
             absolute_alias = os.path.abspath(str(workspace.root / name))
             bypass = await workspace.write(absolute_alias, "bypass", None)
@@ -457,10 +458,10 @@ class ToolIntegrationTest(WorkspaceTestCase):
             "run_worker",
             AsyncMock(side_effect=responses),
         ) as run_worker:
-            bash = await bot.tool_bash_exec(workspace, "printf ok")
+            bash = await bot.tool_bash_exec(workspace, "printf ok", "c1")
             read = await bot.tool_read_file(workspace, "note.txt")
             write = await bot.tool_write_file(workspace, "note.txt", "inside", None)
-            search = await bot.tool_web_search("one")
+            search = await bot.tool_web_search(workspace, "one", "c4")
 
         self.assertIn("[exit code: 0]", bash)
         self.assertEqual(json.loads(read)["status"], "success")
@@ -489,7 +490,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
         inside = workspace.root / "nested" / "absolute.txt"
         self.assertEqual(workspace.resolve(str(inside)), inside)
 
-        bash_result = await bot.tool_bash_exec(workspace, "pwd")
+        bash_result = await bot.tool_bash_exec(workspace, "pwd", "pwd-call")
         self.assertIn(str(workspace.root), bash_result)
         write_result = json.loads(await bot.tool_write_file(
             workspace, "nested/file.txt", "inside", None
@@ -514,7 +515,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
         canary.write_text("canary-original", encoding="utf-8")
 
         link_result = await bot.tool_bash_exec(
-            workspace, f"ln -s '{self.temp_dir.name}' escape_link"
+            workspace, f"ln -s '{self.temp_dir.name}' escape_link", "link-call"
         )
         self.assertIn("[exit code: 0]", link_result)
         self.assertTrue((workspace.root / "escape_link").is_symlink())
@@ -568,7 +569,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
         )
 
         await bot.tool_bash_exec(
-            workspace, f"ln -s '{workspace.log_path.parent}' log_link"
+            workspace, f"ln -s '{workspace.log_path.parent}' log_link", "log-link-call"
         )
         relative_to_log = os.path.relpath(
             str(workspace.log_path), str(workspace.root)
@@ -603,7 +604,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
             os.environ,
             {"DISCORD_BOT_TOKEN": canary, "OPENAI_API_KEY": canary},
         ):
-            printed = await bot.tool_bash_exec(workspace, "env; echo HOME=$HOME")
+            printed = await bot.tool_bash_exec(workspace, "env; echo HOME=$HOME", "env-call")
 
         self.assertNotIn(canary, printed)
         self.assertNotIn("DISCORD_BOT_TOKEN", printed)
@@ -646,11 +647,11 @@ class ToolIntegrationTest(WorkspaceTestCase):
         )
         self.assertIn("expected_revision", write_schema["parameters"]["properties"])
 
-        calls = [{"name": "bash_exec", "arguments": {"command": "true"}}]
+        calls = [{"id": "ctx-1", "name": "bash_exec", "arguments": {"command": "true"}}]
         with patch.object(bot, "tool_bash_exec", AsyncMock(return_value="ok")) as bash:
             result = await bot.execute_tools_in_parallel(workspace, calls)
         self.assertEqual(result, ["ok"])
-        bash.assert_awaited_once_with(workspace, "true")
+        bash.assert_awaited_once_with(workspace, "true", "ctx-1")
 
         messages = [{"role": "system", "content": prompt}]
         for index in range(10):
@@ -1153,11 +1154,69 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             )
             self.assertFalse(resumed.root.exists())
 
+    async def test_canonical_copy_errors_roll_back_and_retry_newest_snapshot(self):
+        payload = "- intact newest snapshot"
+        for operation in ("read", "write"):
+            catalog = run_workspace.RunCatalog(
+                self.workspace_root / operation,
+                self.log_root / operation,
+            )
+            prior = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+            await prior.write("playbook.md", payload, "absent")
+            catalog.finish(prior, "completed")
+            source = prior.root / "playbook.md"
+
+            original_read_bytes = Path.read_bytes
+            original_atomic_write = run_workspace.atomic_write
+            if operation == "read":
+                def fail_copy_read(path):
+                    if path == source:
+                        raise OSError("injected canonical copy read failure")
+                    return original_read_bytes(path)
+
+                copy_failure = patch.object(Path, "read_bytes", new=fail_copy_read)
+            else:
+                def fail_copy_write(path, data):
+                    if Path(path).name == "playbook.md":
+                        raise OSError("injected canonical copy write failure")
+                    return original_atomic_write(path, data)
+
+                copy_failure = patch.object(
+                    run_workspace,
+                    "atomic_write",
+                    new=fail_copy_write,
+                )
+
+            acquisition_error = None
+            with copy_failure:
+                try:
+                    catalog.acquire(TEST_USER_ID, CHANNEL_A)
+                except OSError as error:
+                    acquisition_error = error
+
+            retry = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+            expected_run_ids = {prior.run_id, retry.run_id}
+            with self.subTest(operation=operation, behavior="propagate"):
+                self.assertIsInstance(acquisition_error, OSError)
+            with self.subTest(operation=operation, behavior="roll_back"):
+                self.assertEqual(
+                    {workspace.run_id for workspace in catalog.workspaces()},
+                    expected_run_ids,
+                )
+                self.assertEqual(
+                    {path.name for path in catalog.runs_root.iterdir()},
+                    expected_run_ids,
+                )
+            with self.subTest(operation=operation, behavior="retry"):
+                self.assertEqual(source.read_text(encoding="utf-8"), payload)
+                self.assertEqual(retry.read("playbook.md").get("content"), payload)
+
     async def test_acquire_inherits_canonical_files_from_prior_run_of_same_owner_and_channel(self):
         catalog = self.catalog()
         run1 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
         await run1.write("plan.md", "# Plan 1\n- [x] Step 1", "absent")
         await run1.write("findings.md", "# Findings\nDiscovered secret", "absent")
+        await run1.write("playbook.md", "- Mac grep은 -P를 지원하지 않는다", "absent")
         await run1.write("other.txt", "not canonical", None)
         catalog.finish(run1, "completed")
 
@@ -1169,16 +1228,21 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         read_findings = run2.read("findings.md")
         self.assertEqual(read_findings["status"], "success")
         self.assertEqual(read_findings["content"], "# Findings\nDiscovered secret")
+        read_playbook = run2.read("playbook.md")
+        self.assertEqual(read_playbook["status"], "success")
+        self.assertEqual(read_playbook["content"], "- Mac grep은 -P를 지원하지 않는다")
         self.assertEqual(run2.read("other.txt")["status"], "error")
 
         # Different channel must not inherit
         diff_channel = catalog.acquire(TEST_USER_ID, CHANNEL_B)
         self.assertEqual(diff_channel.read("plan.md")["status"], "error")
+        self.assertEqual(diff_channel.read("playbook.md")["status"], "error")
         catalog.finish(diff_channel, "completed")
 
         # Different owner must not inherit
         diff_owner = catalog.acquire(TEST_ADMIN_ID, CHANNEL_A)
         self.assertEqual(diff_owner.read("plan.md")["status"], "error")
+        self.assertEqual(diff_owner.read("playbook.md")["status"], "error")
         catalog.finish(diff_owner, "completed")
 
         # Explicit reset (prepare) must not inherit
@@ -1188,6 +1252,15 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         self.assertEqual(fresh.run_id, prepared.run_id)
         self.assertEqual(fresh.read("plan.md")["status"], "error")
         self.assertEqual(fresh.read("findings.md")["status"], "error")
+        self.assertEqual(fresh.read("playbook.md")["status"], "error")
+
+        # Production mutation caught: per-file fallback can skip this blank run
+        # after it is consumed and resurrect pre-reset files on the next acquire.
+        catalog.finish(fresh, "completed")
+        after_reset = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        self.assertEqual(after_reset.read("plan.md")["status"], "error")
+        self.assertEqual(after_reset.read("findings.md")["status"], "error")
+        self.assertEqual(after_reset.read("playbook.md")["status"], "error")
 
 
 if __name__ == "__main__":
