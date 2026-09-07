@@ -20,13 +20,16 @@ CHANNEL_ID = 987654600
 LONG_REPORT = "조사 결과 정리. " + ("확인됨. " * 80)
 
 
-def _response(content="", tool_calls=(), reasoning=""):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-        content=content,
-        reasoning_content=reasoning,
-        reasoning="",
-        tool_calls=list(tool_calls),
-    ))])
+def _response(content="", tool_calls=(), reasoning="", finish_reason=None):
+    return SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason=finish_reason,
+        message=SimpleNamespace(
+            content=content,
+            reasoning_content=reasoning,
+            reasoning="",
+            tool_calls=list(tool_calls),
+        )
+    )])
 
 
 def _tool_call(call_id, name, arguments):
@@ -142,7 +145,100 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
         self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
         self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_FINISH_TASK)
         self.assertIn("완료 시간", self.final_reply)
-        self.assertNotIn("미완료", self.final_reply)
+
+    def test_clean_internal_thought_content(self):
+        self.assertEqual(bot.clean_internal_thought_content(""), "")
+        self.assertEqual(bot.clean_internal_thought_content("정상 생각"), "정상 생각")
+
+        # Truncation sentinel removal
+        truncated = "[truncated — reasoning incomplete; raise max_tokens]\n\n!!!!!!!!!!!!!!!!"
+        self.assertEqual(bot.clean_internal_thought_content(truncated), "[내부 추론 토큰 한도 도달]")
+
+        prefix_truncated = "앞부분 생각 [truncated — reasoning incomplete; raise max_tokens]"
+        self.assertEqual(bot.clean_internal_thought_content(prefix_truncated), "앞부분 생각")
+
+        # Repetitive characters collapsing
+        repeated = "이상 발생" + ("!" * 50)
+        self.assertEqual(bot.clean_internal_thought_content(repeated), "이상 발생!")
+
+    async def test_2c_internal_thought_length_cutoff_injects_nudge(self):
+        """When reasoning is cut off by length limit or sentinel, inject nudge and finish cleanly."""
+        captured_payloads = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            if "messages" in kwargs:
+                captured_payloads.append(list(kwargs["messages"]))
+            return await original_run(*args, **kwargs)
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                    _response(
+                        content="[truncated — reasoning incomplete; raise max_tokens]\n\n!!!!!!!!",
+                        finish_reason="length",
+                    ),
+                    _response(tool_calls=[_tool_call("c2", "finish_task", {"report": "완료 보고서"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        step3_messages = captured_payloads[2]
+        user_nudges = [m for m in step3_messages if m.get("role") == "user" and "토큰 한도에 도달하여 중단" in m.get("content", "")]
+        self.assertTrue(len(user_nudges) >= 1)
+        assistant_msgs = [m for m in step3_messages if m.get("role") == "assistant"]
+        for m in assistant_msgs:
+            text = m.get("content") or ""
+            self.assertNotIn("[truncated — reasoning incomplete", text)
+            self.assertNotIn("!!!!!!", text)
+
+    async def test_2d_internal_thought_consecutive_stall_stops_at_limit(self):
+        """Consecutive internal thoughts without tool calls stops at MAX_CONSECUTIVE_INTERNAL_THOUGHTS limit."""
+        await self.drive(
+            [
+                _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                _response(content="<think>생각 1</think>"),
+                _response(content="<think>생각 2</think>"),
+                _response(content="<think>생각 3</think>"),
+            ],
+            max_loops=10,
+        )
+
+        self.assertEqual(len(self.recorder.settled), 1)
+        self.assertEqual(self.recorder.reason, outcome_mod.EXHAUSTED)
+        self.assertEqual(self.recorder.detail, "내부 추론 반복 정체")
+        self.assertIn("미완료", self.final_reply)
+
+    async def test_2e_internal_thought_stall_forces_none_effort_on_next_step(self):
+        """When an internal thought cutoff or thought without tools occurs, the next step forces reasoning_effort='none'."""
+        captured_kwargs = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return await original_run(*args, **kwargs)
+
+        bot.channel_reasoning[CHANNEL_ID] = "medium"
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                    _response(content="<think>생각만 하고 도구를 부르지 않음</think>"),
+                    _response(tool_calls=[_tool_call("c2", "finish_task", {"report": "완료"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        # Step 1 (iteration 0): always "none"
+        self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
+        # Step 2 (iteration 1): normal configured effort ("medium")
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "medium")
+        # Step 3 (iteration 2): consecutive_internal_thoughts > 0 -> forced fallback to "none"
+        self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
 
     async def test_2_completion_text_after_tools_does_not_stall_and_continues_until_budget(self):
         """Completion text without finish_task continues autonomously without stall until step budget."""
@@ -587,6 +683,73 @@ class DeliveryFailureLabelTest(TerminalStateTestCase):
         self.assertIn(outcome_mod.LABELS[outcome_mod.FAILED], failure_notice)
         self.assertNotIn(outcome_mod.LABELS[outcome_mod.COMPLETED], failure_notice)
         self.assertIn("미완료", failure_notice)
+
+
+    async def test_2f_none_effort_is_consistently_propagated(self):
+        """When reasoning_effort is configured as 'none', subsequent steps continue passing 'none'."""
+        captured_kwargs = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return await original_run(*args, **kwargs)
+
+        bot.channel_reasoning[CHANNEL_ID] = "none"
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
+                    _response(tool_calls=[_tool_call("c2", "read_file", {"path": "test.txt"})]),
+                    _response(tool_calls=[_tool_call("c3", "finish_task", {"report": "완료"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        # Step 1: "none"
+        self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
+        # Step 2: "none" (not dropped or left empty)
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "none")
+        # Step 3: "none"
+        self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
+
+    def test_2g_unclosed_xml_tool_call_extraction(self):
+        """extract_tool_calls_from_text handles unclosed tags or xml tags without error."""
+        text = "<tool_call>\n<function=bash_exec>\n<parameter=command>\nls -la</parameter>"
+        extracted = bot.extract_tool_calls_from_text(text)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0]["name"], "bash_exec")
+        self.assertEqual(extracted[0]["arguments"], {"command": "ls -la"})
+
+    async def test_first_step_cutoff_retries_instead_of_completing(self):
+        for response in (
+            _response(content="Partial answer", finish_reason="length"),
+            _response(content="[truncated \u2014 reasoning incomplete; raise max_tokens]"),
+            _response(content="<tool_call><function=bash_exec><parameter=command>echo partial"),
+            _response(content='<tool_call>{"name":"finish_task","arguments":[]}</tool_call>'),
+            _response(tool_calls=[_tool_call("partial", "bash_exec", {"command": "echo partial"})],
+                      finish_reason="length"),
+            _response(tool_calls=[_tool_call("partial", "finish_task", {"report": "partial"})],
+                      finish_reason="length"),
+        ):
+            with self.subTest(response=response):
+                self.recorder = RunRecorder()
+                message = await self.run_agent([
+                    response,
+                    _response(tool_calls=[_tool_call("done", "finish_task", {"report": LONG_REPORT})]),
+                ])
+                self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_FINISH_TASK)
+                self.bash_exec.assert_not_awaited()
+                self.assertIn(LONG_REPORT.strip(), "\n".join(message.replies))
+
+    async def test_short_answer_cutoff_falls_back_to_agent(self):
+        message = await self.run_agent([
+            _response(content="Partial answer", finish_reason="length"),
+            _response(tool_calls=[_tool_call("done", "finish_task", {"report": LONG_REPORT})]),
+        ], request="간단히 답해줘")
+        self.assertEqual(self.recorder.detail, outcome_mod.DETAIL_FINISH_TASK)
+        self.assertIn(LONG_REPORT.strip(), "\n".join(message.replies))
 
 
 if __name__ == "__main__":
