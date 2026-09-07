@@ -41,20 +41,27 @@ class TieredMemoryFormatTest(unittest.TestCase):
         self.assertEqual(parsed["tier2"], tier2)
         self.assertEqual(parsed["discoveries"], discoveries)
 
-    def test_obsolete_two_level_format_is_not_migrated(self):
-        # Production mutation caught: a compatibility parser keeps two sources
-        # of truth alive and lets old milestone prose revive rejected hypotheses.
-        old = (
-            "## 🏛️ 장기 마일스톤 색인\n- H_OLD is active\n\n"
-            "## 🔍 직전 구간 상세 요약\nold detail"
+    def test_obsolete_summary_formats_are_not_migrated_or_parsed(self):
+        # Production mutations caught: compatibility parsers keep old authority
+        # prose alive, or trust a pre-integrity Tier 3 coverage watermark.
+        obsolete = (
+            (
+                "## 🏛️ 장기 마일스톤 색인\n- H_OLD is active\n\n"
+                "## 🔍 직전 구간 상세 요약\nold detail"
+            ),
+            (
+                f"{bot.TIER3_SECTION_HEADER}\n{bot.TIER3_AUTHORITY_NOTICE}\n"
+                "적용 범위: Step 1-10\n- Step 1-10: old unverified procedure\n\n"
+                f"{bot.TIER2_SECTION_HEADER}\n(아직 중기 스텝 인덱스 없음)"
+            ),
         )
 
-        parsed = bot.parse_tiered_summary(old)
-
-        self.assertEqual(
-            parsed,
-            {"tier3": "", "tier3_through": 0, "tier2": [], "discoveries": []},
-        )
+        for old in obsolete:
+            with self.subTest(summary=old.splitlines()[0]):
+                self.assertEqual(
+                    bot.parse_tiered_summary(old),
+                    {"tier3": "", "tier3_through": 0, "tier2": [], "discoveries": []},
+                )
         self.assertFalse(hasattr(bot, "parse_hierarchical_summary"))
         self.assertFalse(hasattr(bot, "update_hierarchical_summary"))
 
@@ -202,6 +209,92 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
         recent_tools = [item for item in rolled if bot._msg_role(item) == "tool"]
         self.assertEqual(len(recent_tools), 10)
         self.assertEqual(bot._msg_content(recent_tools[-1]), "[stdout]\nStep 14 output\n[exit code: 0]")
+
+    async def test_rollover_does_not_advance_past_hash_invalid_trajectory(self):
+        # Production mutation caught: procedural_source can discard a corrupt
+        # suffix while rollover still persists tier3_through=tier3_end.
+        import json
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(root=temp_dir)
+            ledger, payload = self._make_payload(workspace)
+            self._seed_trajectory(workspace)
+            path = trajectory.trajectory_path(workspace)
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            records[5]["result"] = "forged-result"
+            path.write_text(
+                "".join(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                    for record in records
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                bot,
+                "run_completion_stage",
+                AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
+            ):
+                rolled, summary = await bot.rollover_agent_context(
+                    workspace, payload, existing_summary="", step_num=40, ledger=ledger
+                )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(parsed["tier3_through"], 5)
+        self.assertIn("Step 1-5", parsed["tier3"])
+        self.assertNotIn("Step 6", parsed["tier3"])
+        self.assertTrue(
+            bot._msg_content(rolled[0]).rstrip().endswith(ledger.render().rstrip())
+        )
+
+    async def test_rollover_stops_at_durable_internal_or_trailing_trajectory_gap(self):
+        # Production mutation caught: a syntactically complete sparse chain can
+        # hide a caught zero-byte append failure unless its first gap is a cap.
+        for recorded_steps in ((1,), (1, 3)):
+            with self.subTest(recorded_steps=recorded_steps):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    workspace = SimpleNamespace(root=temp_dir)
+                    ledger, payload = self._make_payload(workspace)
+                    for step in recorded_steps:
+                        trajectory.append_tool_group(
+                            workspace,
+                            step,
+                            [{
+                                "id": f"gap-{step}",
+                                "name": "bash_exec",
+                                "arguments": {"command": f"probe-{step}"},
+                                "failed": False,
+                            }],
+                            [f"result-{step}"],
+                            {f"gap-{step}"},
+                        )
+                    with patch.object(
+                        bot,
+                        "run_completion_stage",
+                        AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
+                    ):
+                        rolled, summary = await bot.rollover_agent_context(
+                            workspace,
+                            payload,
+                            existing_summary="",
+                            step_num=33,
+                            ledger=ledger,
+                            trajectory_gap_step=2,
+                        )
+
+                parsed = bot.parse_tiered_summary(summary)
+                self.assertEqual(parsed["tier3_through"], 1)
+                self.assertIn("Step 1-1", parsed["tier3"])
+                self.assertNotIn("Step 3", parsed["tier3"])
+                self.assertTrue(
+                    bot._msg_content(rolled[0]).rstrip().endswith(
+                        ledger.render().rstrip()
+                    )
+                )
 
     async def test_rollover_keeps_a_new_increment_before_advancing_its_watermark(self):
         # Production mutation caught: appending a new increment after a full

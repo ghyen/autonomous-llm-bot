@@ -14,7 +14,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 
-SCHEMA = 1
+SCHEMA = 2
 FILE_NAME = "traj.jsonl"
 ARGUMENT_STRING_MAX_CHARS = 1000
 RESULT_MAX_CHARS = 4000
@@ -81,7 +81,10 @@ def _bounded_value(value, depth=0):
 
 def _decode_records(data, require_complete=False):
     records = []
+    pending = []
+    pending_step = None
     expected_parent = None
+    previous_step = 0
     invalid = False
     text = data.decode("utf-8", errors="replace")
     for line in text.splitlines():
@@ -97,6 +100,8 @@ def _decode_records(data, require_complete=False):
             break
         body = dict(record)
         record_id = body.pop("id", None)
+        step = record.get("step")
+        group_end = record.get("group_end")
         if (
             not isinstance(record_id, str)
             or len(record_id) != 64
@@ -104,14 +109,32 @@ def _decode_records(data, require_complete=False):
             or record.get("parent") != expected_parent
             or hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
             != record_id
+            or not isinstance(step, int)
+            or isinstance(step, bool)
+            or step < 1
+            or not isinstance(group_end, bool)
         ):
             invalid = True
             break
-        records.append(record)
+        if pending_step is None:
+            if step <= previous_step:
+                invalid = True
+                break
+            pending_step = step
+        elif step != pending_step:
+            invalid = True
+            break
+        pending.append(record)
         expected_parent = record_id
-    if invalid and require_complete:
+        if group_end:
+            records.extend(pending)
+            pending = []
+            previous_step = step
+            pending_step = None
+    complete = not invalid and not pending
+    if not complete and require_complete:
         raise ValueError("trajectory integrity check failed")
-    return records
+    return records, complete
 
 
 def _read_descriptor(descriptor):
@@ -163,13 +186,15 @@ def append_tool_group(workspace, step, tool_calls, results, executed_ids):
         os.fchmod(descriptor, 0o600)
         existing = _read_descriptor(descriptor)
         parent = None
-        prior = _decode_records(existing, require_complete=True)
+        prior, _complete = _decode_records(existing, require_complete=True)
+        if tool_calls and prior and step <= prior[-1]["step"]:
+            raise ValueError("trajectory steps must increase")
         if prior:
             parent = prior[-1]["id"]
 
         executed_ids = {str(call_id) for call_id in executed_ids or ()}
         records = []
-        for call, raw_result in zip(tool_calls, results):
+        for index, (call, raw_result) in enumerate(zip(tool_calls, results)):
             arguments = call.get("arguments")
             if not isinstance(arguments, dict):
                 arguments = {}
@@ -179,6 +204,7 @@ def append_tool_group(workspace, step, tool_calls, results, executed_ids):
                 "schema": SCHEMA,
                 "parent": parent,
                 "step": step,
+                "group_end": index == len(tool_calls) - 1,
                 "call_id": str(call.get("id") or ""),
                 "tool": str(call.get("name") or ""),
                 "arguments": _bounded_value(arguments),
@@ -215,7 +241,7 @@ def read_records(workspace):
     try:
         descriptor = os.open(str(path), _open_flags(os.O_RDONLY))
     except FileNotFoundError:
-        return []
+        return [], False
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
@@ -229,9 +255,10 @@ def lookup(workspace, step, call_id=""):
     if not isinstance(step, int) or isinstance(step, bool) or step < 1:
         return {"status": "not_found", "step": step, "call_id": str(call_id or "")}
     call_id = str(call_id or "")
+    trusted, _complete = read_records(workspace)
     records = [
         record
-        for record in read_records(workspace)
+        for record in trusted
         if record.get("step") == step
         and (not call_id or record.get("call_id") == call_id)
     ]
@@ -286,7 +313,8 @@ def micro_index(workspace, start_step, end_step):
     if end_step < start_step:
         return []
     grouped = OrderedDict()
-    for record in read_records(workspace):
+    records, _complete = read_records(workspace)
+    for record in records:
         step = record.get("step")
         if not isinstance(step, int) or step < start_step or step > end_step:
             continue
@@ -311,13 +339,22 @@ def procedural_source(workspace, end_step, max_chars, start_step=1):
     start_step = max(1, int(start_step))
     if max_chars == 0 or end_step < start_step:
         return "", start_step - 1
+
+    records, complete = read_records(workspace)
+    if complete:
+        trusted_through = end_step
+    elif records:
+        trusted_through = min(end_step, records[-1]["step"])
+    else:
+        trusted_through = start_step - 1
+
     grouped = OrderedDict()
-    for record in read_records(workspace):
+    for record in records:
         step = record.get("step")
         if (
             not isinstance(step, int)
             or step < start_step
-            or step > end_step
+            or step > trusted_through
             or record.get("tool") in ("record_state", "finish_task")
         ):
             continue
@@ -335,16 +372,12 @@ def procedural_source(workspace, end_step, max_chars, start_step=1):
 
     selected = []
     used = 0
-    through = end_step
+    through = max(start_step - 1, trusted_through)
     for step, lines in grouped.items():
         block = "\n".join(lines)
         cost = len(block) + (1 if selected else 0)
         if cost > max_chars - used:
-            if not selected:
-                selected.append(_clip_middle(block, max_chars))
-                through = step
-            else:
-                through = step - 1
+            through = step - 1
             break
         selected.append(block)
         used += cost

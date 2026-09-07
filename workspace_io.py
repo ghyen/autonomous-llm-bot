@@ -77,7 +77,11 @@ def is_canonical(root, target):
 def is_reserved(root, target):
     root = _workspace_root(root)
     target = Path(target)
-    return any(target == root / name for name in RESERVED_NAMES)
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0].casefold() in RESERVED_NAMES
 
 
 def read_bytes(root, path, max_bytes=None):

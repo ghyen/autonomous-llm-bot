@@ -495,6 +495,22 @@ class ToolIntegrationTest(WorkspaceTestCase):
             self.assertEqual(result["error"], "reserved_path", (name, result))
             self.assertEqual(path.read_bytes(), before)
 
+    async def test_write_file_cannot_create_below_supervisor_owned_root_namespaces(self):
+        # Production mutation caught: checking only exact reserved paths lets
+        # atomic_write create traj.jsonl/child.txt as a model-owned directory.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+
+        for namespace in ("run.json", "state.json", "traj.jsonl"):
+            relative = f"{namespace}/child.txt"
+            with self.subTest(path=relative):
+                result = json.loads(
+                    await bot.tool_write_file(workspace, relative, "model-bytes", None)
+                )
+
+                self.assertEqual(result["status"], "error", result)
+                self.assertEqual(result["error"], "reserved_path", result)
+                self.assertFalse((workspace.root / relative).exists())
+
     async def test_relative_paths_and_bash_use_the_run_root_without_broadening_scope(self):
         # Production mutation caught: retaining the global cwd/path join permits
         # run overlap, while accepting any absolute path lets one line of model
@@ -869,6 +885,7 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
                 ledger=bot.ResearchLedger(),
                 interrupt={},
                 executed_call_ids=[],
+                trajectory_gap_step=None,
                 state="stopped",
             )
             catalog.finish(resumable, "stopped")

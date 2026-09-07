@@ -125,10 +125,88 @@ class TrajectoryTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                trusted = trajectory.read_records(self.workspace)
+                trusted, complete = trajectory.read_records(self.workspace)
 
+                self.assertFalse(complete)
                 self.assertEqual([record["call_id"] for record in trusted], ["c1"])
                 self.assertEqual(trajectory.lookup(self.workspace, 3)["status"], "not_found")
+
+    def test_procedural_source_stops_before_a_hash_invalid_partial_group(self):
+        # Production mutation caught: discarding an invalid suffix but reporting
+        # the caller's end_step lets Tier 3 permanently skip the missing group.
+        trajectory.append_tool_group(
+            self.workspace,
+            1,
+            [_call("trusted", "bash_exec", {"command": "probe-1"})],
+            ["result-1"],
+            {"trusted"},
+        )
+        trajectory.append_tool_group(
+            self.workspace,
+            2,
+            [
+                _call("partial-a", "bash_exec", {"command": "probe-2a"}),
+                _call("partial-b", "read_file", {"path": "evidence.txt"}),
+            ],
+            ["result-2a", "result-2b"],
+            {"partial-a", "partial-b"},
+        )
+        trajectory.append_tool_group(
+            self.workspace,
+            3,
+            [_call("unreachable", "bash_exec", {"command": "probe-3"})],
+            ["result-3"],
+            {"unreachable"},
+        )
+        records = self.records()
+        records[2]["result"] = "forged-result"
+        self.path.write_text(
+            "".join(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+
+        source, through = trajectory.procedural_source(
+            self.workspace, 3, max_chars=10000
+        )
+
+        self.assertEqual(through, 1)
+        self.assertIn("probe-1", source)
+        self.assertNotIn("probe-2a", source)
+        self.assertNotIn("probe-3", source)
+
+    def test_procedural_source_does_not_cover_a_partly_rendered_group(self):
+        # Production mutation caught: clipping an oversized first group and then
+        # advancing through it makes omitted calls unreachable on later rolls.
+        calls = [
+            _call(
+                f"oversized-{index}",
+                "bash_exec",
+                {"command": f"probe-{index}-" + ("x" * 80)},
+            )
+            for index in range(20)
+        ]
+        trajectory.append_tool_group(
+            self.workspace,
+            1,
+            calls,
+            [f"result-{index}" for index in range(20)],
+            {call["id"] for call in calls},
+        )
+
+        source, through = trajectory.procedural_source(
+            self.workspace, 1, max_chars=400
+        )
+
+        self.assertEqual(source, "")
+        self.assertEqual(through, 0)
 
     def test_append_refuses_an_integrity_broken_history(self):
         # Production mutation caught: deriving the next parent from an invalid

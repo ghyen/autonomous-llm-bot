@@ -1210,6 +1210,46 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(group["calls"][0]["failed"])
         self.assertFalse(group["calls"][1]["failed"])
 
+    async def test_trajectory_write_failure_latches_the_first_durable_gap(self):
+        # Production mutation caught: a zero-byte Step 2 append failure followed
+        # by a valid Step 3 chain must not be forgotten at the next snapshot.
+        real_append = trajectory.append_tool_group
+        real_save = bot.run_state.save
+        appended_steps = []
+        saved_gaps = []
+
+        def failing_append(workspace, step, calls, results, executed_ids):
+            if step == 2:
+                raise OSError("injected zero-byte trajectory failure")
+            appended_steps.append(step)
+            return real_append(workspace, step, calls, results, executed_ids)
+
+        def recording_save(*args, **kwargs):
+            saved_gaps.append(kwargs.get("trajectory_gap_step"))
+            return real_save(*args, **kwargs)
+
+        with patch.object(bot.trajectory, "append_tool_group", failing_append), patch.object(
+            bot.run_state, "save", recording_save
+        ):
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call("gap-1", "bash_exec", {"command": "printf one"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("gap-2", "bash_exec", {"command": "printf two"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("gap-3", "bash_exec", {"command": "printf three"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(appended_steps, [1, 3])
+        self.assertIsNone(saved_gaps[1])
+        self.assertEqual(saved_gaps[-2:], [2, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

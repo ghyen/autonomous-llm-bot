@@ -31,7 +31,7 @@ from ledger import ResearchLedger
 from run_workspace import atomic_write
 
 SCHEMA = 1
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2
 FILE_NAME = "state.json"
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
@@ -47,6 +47,7 @@ _REQUIRED = (
     "ledger",
     "interrupt",
     "executed_call_ids",
+    "trajectory_gap_step",
 )
 
 
@@ -67,6 +68,7 @@ def save(
     ledger,
     interrupt,
     executed_call_ids,
+    trajectory_gap_step,
     state=RUNNING,
 ):
     """Replace the run's record atomically.
@@ -76,6 +78,12 @@ def save(
     both breaks the next request and invites the already-executed side effects
     to run a second time.
     """
+    if trajectory_gap_step is not None and (
+        not isinstance(trajectory_gap_step, int)
+        or isinstance(trajectory_gap_step, bool)
+        or trajectory_gap_step < 1
+    ):
+        raise ValueError("trajectory gap step must be a positive integer or None")
     record = {
         "schema": SCHEMA,
         "summary_version": SUMMARY_VERSION,
@@ -90,6 +98,7 @@ def save(
         "ledger": ledger.to_dict(),
         "interrupt": dict(interrupt or {}),
         "executed_call_ids": [str(call_id) for call_id in executed_call_ids or ()],
+        "trajectory_gap_step": trajectory_gap_step,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -124,6 +133,13 @@ def load(workspace):
     if not isinstance(payload["interrupt"], dict):
         return None
     if not isinstance(payload["executed_call_ids"], list):
+        return None
+    trajectory_gap_step = payload["trajectory_gap_step"]
+    if trajectory_gap_step is not None and (
+        not isinstance(trajectory_gap_step, int)
+        or isinstance(trajectory_gap_step, bool)
+        or trajectory_gap_step < 1
+    ):
         return None
     try:
         payload["ledger"] = ResearchLedger.from_dict(payload["ledger"])

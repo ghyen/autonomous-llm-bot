@@ -219,6 +219,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 "steering": {"depth": 2, "applied": 1},
             },
             executed_call_ids=["c1", "c2"],
+            trajectory_gap_step=None,
         )
         payload.update(overrides)
         return run_state.save(workspace, **payload)
@@ -244,6 +245,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         self.assertEqual(restored["tail"], saved["tail"])
         self.assertEqual(restored["interrupt"], saved["interrupt"])
         self.assertEqual(restored["executed_call_ids"], ["c1", "c2"])
+        self.assertIsNone(restored["trajectory_gap_step"])
 
         ledger = restored["ledger"]
         self.assertEqual(ledger.goal, "장애 원인 규명")
@@ -255,6 +257,19 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         path = run_state.snapshot_path(workspace)
         self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
         self.assertEqual(oct(path.parent.stat().st_mode)[-3:], "700")
+
+    def test_3_first_trajectory_gap_survives_the_round_trip(self):
+        # Production mutation caught: keeping the append-failure ceiling only in
+        # process memory lets a restart resume and advance Tier 3 past the gap.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace, trajectory_gap_step=4)
+
+        restored = run_state.load(
+            self.catalog().lookup_owned(TEST_USER_ID, workspace.run_id)
+        )
+
+        self.assertEqual(restored["trajectory_gap_step"], 4)
 
     def test_3_a_record_that_does_not_match_the_schema_is_discarded(self):
         # Production mutation caught: migrating or half-reading a mismatched
@@ -294,6 +309,19 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         path = run_state.snapshot_path(workspace)
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.pop("summary_version", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertIsNone(run_state.load(workspace))
+
+    def test_3_b_pre_integrity_summary_version_is_discarded(self):
+        # Production mutation caught: retaining summary version 1 accepts a
+        # tier3_through value created before completeness was enforced.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace, summary="pre-integrity-tiered-summary")
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["summary_version"] = 1
         path.write_text(json.dumps(payload), encoding="utf-8")
 
         self.assertIsNone(run_state.load(workspace))
@@ -644,6 +672,7 @@ class RestartRecoveryTest(DurableStateTestCase):
             ledger=refuted_ledger(),
             interrupt={},
             executed_call_ids=[],
+            trajectory_gap_step=None,
             state="stopped",
         )
         catalog.finish(workspace, "stopped")

@@ -1274,6 +1274,7 @@ _TIER2_EMPTY = "(아직 중기 스텝 인덱스 없음)"
 _TIER3_MAX_CHARS = 2000
 _TIER2_MAX_LINES = 20
 _DISCOVERY_MAX_LINES = 10
+_TIERED_SUMMARY_VERSION_LINE = f"요약 형식 버전: {run_state.SUMMARY_VERSION}"
 
 
 def format_tiered_summary(
@@ -1304,6 +1305,7 @@ def format_tiered_summary(
         else "적용 범위: 없음"
     )
     sections = [
+        _TIERED_SUMMARY_VERSION_LINE,
         f"{TIER3_SECTION_HEADER}\n{TIER3_AUTHORITY_NOTICE}\n{coverage}\n{tier3_text}",
         f"{TIER2_SECTION_HEADER}\n" + ("\n".join(tier2) if tier2 else _TIER2_EMPTY),
     ]
@@ -1315,13 +1317,19 @@ def format_tiered_summary(
 def parse_tiered_summary(text: str) -> dict:
     empty = {"tier3": "", "tier3_through": 0, "tier2": [], "discoveries": []}
     text = str(text or "").strip()
-    if TIER3_SECTION_HEADER not in text or TIER2_SECTION_HEADER not in text:
+    lines = text.splitlines()
+    if (
+        not lines
+        or lines[0].strip() != _TIERED_SUMMARY_VERSION_LINE
+        or TIER3_SECTION_HEADER not in text
+        or TIER2_SECTION_HEADER not in text
+    ):
         return empty
 
     sections = {"tier3": [], "tier2": [], "discoveries": []}
     current = None
     tier3_through = 0
-    for line in text.splitlines():
+    for line in lines:
         trimmed = line.strip()
         if trimmed == TIER3_SECTION_HEADER:
             current = "tier3"
@@ -1644,7 +1652,15 @@ def recover_interrupted_runs() -> dict:
     return {"recovered": recovered, "aborted": aborted}
 
 
-async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, ledger=None, token=None):
+async def rollover_agent_context(
+    workspace,
+    messages: list,
+    existing_summary: str,
+    step_num: int,
+    ledger=None,
+    token=None,
+    trajectory_gap_step=None,
+):
     """Replace an old complete prefix with trajectory-backed Tier 2 and Tier 3."""
     if token is not None:
         token.raise_if_cancelled()
@@ -1658,6 +1674,8 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
     tier2_lines = trajectory.micro_index(workspace, tier2_start, tier2_end)
 
     tier3_end = max(0, step_num - 30)
+    if trajectory_gap_step is not None:
+        tier3_end = min(tier3_end, trajectory_gap_step - 1)
     previous_through = parsed["tier3_through"]
     source_start = previous_through + 1
     source = ""
@@ -2666,6 +2684,9 @@ async def on_message(message: discord.Message):
     # 이미 실행한 호출 식별자. 재시작 뒤 모델이 같은 호출을 다시 요청해도 부작용을
     # 두 번 일으키지 않는다.
     executed_call_ids = list(restored["executed_call_ids"]) if restored is not None else []
+    trajectory_gap_step = (
+        restored["trajectory_gap_step"] if restored is not None else None
+    )
     run_end_logged = False
     released = False
 
@@ -2906,6 +2927,7 @@ async def on_message(message: discord.Message):
                     "steering": lease["steering"].stats(),
                 },
                 executed_call_ids=executed_call_ids,
+                trajectory_gap_step=trajectory_gap_step,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -3012,6 +3034,7 @@ async def on_message(message: discord.Message):
             step_num,
             ledger=ledger,
             token=token,
+            trajectory_gap_step=trajectory_gap_step,
         )
         # 롤오버는 누적 요약이 바뀌는 유일한 지점이다. 되돌려 쓰지 않으면 이 런의
         # 모든 롤오버 요약이 함수 종료와 함께 사라지고, 같은 프로세스의 다음
@@ -3515,6 +3538,14 @@ async def on_message(message: discord.Message):
                         {tc["id"] for tc in allowed_calls},
                     )
                 except (OSError, ValueError) as trajectory_error:
+                    # The first missing group is a permanent Tier 3 ceiling;
+                    # later valid groups cannot prove what this append lost.
+                    failed_step = iteration + 1
+                    trajectory_gap_step = (
+                        failed_step
+                        if trajectory_gap_step is None
+                        else min(trajectory_gap_step, failed_step)
+                    )
                     # The canonical model/tool payload is already complete, so
                     # trajectory persistence may degrade without killing the run.
                     # Never put argument or result content in the system log.
