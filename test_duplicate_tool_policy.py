@@ -524,6 +524,41 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(blocked["blocked"])
         self.assertEqual(blocked["directive"], BLOCK_DIRECTIVE)
 
+    # Mutation caught: treating force as action data lets the model alternate
+    # policy metadata to reset an otherwise consecutive failure streak.
+    async def test_force_metadata_does_not_reset_the_failure_streak(self):
+        attempts = [
+            {"command": "always-fail"},
+            {"command": "always-fail", "force": True},
+            {"command": "always-fail", "force": False},
+        ]
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        f"force-failure-{attempt}", "bash_exec", arguments
+                    ),
+                ])
+                for attempt, arguments in enumerate(attempts, start=1)
+            ] + [
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            tool_result="[Error: synthetic failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["always-fail", "always-fail"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["force-failure-1"], ["force-failure-2"]],
+        )
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[3])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["count"], 2)
+
     # Mutation caught: describing an all-blocked batch as active terminal or
     # network I/O misreports a request that never reaches the dispatcher.
     async def test_all_blocked_status_uses_neutral_request_review_wording(self):
@@ -693,7 +728,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.run_agent(
             [
                 _response(tool_calls=[
-                    _tool_call(f"success-reset-{attempt}", "bash_exec", {"command": "recovering-A"}),
+                    _tool_call(
+                        f"success-reset-{attempt}",
+                        "bash_exec",
+                        {"command": "recovering-A", "force": True},
+                    ),
                 ])
                 for attempt in range(1, 5)
             ] + [
@@ -723,7 +762,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.run_agent(
             [
                 _response(tool_calls=[
-                    _tool_call(f"prose-{attempt}", "bash_exec", {"command": "prose-A"}),
+                    _tool_call(
+                        f"prose-{attempt}",
+                        "bash_exec",
+                        {"command": "prose-A", "force": True},
+                    ),
                 ])
                 for attempt in range(1, 5)
             ] + [
@@ -747,7 +790,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.run_agent(
             [
                 _response(tool_calls=[
-                    _tool_call(f"stdout-marker-{attempt}", "bash_exec", {"command": "marker-A"}),
+                    _tool_call(
+                        f"stdout-marker-{attempt}",
+                        "bash_exec",
+                        {"command": "marker-A", "force": True},
+                    ),
                 ])
                 for attempt in range(1, 4)
             ] + [
@@ -910,6 +957,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
                     _response(tool_calls=[
                         _tool_call(f"read-success-{attempt}", "read_file", {
                             "path": "error_like.txt",
+                            "force": True,
                         }),
                     ])
                     for attempt in range(1, 4)
@@ -1416,6 +1464,261 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("현재까지 실행: `0개`", live_status)
         self.assertIn("요청 도구", live_status)
         self.assertNotIn("총 도구: `101개`", live_status)
+
+    # --- Issue #50: harness-level loop guard over a multi-step window ---
+
+    @staticmethod
+    def _bash(call_id, command, force=None):
+        arguments = {"command": command}
+        if force is not None:
+            arguments["force"] = force
+        return _tool_call(call_id, "bash_exec", arguments)
+
+    @staticmethod
+    def _finish():
+        return _response(tool_calls=[
+            _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+        ])
+
+    def _last_blocked(self, payload_index):
+        content = self._tool_messages(self.model.agent_payloads[payload_index])[-1]
+        return json.loads(content["content"])
+
+    # Mutation caught: hashing ignored metadata lets the model change data that
+    # dispatch never consumes and replay the same effective side effect.
+    async def test_ignored_metadata_cannot_bypass_effective_action_identity(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call(
+                    "metadata-1",
+                    "bash_exec",
+                    {"command": "printf once", "tag": 1},
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call(
+                    "metadata-2",
+                    "bash_exec",
+                    {"command": "printf once", "tag": 2},
+                ),
+            ]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf once"])
+        self.assertEqual(len(self.dispatched_batches), 1)
+        blocked = self._last_blocked(2)
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["tool"], "bash_exec")
+
+    # Mutation caught: admitting a forced duplicate against stale pre-batch
+    # failure state lets two pending copies exceed the consecutive-failure cap.
+    async def test_forced_pending_duplicate_cannot_exceed_failure_cap(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[self._bash("pending-1", "always-fail")]),
+                _response(tool_calls=[
+                    self._bash("pending-2", "always-fail"),
+                    self._bash("pending-forced", "always-fail", force=True),
+                ]),
+                self._finish(),
+            ],
+            tool_result="[Error: synthetic failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["always-fail", "always-fail"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["pending-1"], ["pending-2"]],
+        )
+        tools = self._tool_messages(self.model.agent_payloads[2])[-2:]
+        self.assertEqual(
+            [tool["tool_call_id"] for tool in tools],
+            ["pending-2", "pending-forced"],
+        )
+        blocked = json.loads(tools[1]["content"])
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["count"], bot.MAX_CONSECUTIVE_FAILED_TOOL_CALLS)
+
+    # Mutation caught: a guard that only remembers the immediately preceding
+    # call lets a truncated-reasoning relapse re-run a command whose result is
+    # already in context, which is the Step 30 -> Step 36 curl replay.
+    async def test_identical_successful_call_repeated_inside_the_window_is_blocked(self):
+        await self.run_agent([
+            _response(tool_calls=[self._bash("loop-1", "curl https://example.com/a")]),
+            _response(tool_calls=[self._bash("loop-2", "curl https://example.com/b")]),
+            _response(tool_calls=[self._bash("loop-3", "curl https://example.com/a")]),
+            self._finish(),
+        ])
+
+        self.assertEqual(
+            self.executed_commands,
+            ["curl https://example.com/a", "curl https://example.com/b"],
+        )
+        self.assertEqual(len(self.dispatched_batches), 2)
+        blocked = self._last_blocked(3)
+        self.assertTrue(blocked["blocked"])
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["tool"], "bash_exec")
+        self.assertEqual(blocked["limit"], bot.TOOL_LOOP_GUARD_WINDOW)
+        self.assertEqual(blocked["first_step"], 1)
+        self.assertIn("Step 1", blocked["directive"])
+
+    # Mutation caught: without an escape hatch the guard also blocks the
+    # legitimate retries it cannot distinguish, such as polling a job log.
+    async def test_force_lets_an_intentional_retry_through(self):
+        await self.run_agent([
+            _response(tool_calls=[self._bash("poll-1", "cat job.log")]),
+            _response(tool_calls=[self._bash("poll-2", "cat job.log", force=True)]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["cat job.log"] * 2)
+        self.assertEqual(len(self.dispatched_batches), 2)
+
+    # Mutation caught: hashing force along with the real arguments makes
+    # force=true produce a different fingerprint, so the flag silently disables
+    # the guard for every later call instead of overriding one of them.
+    async def test_force_is_excluded_from_the_fingerprint(self):
+        self.assertEqual(
+            bot._tool_fingerprint("bash_exec", {"command": "cat job.log"}),
+            bot._tool_fingerprint("bash_exec", {"command": "cat job.log", "force": True}),
+        )
+
+        await self.run_agent([
+            _response(tool_calls=[self._bash("fp-1", "cat job.log")]),
+            _response(tool_calls=[self._bash("fp-2", "cat job.log", force=True)]),
+            _response(tool_calls=[self._bash("fp-3", "cat job.log")]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["cat job.log"] * 2)
+        self.assertEqual(self._last_blocked(3)["reason"], "loop_guard_repeat")
+
+    # Mutation caught: retaining the original step after a successful forced
+    # repeat lets the refreshed action expire from the window one step later.
+    async def test_successful_forced_repeat_refreshes_the_window(self):
+        filler = [
+            _response(tool_calls=[self._bash(f"refresh-{step}", f"probe-{step}")])
+            for step in range(2, bot.TOOL_LOOP_GUARD_WINDOW + 1)
+        ]
+        await self.run_agent(
+            [_response(tool_calls=[self._bash("refresh-1", "cat refresh.log")])]
+            + filler
+            + [
+                _response(tool_calls=[
+                    self._bash("refresh-forced", "cat refresh.log", force=True)
+                ]),
+                _response(tool_calls=[
+                    self._bash("refresh-blocked", "cat refresh.log")
+                ]),
+                self._finish(),
+            ]
+        )
+
+        self.assertEqual(self.executed_commands.count("cat refresh.log"), 2)
+        blocked = self._last_blocked(-1)
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["first_step"], bot.TOOL_LOOP_GUARD_WINDOW + 1)
+
+    # Mutation caught: an unbounded memory of every call ever made turns a
+    # long run's legitimate re-check into a permanent refusal.
+    async def test_identical_call_outside_the_window_runs_again(self):
+        filler = [
+            _response(tool_calls=[self._bash(f"win-{step}", f"probe-{step}")])
+            for step in range(2, bot.TOOL_LOOP_GUARD_WINDOW + 2)
+        ]
+        await self.run_agent(
+            [_response(tool_calls=[self._bash("win-1", "probe-repeat")])]
+            + filler
+            + [
+                _response(tool_calls=[self._bash("win-last", "probe-repeat")]),
+                self._finish(),
+            ]
+        )
+
+        self.assertEqual(self.executed_commands.count("probe-repeat"), 2)
+
+    # Mutation caught: force=false is policy metadata, not a distinct action;
+    # including it in same-batch identity lets the model execute the same side
+    # effect twice without actually requesting an override.
+    async def test_force_false_cannot_bypass_same_batch_identity(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                self._bash("false-1", "printf same"),
+                self._bash("false-2", "printf same", force=False),
+            ]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf same"])
+        tools = self._tool_messages(self.model.agent_payloads[1])[-2:]
+        self.assertEqual([item["tool_call_id"] for item in tools], ["false-1", "false-2"])
+        self.assertEqual(json.loads(tools[1]["content"])["reason"], "same_batch_duplicate")
+
+    # Mutation caught: a window held only in memory restarts empty, so the
+    # relapse this guard exists to stop survives exactly the restart that
+    # caused the reasoning truncation in the first place.
+    async def test_snapshot_carries_the_window_for_a_restart(self):
+        captured = []
+        original_save = bot.run_state.save
+
+        def capturing_save(workspace, **kwargs):
+            captured.append(list(kwargs.get("tool_fingerprints") or ()))
+            return original_save(workspace, **kwargs)
+
+        with patch.object(bot.run_state, "save", capturing_save):
+            await self.run_agent([
+                _response(tool_calls=[self._bash("persist-1", "probe-persist")]),
+                self._finish(),
+            ])
+
+        recorded = [entry for entries in captured for entry in entries]
+        self.assertTrue(recorded, "no fingerprint reached the durable record")
+        fingerprint, step = recorded[-1]
+        self.assertEqual(
+            fingerprint, bot._tool_fingerprint("bash_exec", {"command": "probe-persist"})
+        )
+        self.assertEqual(step, 1)
+
+    # Mutation caught: guarding record_state stalls authoritative state updates,
+    # which are cheap, idempotent, and already have their own refusal path.
+    async def test_state_and_write_tools_are_outside_the_guard(self):
+        self.assertEqual(
+            sorted(bot.TOOL_LOOP_GUARD_TOOLS),
+            ["bash_exec", "read_file", "web_search"],
+        )
+        schemas = {
+            entry["function"]["name"]: entry["function"]["parameters"]
+            for entry in bot.agent_tool_params()["tools"]
+        }
+        for name in bot.TOOL_LOOP_GUARD_TOOLS:
+            with self.subTest(tool=name):
+                self.assertEqual(
+                    schemas[name]["properties"]["force"],
+                    {
+                        "type": "boolean",
+                        "description": schemas[name]["properties"]["force"]["description"],
+                    },
+                )
+                self.assertNotIn("force", schemas[name]["required"])
+        self.assertNotIn("force", schemas["write_file"]["properties"])
+        self.assertNotIn("force", schemas["record_state"]["properties"])
+
+    # Mutation caught: recording failed calls makes the loop guard fire on the
+    # second attempt, so consecutive_failure_limit becomes unreachable and its
+    # more specific reason never reaches the model.
+    async def test_failed_repeats_stay_with_the_consecutive_failure_gate(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[self._bash(f"fail-{attempt}", "broken-command")])
+                for attempt in range(1, 4)
+            ] + [self._finish()],
+            tool_result="[Error: still broken]",
+        )
+
+        self.assertEqual(self.executed_commands, ["broken-command"] * 2)
+        self.assertEqual(self._last_blocked(3)["reason"], "consecutive_failure_limit")
 
 
 if __name__ == "__main__":
