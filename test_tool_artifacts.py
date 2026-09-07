@@ -4,6 +4,8 @@ Issue #48. The clamp these tests replace kept the first 2500 characters and
 discarded the rest, so nothing downstream could ever recover the tail.
 """
 
+import hashlib
+import json
 import re
 import shlex
 import sys
@@ -18,12 +20,16 @@ import bot
 
 
 CHANNEL_ID = 987654830
-LONG_STDOUT_SCRIPT = 'import sys; sys.stdout.write("x" * 5001); raise SystemExit(7)'
 
 
-def long_bash_command():
+def long_bash_command(character="x"):
+    script = (
+        "import sys; sys.stdout.write({0!r} * 5001); raise SystemExit(7)".format(
+            character
+        )
+    )
     return "{0} -c {1}".format(
-        shlex.quote(sys.executable), shlex.quote(LONG_STDOUT_SCRIPT)
+        shlex.quote(sys.executable), shlex.quote(script)
     )
 
 
@@ -110,6 +116,52 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("artifacts/out_", result)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
+    # Mutation caught: resolving only the artifact filename still lets a
+    # preplanted directory symlink redirect the parent process outside the run.
+    async def test_artifact_directory_symlink_cannot_escape_run_root(self):
+        outside = Path(self.temp_dir.name) / "outside-artifacts"
+        outside.mkdir()
+        original_mode = outside.stat().st_mode
+        (self.run.root / "artifacts").symlink_to(
+            outside, target_is_directory=True
+        )
+
+        result = await bot.tool_bash_exec(
+            self.run, long_bash_command(), "symlink-call"
+        )
+
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(outside.stat().st_mode, original_mode)
+        self.assertNotIn("artifacts/out_", result)
+        self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
+        self.assertRegex(result, r"\[exit code: 7\]\s*$")
+
+    # Mutation caught: raw safe IDs and hashed unsafe IDs sharing one namespace
+    # lets a second, distinct call silently replace the first call's full text.
+    async def test_safe_call_id_cannot_overwrite_hashed_call_id_artifact(self):
+        unsafe_id = "../../same-artifact"
+        colliding_safe_id = hashlib.sha256(unsafe_id.encode("utf-8")).hexdigest()[:32]
+
+        first = await bot.tool_bash_exec(
+            self.run, long_bash_command("x"), unsafe_id
+        )
+        second = await bot.tool_bash_exec(
+            self.run, long_bash_command("y"), colliding_safe_id
+        )
+
+        path_pattern = r"artifacts/out_[A-Za-z0-9_.-]+\.log"
+        first_path = re.search(path_pattern, first).group(0)
+        second_path = re.search(path_pattern, second).group(0)
+        self.assertNotEqual(first_path, second_path)
+        self.assertEqual(
+            (self.run.root / first_path).read_text(encoding="utf-8").count("x"),
+            5001,
+        )
+        self.assertEqual(
+            (self.run.root / second_path).read_text(encoding="utf-8").count("y"),
+            5001,
+        )
+
     # Mutation caught: leaving web_search unbounded lets one search reply push
     # an arbitrary number of characters straight into the model context.
     async def test_long_web_search_result_is_persisted_in_full_and_summarized(self):
@@ -139,6 +191,24 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
             self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
+    # Mutation caught: routing read_file through artifact encapsulation creates
+    # a redundant copy even though the full source and its revision are durable.
+    async def test_long_read_file_uses_source_without_an_artifact_copy(self):
+        content = "read-file-source\n" * 300
+        source = self.run.root / "large.txt"
+        source.write_text(content, encoding="utf-8")
+
+        result = json.loads(await bot.tool_read_file(self.run, "large.txt"))
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["content"], content[:2500])
+        self.assertEqual(
+            result["revision"],
+            "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(source.read_text(encoding="utf-8"), content)
+        self.assertFalse((self.run.root / "artifacts").exists())
 
     # Mutation caught: writing the artifact somewhere the sandboxed shell cannot
     # reach makes the grep hint a lie and the stored output unreadable.

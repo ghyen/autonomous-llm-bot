@@ -617,21 +617,22 @@ ARTIFACT_RUN_BYTE_BUDGET = TOOL_LIMITS["disk_bytes"] // 8
 
 
 def _artifact_name(call_id) -> str:
-    """모델이 준 호출 id는 신뢰할 수 없다. 안전하지 않으면 다이제스트로 바꾼다."""
+    """모델이 준 호출 id는 신뢰할 수 없다. 안전하지 않으면 별도 이름공간에 둔다."""
     token = str(call_id or "")
     if not ARTIFACT_ID_PATTERN.fullmatch(token):
-        token = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
+        # 점은 안전한 원문 id에 허용되지 않으므로 다이제스트 이름과 충돌하지 않는다.
+        token = "." + hashlib.sha256(token.encode("utf-8")).hexdigest()
     return f"out_{token}.log"
 
 
-def _artifact_usage(directory) -> int:
+def _artifact_usage(directory_descriptor) -> int:
     # ponytail: 저장할 때마다 디렉터리를 훑는다(O(n)). 런당 산출물이 수백 개를
     # 넘기면 워크스페이스에 누적 바이트 카운터를 두는 쪽으로 올린다.
     total = 0
-    with os.scandir(str(directory)) as entries:
+    with os.scandir(directory_descriptor) as entries:
         for entry in entries:
             if entry.is_file(follow_symlinks=False):
-                total += entry.stat().st_size
+                total += entry.stat(follow_symlinks=False).st_size
     return total
 
 
@@ -639,17 +640,76 @@ def _store_tool_artifact(workspace, call_id, text: str) -> Optional[str]:
     """도구 출력 전문을 런 루트 안에 남기고 상대 경로를 돌려준다."""
     data = text.encode("utf-8")
     name = _artifact_name(call_id)
+    directory_descriptor = None
+    temporary = None
+    artifact_descriptor = None
     try:
-        directory = session_log.secure_directory(
-            os.path.join(str(workspace.root), ARTIFACT_DIR_NAME)
-        )
-        if _artifact_usage(directory) + len(data) > ARTIFACT_RUN_BYTE_BUDGET:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        root_descriptor = os.open(str(workspace.root), directory_flags)
+        try:
+            try:
+                os.mkdir(
+                    ARTIFACT_DIR_NAME,
+                    mode=session_log.DIR_MODE,
+                    dir_fd=root_descriptor,
+                )
+            except FileExistsError:
+                pass
+            directory_descriptor = os.open(
+                ARTIFACT_DIR_NAME,
+                directory_flags,
+                dir_fd=root_descriptor,
+            )
+        finally:
+            os.close(root_descriptor)
+
+        os.fchmod(directory_descriptor, session_log.DIR_MODE)
+        if (
+            _artifact_usage(directory_descriptor) + len(data)
+            > ARTIFACT_RUN_BYTE_BUDGET
+        ):
             return None
-        workspace_io.atomic_write(os.path.join(str(directory), name), data)
+
+        temporary = ".{0}.{1}".format(name, os.urandom(16).hex())
+        artifact_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            session_log.FILE_MODE,
+            dir_fd=directory_descriptor,
+        )
+        os.fchmod(artifact_descriptor, session_log.FILE_MODE)
+        with os.fdopen(artifact_descriptor, "wb") as handle:
+            artifact_descriptor = None
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary = None
     except (OSError, ValueError):
         # 저장에 실패해도 도구 결과 자체는 살려야 한다. 여기서 예외를 올리면
         # 호출자의 포괄 except가 종료 코드까지 지운 실패 문자열로 바꿔 버린다.
         return None
+    finally:
+        if artifact_descriptor is not None:
+            try:
+                os.close(artifact_descriptor)
+            except OSError:
+                pass
+        if temporary is not None and directory_descriptor is not None:
+            try:
+                os.unlink(temporary, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
     return f"{ARTIFACT_DIR_NAME}/{name}"
 
 
