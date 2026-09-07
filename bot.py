@@ -1717,7 +1717,7 @@ def recover_interrupted_runs() -> dict:
             step=record["next_step"],
             next_step=record["next_step"],
             tail_msgs=len(record["tail"]),
-            calls=len(record["executed_call_ids"]),
+            calls=len(record["announced_call_ids"]),
         )
         recovered += 1
     return {"recovered": recovered, "aborted": aborted}
@@ -2752,9 +2752,9 @@ async def on_message(message: discord.Message):
     outcome = RunOutcome()
     total_tools_executed = 0
     current_step = 0
-    # 이미 실행한 호출 식별자. 재시작 뒤 모델이 같은 호출을 다시 요청해도 부작용을
-    # 두 번 일으키지 않는다.
-    executed_call_ids = list(restored["executed_call_ids"]) if restored is not None else []
+    # 모델이 이미 알린 유효한 호출 식별자. 실행 전 거부된 호출도 포함해 재시작
+    # 뒤 같은 id가 다른 호출이나 완료 신호로 되살아나지 않게 한다.
+    announced_call_ids = list(restored["announced_call_ids"]) if restored is not None else []
     run_end_logged = False
     released = False
 
@@ -2843,7 +2843,7 @@ async def on_message(message: discord.Message):
             next_step=resume_from,
             same_origin=same_origin,
             tail_msgs=len(restored["tail"]),
-            calls=len(executed_call_ids),
+            calls=len(announced_call_ids),
             summary_chars=len(restored["summary"]),
         )
         # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
@@ -2852,7 +2852,7 @@ async def on_message(message: discord.Message):
         try:
             await message.channel.send(
                 f"▶️ **[중단된 실행 재개]** run `{workspace.run_id}`을 Step {resume_from}에서 "
-                f"이어갑니다. 이미 실행한 도구 {len(executed_call_ids)}건은 다시 실행하지 않습니다."
+                f"이어갑니다. 이미 알린 도구 호출 {len(announced_call_ids)}건은 다시 받지 않습니다."
             )
         except Exception:
             pass
@@ -3006,7 +3006,7 @@ async def on_message(message: discord.Message):
                     "reason": token.reason or "",
                     "steering": lease["steering"].stats(),
                 },
-                executed_call_ids=executed_call_ids,
+                announced_call_ids=announced_call_ids,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -3018,7 +3018,7 @@ async def on_message(message: discord.Message):
                 reason=reason,
                 error=type(snapshot_error).__name__,
             )
-            return
+            return False
         log_session_event(
             workspace,
             "snapshot",
@@ -3027,8 +3027,9 @@ async def on_message(message: discord.Message):
             next_step=next_step,
             tail_msgs=len(tail),
             summary_chars=len(rolling_summary),
-            calls=len(executed_call_ids),
+            calls=len(announced_call_ids),
         )
+        return True
 
     # 여기부터 에이전트 루프가 보장되므로 지시를 받는다. 직접 답변 런은 이 지점에
     # 오지 않으므로 큐가 닫힌 상태로 남고, 반영할 스텝이 없다는 사실이 접수
@@ -3382,13 +3383,56 @@ async def on_message(message: discord.Message):
                     final_raw = direct_text
                     break
 
+            # 모든 모델 호출은 완료 여부와 무관하게 같은 identity 규칙을 지난다.
+            # 유효한 첫 id는 다른 검사를 통과하지 못해도 즉시 런 전체에 예약한다.
+            announced_before = len(announced_call_ids)
+            batch_call_ids = set()
+            for tc in tool_calls_to_run:
+                call_id = tc["id"]
+                if not isinstance(call_id, str) or not call_id:
+                    tc["identity_error"] = json.dumps(
+                        {
+                            "error": "invalid_tool_call_id",
+                            "reason": "missing_or_non_string",
+                            "tool": tc["name"],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    continue
+                if call_id in batch_call_ids:
+                    tc["identity_error"] = _blocked_tool_result(
+                        "same_batch_duplicate_id", tc["name"], 1, 1
+                    )
+                    continue
+                batch_call_ids.add(call_id)
+                if call_id in announced_call_ids:
+                    tc["identity_error"] = _blocked_tool_result(
+                        "already_announced", tc["name"], 1, 1
+                    )
+                    continue
+                announced_call_ids.append(call_id)
+                tc["identity_error"] = None
+
+            if (
+                len(announced_call_ids) != announced_before
+                and not save_snapshot(iteration + 1, "tool_call_ids")
+            ):
+                outcome.settle(
+                    outcome_mod.FAILED, "도구 호출 식별자 저장 실패"
+                )
+                break
+
             # [finish_task = 유일한 구조화된 완료 신호]
             # 동반 도구 호출 정책: finish_task와 같은 응답에 온 다른 도구 호출은
             # 실행하지 않는다. 완료 판단 이후에 부작용을 남기지 않기 위한 것이고,
             # 무엇이 거부되었는지는 로그와 최종 메시지에 남긴다.
             finish_calls = [
                 tc for tc in tool_calls_to_run
-                if tc["name"] == "finish_task" and tc["argument_error"] is None
+                if tc["name"] == "finish_task"
+                and tc["identity_error"] is None
+                and tc["argument_error"] is None
             ]
             if finish_calls:
                 final_completed_report = finish_calls[0]["arguments"].get("report", "")
@@ -3438,43 +3482,17 @@ async def on_message(message: discord.Message):
                     settle_stage_failure(stage_error)
                     break
 
-                batch_call_ids = set()
                 batch_signatures = set()
                 allowed_calls = []
                 allowed_indexes = []
                 allowed_signatures = []
                 merged_results = [None] * len(tool_calls_to_run)
                 for call_index, tc in enumerate(tool_calls_to_run):
-                    call_id = tc["id"]
-                    if not isinstance(call_id, str) or not call_id:
-                        merged_results[call_index] = json.dumps(
-                            {
-                                "error": "invalid_tool_call_id",
-                                "reason": "missing_or_non_string",
-                                "tool": tc["name"],
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
+                    if tc["identity_error"] is not None:
+                        merged_results[call_index] = tc["identity_error"]
                         continue
-                    if call_id in batch_call_ids:
-                        merged_results[call_index] = _blocked_tool_result(
-                            "same_batch_duplicate_id", tc["name"], 1, 1
-                        )
-                        continue
-                    # 첫 등장을 먼저 예약해야 그 호출이 다른 검사를 통과하지 못해도
-                    # 같은 응답의 뒤쪽 호출이 그 id로 부작용을 만들지 않는다.
-                    batch_call_ids.add(call_id)
                     if tc["argument_error"] is not None:
                         merged_results[call_index] = tc["argument_error"]
-                        continue
-                    if call_id in executed_call_ids:
-                        # 재시작 이전에 이미 실행한 호출이다. 다시 보내면 같은
-                        # 부작용이 두 번 일어난다.
-                        merged_results[call_index] = _blocked_tool_result(
-                            "already_executed", tc["name"], 1, 1
-                        )
                         continue
                     signature = (
                         tc["name"],
@@ -3518,9 +3536,6 @@ async def on_message(message: discord.Message):
                     allowed_calls.append(tc)
                     allowed_indexes.append(call_index)
                     allowed_signatures.append(signature)
-                    # 승인된 id를 실행 전에 기록하는 기존 재시작 중복 방지 정책은
-                    # 유지한다.
-                    executed_call_ids.append(call_id)
                     if (
                         last_failed_signature is not None
                         and signature != last_failed_signature
