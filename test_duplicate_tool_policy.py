@@ -13,6 +13,7 @@ from unittest.mock import patch
 from test_support import FakeMessage, TEST_USER_ID, run_catalog_patch
 
 import bot
+import trajectory
 
 
 CHANNEL_ID = 987654800
@@ -1170,6 +1171,44 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("현재까지 실행: `0개`", live_status)
         self.assertIn("요청 도구", live_status)
         self.assertNotIn("총 도구: `101개`", live_status)
+
+    # Mutation caught: recording before merged_results is complete loses blocked
+    # calls or writes None, while recording only allowed calls hides the harness
+    # decisions that explain why a path was not executed.
+    async def test_completed_tool_group_is_appended_to_the_trajectory_once(self):
+        captured = []
+        real_append = trajectory.append_tool_group
+
+        def recording_append(workspace, step, calls, results, executed_ids):
+            captured.append({
+                "step": step,
+                "calls": [dict(call) for call in calls],
+                "results": list(results),
+                "executed_ids": set(executed_ids),
+            })
+            return real_append(workspace, step, calls, results, executed_ids)
+
+        with patch.object(bot.trajectory, "append_tool_group", recording_append):
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call("trail-1", "bash_exec", {"command": "printf trail"}),
+                    _tool_call("trail-2", "bash_exec", {"command": "printf trail"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(len(captured), 1)
+        group = captured[0]
+        self.assertEqual(group["step"], 1)
+        self.assertEqual([call["id"] for call in group["calls"]], ["trail-1", "trail-2"])
+        self.assertEqual(group["executed_ids"], {"trail-1"})
+        self.assertTrue(all(isinstance(result, str) for result in group["results"]))
+        blocked = json.loads(group["results"][1])
+        self.assertEqual(blocked["reason"], "same_batch_duplicate")
+        self.assertFalse(group["calls"][0]["failed"])
+        self.assertFalse(group["calls"][1]["failed"])
 
 
 if __name__ == "__main__":

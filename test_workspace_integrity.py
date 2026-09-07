@@ -652,8 +652,20 @@ class ToolIntegrationTest(WorkspaceTestCase):
         self.assertEqual(result, ["ok"])
         bash.assert_awaited_once_with(workspace, "true")
 
+        bot.trajectory.append_tool_group(
+            workspace,
+            1,
+            [{
+                "id": "rollover-source",
+                "name": "bash_exec",
+                "arguments": {"command": "python3 skills/run_only.py"},
+                "failed": True,
+            }],
+            ["[stderr]\nprobe blocked\n[exit code: 1]"],
+            {"rollover-source"},
+        )
         messages = [{"role": "system", "content": prompt}]
-        for index in range(10):
+        for index in range(11):
             messages.extend([
                 {
                     "role": "assistant",
@@ -672,7 +684,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
                 },
             ])
         summary_response = SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(content="rolled summary")
+            message=SimpleNamespace(content="- Step 1-1: rolled summary")
         )])
         with patch.object(
             bot, "run_completion_stage", AsyncMock(return_value=summary_response)
@@ -681,10 +693,10 @@ class ToolIntegrationTest(WorkspaceTestCase):
                 workspace,
                 messages,
                 "",
-                10,
+                40,
             )
-        self.assertIn(bot.MILESTONES_SECTION_HEADER, summary)
-        self.assertIn(bot.RECENT_PHASE_SECTION_HEADER, summary)
+        self.assertIn(bot.TIER3_SECTION_HEADER, summary)
+        self.assertIn(bot.TIER2_SECTION_HEADER, summary)
         self.assertIn("rolled summary", summary)
         self.assertIn("skills/run_only.py", summary)
         self.assertIn(str(workspace.root), bot._msg_content(rolled[0]))

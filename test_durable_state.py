@@ -96,11 +96,9 @@ class ModelStub:
         self.calls.append((kind, messages))
 
         if kind == "rollover":
-            return _response(content=bot.format_hierarchical_summary(
-                milestones=["• 구간 (Step 1-1): A 경로 실험 완료"],
-                recent_summary=f"{ROLLED_MARK} 최근 구간 상세 요약",
-                discoveries=["- 참조/산출물: `findings.md`"],
-            ))
+            return _response(
+                content=f"- Step 1-10: {ROLLED_MARK} 인증 경로 절차를 완료함."
+            )
         if kind == "checkpoint":
             if self.checkpoint_error is not None:
                 raise self.checkpoint_error
@@ -671,8 +669,8 @@ class RolloverBoundaryTest(DurableStateTestCase):
         # produced along with the tail it was replaced by.
         _catalog, record = await self._crash_after_rollover()
 
-        self.assertIn(ROLLED_MARK, record["summary"])
-        self.assertIn(bot.MILESTONES_SECTION_HEADER, record["summary"])
+        self.assertIn(bot.TIER3_SECTION_HEADER, record["summary"])
+        self.assertIn(bot.TIER2_SECTION_HEADER, record["summary"])
         self.assertEqual(record["next_step"], 3)
         self.assertTrue(record["tail"])
         self.assertIn("collect.sh", json.dumps(record["tail"], ensure_ascii=False))
@@ -682,18 +680,19 @@ class RolloverBoundaryTest(DurableStateTestCase):
         # local only, so every rollover summary is discarded at function exit and
         # even the next message in the same process starts from the stale one.
         await self._crash_after_rollover()
-        self.assertIn(ROLLED_MARK, bot.channel_summary[CHANNEL_ID])
+        self.assertIn(bot.TIER3_SECTION_HEADER, bot.channel_summary[CHANNEL_ID])
 
 
 class HistoryOverflowTest(DurableStateTestCase):
     async def test_3_history_overflow_merges_instead_of_clobbering_the_summary(self):
         # Production mutation caught: replacing channel_summary with plain chat
-        # snippets on overflow, which destroys a restored hierarchical summary
-        # and the state markers embedded in it on the first long conversation.
-        seeded = bot.update_hierarchical_summary(
-            existing_summary="",
-            new_recent_summary="H_A=rejected@v2 를 확인한 구간",
-            step_range="Step 1-10",
+        # snippets on overflow destroys the procedural summary on the first long
+        # conversation after a restore.
+        seeded = bot.format_tiered_summary(
+            tier3="- Step 1-10: 인증 경로 시도를 완료함.",
+            tier3_through=10,
+            tier2_lines=[],
+            discoveries=[],
         )
         bot.channel_summary[CHANNEL_ID] = seeded
         bot.channel_history[CHANNEL_ID] = [
@@ -706,9 +705,10 @@ class HistoryOverflowTest(DurableStateTestCase):
             [_response(tool_calls=[_tool_call("c1", "finish_task", {"report": LONG_REPORT})])],
         )
 
-        merged = bot.channel_summary[CHANNEL_ID]
-        self.assertIn("H_A=rejected@v2", merged)
-        self.assertIn("이전 대화 요약", merged)
+        parsed = bot.parse_tiered_summary(bot.channel_summary[CHANNEL_ID])
+        self.assertIn("인증 경로 시도", parsed["tier3"])
+        self.assertIn("이전 대화 요약", parsed["tier3"])
+        self.assertEqual(parsed["tier3_through"], 10)
 
 
 class InterimReportNamingTest(DurableStateTestCase):

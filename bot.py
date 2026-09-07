@@ -30,6 +30,7 @@ import outcome as outcome_mod
 import run_state
 import session_log
 import steering as steering_mod
+import trajectory
 from deadlines import (
     CancelToken,
     RunCancelled,
@@ -101,6 +102,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `read_file(path)`: 파일 읽기
   - `write_file(path, content, expected_revision)`: 파일 생성 및 덮어쓰기
   - `web_search(query)`: DuckDuckGo 웹 검색
+  - `lookup_trajectory(step, call_id)`: 롤링 컨텍스트에서 빠진 과거 스텝의 도구·인자·결과 조회
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
 - 루트 `plan.md`와 `findings.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`와 `findings.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
@@ -239,6 +241,28 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_trajectory",
+            "description": "롤링 컨텍스트에서 빠진 과거 스텝의 불변 실행 기록(도구, 인자, 결과)을 traj.jsonl에서 조회합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "step": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "조회할 과거 Step 번호"
+                    },
+                    "call_id": {
+                        "type": "string",
+                        "description": "선택 사항: 한 스텝의 특정 tool_call_id만 조회"
+                    }
+                },
+                "required": ["step"]
             }
         }
     },
@@ -522,7 +546,7 @@ def _invalid_tool_arguments_result(reason: str, tool_name: str) -> str:
 
 
 def _tool_result_failed(tool_name: str, result: str) -> bool:
-    if tool_name in ("read_file", "write_file"):
+    if tool_name in ("read_file", "write_file", "lookup_trajectory"):
         try:
             envelope = json.loads(result)
         except (TypeError, ValueError):
@@ -542,8 +566,7 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
 
 
 ROLLING_COMPACTION_INTERVAL = 10
-KEEP_RECENT_TOOL_MESSAGES = 8
-ROLLING_SUMMARY_SOURCE_MAX_CHARS = 24000
+KEEP_RECENT_TOOL_MESSAGES = 10
 ROLLING_SUMMARY_MAX_CHARS = 10000
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
 
@@ -731,6 +754,20 @@ async def tool_web_search(query: str) -> str:
     except Exception as e:
         return f"[Error: worker_unavailable ({type(e).__name__})]"
 
+
+async def tool_lookup_trajectory(workspace, step, call_id="") -> str:
+    try:
+        result = trajectory.lookup(workspace, step, call_id)
+    except (OSError, ValueError) as error:
+        result = {
+            "status": "error",
+            "step": step,
+            "call_id": str(call_id or ""),
+            "error": type(error).__name__,
+        }
+    return _workspace_result(result)
+
+
 async def tool_record_state(ledger, updates) -> str:
     if ledger is None:
         return "[Error: 이 실행에는 상태 원장이 연결되어 있지 않습니다]"
@@ -780,6 +817,10 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
         elif name == "web_search":
             q = args.get("query", "")
             return await tool_web_search(q)
+        elif name == "lookup_trajectory":
+            return await tool_lookup_trajectory(
+                workspace, args.get("step"), args.get("call_id", "")
+            )
         elif name == "record_state":
             return await tool_record_state(ledger, args)
         elif name == "finish_task":
@@ -1220,112 +1261,139 @@ def render_skills_block(workspace) -> str:
 
 # --- Hierarchical Trajectory & Multi-level Compaction ---
 
-MILESTONES_SECTION_HEADER = "## 🏛️ 장기 마일스톤 색인"
-RECENT_PHASE_SECTION_HEADER = "## 🔍 직전 구간 상세 요약"
+TIER3_SECTION_HEADER = "## 🗺️ 장기 절차 요약 (Tier 3)"
+TIER2_SECTION_HEADER = "## 🧭 중기 스텝 인덱스 (Tier 2)"
 ARTIFACTS_SECTION_HEADER = "## 📁 핵심 발견 및 산출물 색인"
+TIER3_AUTHORITY_NOTICE = (
+    "> 절차적 시도·차단 원인·대안만 기록합니다. 목표·사실·결론·가설 상태는 "
+    "마지막 [권위 있는 조사 상태] 블록만 신뢰하세요."
+)
+_TIER3_RANGE_PREFIX = "적용 범위: Step 1-"
+_TIER3_EMPTY = "(아직 장기 절차 이력 없음)"
+_TIER2_EMPTY = "(아직 중기 스텝 인덱스 없음)"
+_TIER3_MAX_CHARS = 2000
+_TIER2_MAX_LINES = 20
+_DISCOVERY_MAX_LINES = 10
 
 
-def format_hierarchical_summary(
-    milestones: list = None,
-    recent_summary: str = "",
+def format_tiered_summary(
+    tier3: str = "",
+    tier3_through: int = 0,
+    tier2_lines: list = None,
     discoveries: list = None,
 ) -> str:
-    sections = []
-    milestone_lines = [str(m).strip() for m in (milestones or []) if str(m).strip()]
-    milestone_content = "\n".join(milestone_lines) if milestone_lines else "(초기 탐색 단계 - 이전 마일스톤 없음)"
-    sections.append(f"{MILESTONES_SECTION_HEADER}\n{milestone_content}")
+    try:
+        tier3_through = max(0, int(tier3_through))
+    except (TypeError, ValueError):
+        tier3_through = 0
 
-    recent_text = str(recent_summary or "").strip()
-    sections.append(f"{RECENT_PHASE_SECTION_HEADER}\n{recent_text or '(진행 중인 세부 작업 없음)'}")
-
-    discovery_lines = [str(d).strip() for d in (discoveries or []) if str(d).strip()]
+    tier3_text = _clip_summary_text(tier3, _TIER3_MAX_CHARS) or _TIER3_EMPTY
+    tier2 = [
+        _clip_summary_text(line, trajectory.MICRO_LINE_MAX_CHARS)
+        for line in (tier2_lines or [])
+        if str(line or "").strip()
+    ][:_TIER2_MAX_LINES]
+    discovery_lines = [
+        _clip_summary_text(item, 140)
+        for item in (discoveries or [])
+        if str(item or "").strip()
+    ][:_DISCOVERY_MAX_LINES]
+    coverage = (
+        f"{_TIER3_RANGE_PREFIX}{tier3_through}"
+        if tier3_through
+        else "적용 범위: 없음"
+    )
+    sections = [
+        f"{TIER3_SECTION_HEADER}\n{TIER3_AUTHORITY_NOTICE}\n{coverage}\n{tier3_text}",
+        f"{TIER2_SECTION_HEADER}\n" + ("\n".join(tier2) if tier2 else _TIER2_EMPTY),
+    ]
     if discovery_lines:
         sections.append(f"{ARTIFACTS_SECTION_HEADER}\n" + "\n".join(discovery_lines))
-
     return "\n\n".join(sections)
 
 
-def parse_hierarchical_summary(text: str) -> dict:
+def parse_tiered_summary(text: str) -> dict:
+    empty = {"tier3": "", "tier3_through": 0, "tier2": [], "discoveries": []}
     text = str(text or "").strip()
-    if not text:
-        return {"milestones": [], "recent_summary": "", "discoveries": []}
+    if TIER3_SECTION_HEADER not in text or TIER2_SECTION_HEADER not in text:
+        return empty
 
-    milestones = []
-    recent_summary = ""
-    discoveries = []
-
-    if MILESTONES_SECTION_HEADER not in text and RECENT_PHASE_SECTION_HEADER not in text:
-        return {"milestones": [], "recent_summary": text, "discoveries": []}
-
-    curr_section = None
-    curr_lines = []
-
+    sections = {"tier3": [], "tier2": [], "discoveries": []}
+    current = None
+    tier3_through = 0
     for line in text.splitlines():
         trimmed = line.strip()
-        if trimmed.startswith(MILESTONES_SECTION_HEADER):
-            if curr_section == "recent":
-                recent_summary = "\n".join(curr_lines).strip()
-            elif curr_section == "artifacts":
-                discoveries.extend([l for l in curr_lines if l.strip()])
-            curr_section = "milestones"
-            curr_lines = []
-        elif trimmed.startswith(RECENT_PHASE_SECTION_HEADER):
-            if curr_section == "milestones":
-                milestones.extend([l for l in curr_lines if l.strip() and not l.strip().startswith("(초기")])
-            elif curr_section == "artifacts":
-                discoveries.extend([l for l in curr_lines if l.strip()])
-            curr_section = "recent"
-            curr_lines = []
-        elif trimmed.startswith(ARTIFACTS_SECTION_HEADER):
-            if curr_section == "milestones":
-                milestones.extend([l for l in curr_lines if l.strip() and not l.strip().startswith("(초기")])
-            elif curr_section == "recent":
-                recent_summary = "\n".join(curr_lines).strip()
-            curr_section = "artifacts"
-            curr_lines = []
-        else:
-            curr_lines.append(line)
-
-    if curr_section == "milestones":
-        milestones.extend([l for l in curr_lines if l.strip() and not l.strip().startswith("(초기")])
-    elif curr_section == "recent":
-        recent_summary = "\n".join(curr_lines).strip()
-    elif curr_section == "artifacts":
-        discoveries.extend([l for l in curr_lines if l.strip()])
+        if trimmed == TIER3_SECTION_HEADER:
+            current = "tier3"
+            continue
+        if trimmed == TIER2_SECTION_HEADER:
+            current = "tier2"
+            continue
+        if trimmed == ARTIFACTS_SECTION_HEADER:
+            current = "discoveries"
+            continue
+        if current == "tier3":
+            if trimmed == TIER3_AUTHORITY_NOTICE or trimmed == _TIER3_EMPTY:
+                continue
+            if trimmed.startswith(_TIER3_RANGE_PREFIX):
+                try:
+                    tier3_through = max(0, int(trimmed[len(_TIER3_RANGE_PREFIX):]))
+                except ValueError:
+                    tier3_through = 0
+                continue
+            if trimmed == "적용 범위: 없음":
+                continue
+        if current and trimmed:
+            if current == "tier2" and trimmed == _TIER2_EMPTY:
+                continue
+            sections[current].append(line.strip())
 
     return {
-        "milestones": milestones,
-        "recent_summary": recent_summary,
-        "discoveries": discoveries,
+        "tier3": "\n".join(sections["tier3"]).strip(),
+        "tier3_through": tier3_through,
+        "tier2": sections["tier2"],
+        "discoveries": sections["discoveries"],
     }
 
 
-def update_hierarchical_summary(
-    existing_summary: str,
-    new_recent_summary: str,
-    step_range: str = "",
-    discoveries: list = None,
-) -> str:
-    parsed = parse_hierarchical_summary(existing_summary)
-    old_milestones = list(parsed["milestones"])
-    old_recent = parsed["recent_summary"].strip()
-
-    if old_recent and not old_recent.startswith("(진행") and not old_recent.startswith("(초기"):
-        condensed = _clip_summary_text(old_recent.replace("\n", " "), 250)
-        prefix = f"• 구간 ({step_range}): " if step_range else "• 이전 구간: "
-        if not any(condensed in m for m in old_milestones):
-            old_milestones.append(f"{prefix}{condensed}")
-
-    merged_discoveries = list(parsed["discoveries"])
-    for d in (discoveries or []):
-        if d not in merged_discoveries:
-            merged_discoveries.append(d)
-
-    return format_hierarchical_summary(
-        milestones=old_milestones,
-        recent_summary=new_recent_summary,
-        discoveries=merged_discoveries,
+def merge_tier3_procedure(existing_summary: str, note: str) -> str:
+    parsed = parse_tiered_summary(existing_summary)
+    tier3 = parsed["tier3"]
+    note = str(note or "").strip()
+    if note and note not in tier3:
+        tier3 = "\n".join(part for part in (tier3, note) if part)
+    return format_tiered_summary(
+        tier3=tier3,
+        tier3_through=parsed["tier3_through"],
+        tier2_lines=parsed["tier2"],
+        discoveries=parsed["discoveries"],
     )
+
+
+def _deterministic_tier3_fallback(source: str, start_step: int, end_step: int) -> str:
+    groups = {}
+    for line in str(source or "").splitlines():
+        match = re.match(r"^\[Step (\d+)\]\s*(.*)$", line.strip())
+        if not match:
+            continue
+        step = int(match.group(1))
+        bucket = (step - 1) // 10
+        groups.setdefault(bucket, []).append((step, match.group(2).strip()))
+
+    rendered = []
+    for records in groups.values():
+        first_step = records[0][0]
+        last_step = records[-1][0]
+        detail = " | ".join(item for _, item in records)
+        rendered.append(
+            _clip_summary_text(f"- Step {first_step}-{last_step}: {detail}", 600)
+        )
+    if rendered:
+        return "\n".join(rendered)
+    compact = " ".join(str(source or "").split())
+    if not compact:
+        return ""
+    return _clip_summary_text(f"- Step {start_step}-{end_step}: {compact}", 600)
 
 
 def extract_discovered_artifacts(text: str, workspace) -> list:
@@ -1389,37 +1457,31 @@ def parse_state_update_blocks(text: str):
     return updates, cleaned.strip()
 
 
-def missing_state_markers(text: str, markers) -> list:
-    text = str(text or "")
-    return [marker for marker in markers or [] if marker not in text]
-
-
-def build_rollup_source(messages: list, max_chars: int = ROLLING_SUMMARY_SOURCE_MAX_CHARS) -> str:
-    """Create a bounded, chronological source for the LLM-generated rollup.
-
-    The budget is spent newest-first and the blocks are re-ordered afterwards.
-    Oldest material is already covered by the cumulative summary, so filling
-    oldest-first would drop the newest refutation - the one thing the summary
-    does not yet know about.
-    """
+def build_report_source(messages: list, max_chars: int = 24000) -> str:
+    """Render a bounded newest-first message source for user-facing reports."""
     blocks = []
     used = 0
-
     for msg in reversed(messages):
         role = _msg_role(msg)
         if role == "system":
             continue
-
         if role == "assistant" and _msg_tool_calls(msg):
-            calls = ", ".join(_tool_call_summary(call) for call in _msg_tool_calls(msg))
-            block = f"[assistant 도구 지시]\n{calls}\n{_clip_summary_text(_msg_content(msg), 500)}"
+            calls = ", ".join(
+                _tool_call_summary(call) for call in _msg_tool_calls(msg)
+            )
+            block = (
+                f"[assistant 도구 지시]\n{calls}\n"
+                f"{_clip_summary_text(_msg_content(msg), 500)}"
+            )
         elif role == "tool":
-            block = f"[tool: {_msg_name(msg)}]\n{_clip_summary_text(_msg_content(msg), 1400)}"
+            block = (
+                f"[tool: {_msg_name(msg)}]\n"
+                f"{_clip_summary_text(_msg_content(msg), 1400)}"
+            )
         elif role == "user":
             block = f"[user]\n{_clip_summary_text(_msg_content(msg), 1200)}"
         else:
             block = f"[{role}]\n{_clip_summary_text(_msg_content(msg), 800)}"
-
         if not block.strip():
             continue
         remaining = max_chars - used
@@ -1429,9 +1491,9 @@ def build_rollup_source(messages: list, max_chars: int = ROLLING_SUMMARY_SOURCE_
             block = _clip_summary_text(block, remaining)
         blocks.append(block)
         used += len(block) + 2
-
     blocks.reverse()
     return "\n\n".join(blocks)
+
 
 def split_recent_agent_context(messages: list, keep_recent_tool_messages: int = None):
     """Split at a complete assistant-tool group so tool_call_ids stay valid."""
@@ -1594,126 +1656,107 @@ def recover_interrupted_runs() -> dict:
 
 
 async def rollover_agent_context(workspace, messages: list, existing_summary: str, step_num: int, ledger=None, token=None):
-    """Summarize old steps and replace the live payload with a bounded tail."""
+    """Replace an old complete prefix with trajectory-backed Tier 2 and Tier 3."""
     if token is not None:
         token.raise_if_cancelled()
-    old_messages, recent_messages = split_recent_agent_context(messages)
+    _old_messages, recent_messages = split_recent_agent_context(messages)
     if not recent_messages:
         return messages, existing_summary
 
-    source = build_rollup_source(old_messages)
-    if not source.strip() or source.strip() in (existing_summary or ""):
-        # Nothing new to fold in. Asking the model to rewrite the summary from
-        # material it already covers is how a summary silently reverts to an
-        # older state, so record a no-op instead.
-        log_session_event(workspace, "rollover_skipped", step=step_num, reason="no_new_source")
-        return messages, existing_summary
+    parsed = parse_tiered_summary(existing_summary)
+    tier2_start = max(1, step_num - 29)
+    tier2_end = step_num - 10
+    tier2_lines = trajectory.micro_index(workspace, tier2_start, tier2_end)
 
-    state_block = ledger.render() if ledger is not None else ""
-    required_markers = ledger.state_markers() if ledger is not None else []
-    marker_hint = ""
-    if required_markers:
-        marker_hint = (
-            "다음 상태 마커는 요약에 반드시 문자 그대로 남기고, 상태를 과거로 되돌리지 마세요: "
-            + ", ".join(required_markers)
-            + "\n"
-        )
-
-    start_step = max(1, step_num - ROLLING_COMPACTION_INTERVAL + 1)
-    step_range = f"Step {start_step}-{step_num}"
-    discoveries = extract_discovered_artifacts(
-        source + "\n" + (existing_summary or ""), workspace
-    )
-
-    summary_prompt = (
-        "이것은 장시간 자율 에이전트의 다단계 계층형 컨텍스트 압축 작업입니다.\n"
-        "이전 원본 대화를 그대로 반복하지 말고, 다음 에이전트가 작업을 이어갈 수 있도록 "
-        "아래 3개 섹션 구조로 명확하게 작성하세요:\n\n"
-        f"1. `{MILESTONES_SECTION_HEADER}`: 이전 구간들의 핵심 결정, 반증된 가설, 주요 마일스톤을 간결한 불릿 포인트(•)로 요약\n"
-        f"2. `{RECENT_PHASE_SECTION_HEADER}`: 이번 구간({step_range})의 구체적인 도구 실행 결과, 확인된 사실/수치/에러, 다음 할 일 상세 기술\n"
-        f"3. `{ARTIFACTS_SECTION_HEADER}`: 생성/수정한 파일(`plan.md`, `findings.md`, `skills/...`), 확인한 URL, 주요 명령어 목록\n\n"
-        "반드시 포함할 것: 원래 사용자 목표, 완료한 작업, 확인된 사실/수치/URL/파일 경로, "
-        "실패와 원인, 반증된 가설과 그 근거, 무효가 된 결론, 아직 검증하지 않은 가정, "
-        "다음에 해야 할 구체적인 작업.\n"
-        f"{marker_hint}"
-        "도구 결과가 불확실하면 추측하지 말고 불확실하다고 표시하세요. "
-        "한국어 마크다운으로 10,000자 이내로 작성하고 요약 외의 인사말은 쓰지 마세요.\n\n"
-        + (f"{state_block}\n\n" if state_block else "")
-        + f"[기존 누적 요약]\n{_clip_summary_text(existing_summary, ROLLING_SUMMARY_MAX_CHARS)}\n\n"
-        + f"[이번 구간의 원본 실행 기록]\n{source}"
-    )
-
-    new_summary = ""
-    validation_notes_prefix = ""
-    try:
-        summary_resp = await run_completion_stage(
-            token=token,
-            stage="rollover",
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "당신은 자율 에이전트의 정확한 컨텍스트 압축기입니다."},
-                {"role": "user", "content": summary_prompt},
-            ],
-            max_tokens=1536,
-            temperature=0.2,
-            reasoning_effort="none",
-        )
-        new_summary = (summary_resp.choices[0].message.content or "").strip()
-        new_summary = re.sub(r"<think>.*?</think>", "", new_summary, flags=re.DOTALL).strip()
-    except RunCancelled:
-        # Cancellation must not silently degrade into a fallback summary.
-        raise
-    except StageTimeout as compaction_timeout:
-        # Rollover is an optimization: the original source is still available,
-        # so a bounded timeout can safely use deterministic local compaction.
-        validation_notes_prefix = str(compaction_timeout)
-        log_session_event(
-            workspace, "rollover_timeout", step=step_num, stage=compaction_timeout.stage
-        )
-    except Exception as compaction_error:
-        log_session_event(
+    tier3_end = max(0, step_num - 30)
+    previous_through = parsed["tier3_through"]
+    source_start = previous_through + 1
+    source = ""
+    if source_start <= tier3_end:
+        source = trajectory.procedural_source(
             workspace,
-            "rollover_error",
-            step=step_num,
-            error=type(compaction_error).__name__,
+            tier3_end,
+            max_chars=ROLLING_SUMMARY_MAX_CHARS,
+            start_step=source_start,
         )
 
-    validation_notes = [validation_notes_prefix] if validation_notes_prefix else []
-    if new_summary and existing_summary and new_summary == existing_summary.strip():
-        # The source had new content but the compactor echoed the old summary.
-        # Accepting it would freeze the state at its previous revision.
-        validation_notes.append("압축기가 기존 요약을 그대로 반환하여 거부했습니다.")
-        new_summary = ""
+    discoveries = list(parsed["discoveries"])
+    discovered_now = extract_discovered_artifacts(
+        "\n".join(part for part in (source, *tier2_lines) if part), workspace
+    )
+    for item in discovered_now:
+        if item not in discoveries:
+            discoveries.append(item)
 
-    if not new_summary:
-        new_summary = update_hierarchical_summary(
-            existing_summary=existing_summary,
-            new_recent_summary=source,
-            step_range=step_range,
-            discoveries=discoveries,
+    new_procedure = ""
+    validation_notes = []
+    if source:
+        summary_prompt = (
+            "아래 실행 기록을 절차 이력으로만 압축하세요. 시도한 방법, 실패·차단 원인, "
+            "그 뒤 선택한 대안만 시간순 불릿으로 작성하세요. 사용자 목표, 확인된 사실, "
+            "결론, 가설 또는 가설 상태를 쓰지 마세요. 원문에 없는 내용을 추측하지 말고, "
+            f"Step {source_start}-{tier3_end} 범위를 한국어 2,000자 이내로 작성하세요.\n\n"
+            f"[절차 실행 기록]\n{source}"
         )
-        validation_notes.append("결정적 폴백 계층 요약(기존 요약 + 원본 기록)을 사용했습니다.")
-    else:
-        if MILESTONES_SECTION_HEADER not in new_summary and RECENT_PHASE_SECTION_HEADER not in new_summary:
-            new_summary = update_hierarchical_summary(
-                existing_summary=existing_summary,
-                new_recent_summary=new_summary,
-                step_range=step_range,
-                discoveries=discoveries,
+        try:
+            summary_resp = await run_completion_stage(
+                token=token,
+                stage="rollover",
+                model=MODEL_NAME,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "당신은 자율 에이전트의 절차 전용 컨텍스트 압축기입니다.",
+                    },
+                    {"role": "user", "content": summary_prompt},
+                ],
+                max_tokens=768,
+                temperature=0.2,
+                reasoning_effort="none",
+            )
+            new_procedure = (summary_resp.choices[0].message.content or "").strip()
+            new_procedure = re.sub(
+                r"<think>.*?</think>", "", new_procedure, flags=re.DOTALL
+            ).strip()
+        except RunCancelled:
+            raise
+        except StageTimeout as compaction_timeout:
+            validation_notes.append(str(compaction_timeout))
+            log_session_event(
+                workspace,
+                "rollover_timeout",
+                step=step_num,
+                stage=compaction_timeout.stage,
+            )
+        except Exception as compaction_error:
+            log_session_event(
+                workspace,
+                "rollover_error",
+                step=step_num,
+                error=type(compaction_error).__name__,
             )
 
-    new_summary = _clip_summary_text(new_summary, ROLLING_SUMMARY_MAX_CHARS)
-    dropped_markers = missing_state_markers(new_summary, required_markers)
-    if dropped_markers:
-        validation_notes.append("누락된 상태 마커를 권위 있는 상태 블록으로 보정했습니다: " + ", ".join(dropped_markers))
-        new_summary = f"{state_block}\n\n{new_summary}".strip()
+        if not new_procedure:
+            new_procedure = _deterministic_tier3_fallback(
+                source, source_start, tier3_end
+            )
+            validation_notes.append("결정적 Tier 3 절차 폴백을 사용했습니다.")
 
-    # 400 Chat template error 완벽 방지: 단일 시스템 프롬프트로 병합
+    tier3 = parsed["tier3"]
+    if new_procedure and new_procedure not in tier3:
+        tier3 = "\n".join(part for part in (tier3, new_procedure) if part)
+    new_summary = format_tiered_summary(
+        tier3=tier3,
+        tier3_through=max(previous_through, tier3_end),
+        tier2_lines=tier2_lines,
+        discoveries=discoveries,
+    )
+
     replaced_messages = [
         {"role": "system", "content": build_system_content(workspace, ledger, new_summary)},
         {
             "role": "user",
-            "content": "[롤링 컨텍스트 재개] 위 요약과 권위 있는 조사 상태를 기준으로 최근 도구 실행 결과를 반영하고 다음 작업을 계속하세요.",
+            "content": "[롤링 컨텍스트 재개] 위 절차 요약과 권위 있는 조사 상태를 기준으로 최근 도구 실행 결과를 반영하고 다음 작업을 계속하세요.",
         },
     ]
     replaced_messages.extend(recent_messages)
@@ -1733,8 +1776,6 @@ async def rollover_agent_context(workspace, messages: list, existing_summary: st
         summary_chars=len(new_summary),
         validation="; ".join(validation_notes) if validation_notes else "pass",
     )
-    # 압축된 요약 본문은 명시적 opt-in 싱크에만 남는다. 기본 배포에서는 이 줄이
-    # 아무것도 쓰지 않는다.
     log_content_debug(workspace, "rollover_summary", new_summary, step=step_num)
     return replaced_messages, new_summary
 
@@ -2088,7 +2129,7 @@ def build_incomplete_report(outcome, ledger, rolling_summary: str, messages_payl
     repeat the very hang that ended the run. Keep this deterministic and bounded.
     """
     state = ledger.render() if ledger is not None else ""
-    tail = build_rollup_source(messages_payload, max_chars=6000)
+    tail = build_report_source(messages_payload, max_chars=6000)
     if outcome.is_completed:
         closing_section = (
             "## 결과 안내\n조사는 완료되었습니다. "
@@ -2738,12 +2779,10 @@ async def on_message(message: discord.Message):
             role_label = "사용자" if msg_item["role"] == "user" else "AI"
             snippet = msg_item["content"][:150].replace("\n", " ")
             summary_snippets.append(f"{role_label}: {snippet}")
-        # 병합이지 교체가 아니다. 예전의 `=`는 계층 요약과 그 안에 실린 상태
-        # 마커를 스니펫으로 덮어써서, 복원한 요약이 첫 긴 대화에서 사라졌다.
-        channel_summary[message.channel.id] = update_hierarchical_summary(
-            existing_summary=channel_summary[message.channel.id],
-            new_recent_summary="이전 대화 요약: " + " | ".join(summary_snippets[-8:]),
-            step_range="대화 이력 초과분",
+        # 대화 초과분도 절차 메모로 병합하며 Tier 2와 범위 메타데이터는 유지한다.
+        channel_summary[message.channel.id] = merge_tier3_procedure(
+            channel_summary[message.channel.id],
+            "이전 대화 요약: " + " | ".join(summary_snippets[-8:]),
         )
         channel_history[message.channel.id] = recent_turns
         history = recent_turns
@@ -3441,9 +3480,12 @@ async def on_message(message: discord.Message):
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
 
-                for tc, tool_result in zip(tool_calls_to_run, merged_results):
+                for result_index, (tc, tool_result) in enumerate(
+                    zip(tool_calls_to_run, merged_results)
+                ):
                     if not isinstance(tool_result, str):
                         tool_result = TOOL_PAYLOAD_MISSING_RESULT
+                    merged_results[result_index] = tool_result
                     # 도구 결과 원문 대신 실패 여부와 규모만 남긴다. 명령 출력,
                     # 파일 내용, HTTP 응답이 이 줄로 들어오던 것을 끊는다.
                     log_session_event(
@@ -3464,6 +3506,35 @@ async def on_message(message: discord.Message):
                         "name": tc["name"],
                         "content": tool_result
                     })
+
+                trajectory_calls = [
+                    {
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "arguments": tc["arguments"] if isinstance(tc["arguments"], dict) else {},
+                        "failed": _tool_result_failed(tc["name"], tool_result),
+                    }
+                    for tc, tool_result in zip(tool_calls_to_run, merged_results)
+                ]
+                try:
+                    trajectory.append_tool_group(
+                        workspace,
+                        iteration + 1,
+                        trajectory_calls,
+                        merged_results,
+                        {tc["id"] for tc in allowed_calls},
+                    )
+                except (OSError, ValueError) as trajectory_error:
+                    # The canonical model/tool payload is already complete, so
+                    # trajectory persistence may degrade without killing the run.
+                    # Never put argument or result content in the system log.
+                    log_session_event(
+                        workspace,
+                        "trajectory_write_failed",
+                        step=iteration + 1,
+                        error=type(trajectory_error).__name__,
+                        count=len(trajectory_calls),
+                    )
 
                 # 도구 실행 중에 접수된 지시를 여기서 흡수한다. 다음 루프 머리까지
                 # 미루면 체크포인트 보고서와 롤오버 모델 단계를 모두 기다린다.
@@ -3502,7 +3573,7 @@ async def on_message(message: discord.Message):
                         "이 블록은 사용자에게 보이지 않고 상태에 반영됩니다. 정정할 것이 없으면 붙이지 마세요."
                     )
                     inter_state_block = ledger.render()
-                    inter_source = build_rollup_source(messages_payload[-16:])
+                    inter_source = build_report_source(messages_payload[-16:])
                     inter_context = "\n\n".join(
                         part for part in [
                             inter_state_block,
@@ -3730,10 +3801,10 @@ async def on_message(message: discord.Message):
                 "무효 결론을 현재 사실로 제시하지 마세요. 폐기된 방향은 왜 폐기되었는지 근거 증거와 함께 밝히세요."
             )
             # 롤오버 이후 누적 요약은 교체된 system 메시지 안에만 남는데
-            # build_rollup_source는 system을 건너뛴다. 그래서 상태 블록과 누적 요약을
+            # build_report_source는 system을 건너뛴다. 그래서 상태 블록과 누적 요약을
             # 최신 tail과 함께 명시적으로 넣는다.
             synth_state_block = ledger.render()
-            synth_source = build_rollup_source(messages_payload)
+            synth_source = build_report_source(messages_payload)
             synth_context = "\n\n".join(
                 part for part in [
                     synth_state_block,
