@@ -12,6 +12,7 @@ Integrated with:
 import os
 import sys
 import re
+import hashlib
 import json
 import time
 import asyncio
@@ -45,6 +46,7 @@ from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
 import tool_sandbox
+import workspace_io
 
 # Configuration is fully validated before any filesystem or network side effect.
 try:
@@ -585,7 +587,9 @@ ROLLING_COMPACTION_INTERVAL = 10
 KEEP_RECENT_TOOL_MESSAGES = 8
 ROLLING_SUMMARY_SOURCE_MAX_CHARS = 24000
 ROLLING_SUMMARY_MAX_CHARS = 10000
-DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
+# 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
+# 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
+DEFAULT_TOOL_OUTPUT_MAX_CHARS = workspace_io.DEFAULT_TOOL_OUTPUT_MAX_CHARS
 
 # Transport-level bounds. Application-level stage budgets live in deadlines.py;
 # these stop a request from hanging below the layer those budgets can see.
@@ -641,7 +645,136 @@ async def _auto_delete_notice(msg: discord.Message, delay: int = 6):
 
 # --- Tool Execution Functions ---
 
-async def tool_bash_exec(workspace, command: str) -> str:
+ARTIFACT_DIR_NAME = "artifacts"
+ARTIFACT_PREVIEW_LINES = 20
+ARTIFACT_PREVIEW_MAX_CHARS = 800
+# ponytail: 런당 산출물 예산을 디스크 한도의 1/8로 고정한다. 산출물은 런 루트
+# 안에 쌓이므로 bash 워커의 workspace_disk_limit 감시에 함께 잡히고, 예산이 없으면
+# 긴 출력이 이어질 때 뒤쪽 bash 호출이 굶는다. 실행별 조정이 필요해지면 설정
+# 값으로 승격한다.
+ARTIFACT_RUN_BYTE_BUDGET = TOOL_LIMITS["disk_bytes"] // 8
+
+
+def _artifact_name(call_id: str) -> str:
+    """호출 id의 전체 다이제스트를 대소문자 비의존 산출물 identity로 쓴다."""
+    digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
+    return f"out_.{digest}.log"
+
+
+def _artifact_usage(directory_descriptor) -> int:
+    # ponytail: 저장할 때마다 디렉터리를 훑는다(O(n)). 런당 산출물이 수백 개를
+    # 넘기면 워크스페이스에 누적 바이트 카운터를 두는 쪽으로 올린다.
+    total = 0
+    with os.scandir(directory_descriptor) as entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+    return total
+
+
+def _store_tool_artifact(workspace, call_id, text: str) -> Optional[str]:
+    """도구 출력 전문을 런 루트 안에 남기고 상대 경로를 돌려준다."""
+    data = text.encode("utf-8")
+    name = _artifact_name(call_id)
+    directory_descriptor = None
+    temporary = None
+    artifact_descriptor = None
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        root_descriptor = os.open(str(workspace.root), directory_flags)
+        try:
+            try:
+                os.mkdir(
+                    ARTIFACT_DIR_NAME,
+                    mode=session_log.DIR_MODE,
+                    dir_fd=root_descriptor,
+                )
+            except FileExistsError:
+                pass
+            directory_descriptor = os.open(
+                ARTIFACT_DIR_NAME,
+                directory_flags,
+                dir_fd=root_descriptor,
+            )
+        finally:
+            os.close(root_descriptor)
+
+        os.fchmod(directory_descriptor, session_log.DIR_MODE)
+        if (
+            _artifact_usage(directory_descriptor) + len(data)
+            > ARTIFACT_RUN_BYTE_BUDGET
+        ):
+            return None
+
+        temporary = ".{0}.{1}".format(name, os.urandom(16).hex())
+        artifact_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            session_log.FILE_MODE,
+            dir_fd=directory_descriptor,
+        )
+        os.fchmod(artifact_descriptor, session_log.FILE_MODE)
+        with os.fdopen(artifact_descriptor, "wb") as handle:
+            artifact_descriptor = None
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary = None
+    except (OSError, ValueError):
+        # 저장에 실패해도 도구 결과 자체는 살려야 한다. 여기서 예외를 올리면
+        # 호출자의 포괄 except가 종료 코드까지 지운 실패 문자열로 바꿔 버린다.
+        return None
+    finally:
+        if artifact_descriptor is not None:
+            try:
+                os.close(artifact_descriptor)
+            except OSError:
+                pass
+        if temporary is not None and directory_descriptor is not None:
+            try:
+                os.unlink(temporary, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
+    return f"{ARTIFACT_DIR_NAME}/{name}"
+
+
+def _encapsulate_tool_output(workspace, call_id, text: str) -> str:
+    """긴 출력을 잘라 버리는 대신 파일 경로와 앞부분 미리보기로 바꾼다.
+
+    결과 문자열 끝에 무엇이 와야 하는지는 호출자가 안다. 그래서 이 함수는 자체로
+    완결된 블록만 돌려주고 종료 표시 같은 꼬리를 붙이지 않는다.
+    """
+    if len(text) <= DEFAULT_TOOL_OUTPUT_MAX_CHARS:
+        return text
+    preview = "\n".join(text.split("\n")[:ARTIFACT_PREVIEW_LINES])
+    preview = preview[:ARTIFACT_PREVIEW_MAX_CHARS]
+    stored = _store_tool_artifact(workspace, call_id, text)
+    if stored is None:
+        return (
+            f"[출력 {len(text)}자: 이 런의 산출물 예산을 넘어 파일로 남기지 못했습니다."
+            f" 아래 미리보기가 남은 전부이므로 필요한 범위를 좁혀 다시 실행하세요.]\n"
+            f"{preview}"
+        )
+    return (
+        f"[출력 {len(text)}자 전문을 {stored}에 저장했습니다. 아래는 앞"
+        f" {ARTIFACT_PREVIEW_LINES}줄 미리보기입니다. 나머지는"
+        f" grep -n '패턴' {stored} 이나 python3로 직접 조회하세요.]\n"
+        f"{preview}"
+    )
+
+
+async def tool_bash_exec(workspace, command: str, call_id: str) -> str:
     try:
         result = await tool_sandbox.run_worker(
             workspace,
@@ -672,12 +805,7 @@ async def tool_bash_exec(workspace, command: str) -> str:
         if err_str:
             payload += f"[stderr]\n{strip_ansi(err_str)}\n"
 
-        if len(payload) > DEFAULT_TOOL_OUTPUT_MAX_CHARS:
-            payload = (
-                payload[:DEFAULT_TOOL_OUTPUT_MAX_CHARS]
-                + f"\n... [출력 결과가 너무 길어 {DEFAULT_TOOL_OUTPUT_MAX_CHARS}자로 잘렸습니다. 필요한 경우 grep이나 head/tail로 조회하세요.]"
-            )
-        payload = payload.strip()
+        payload = _encapsulate_tool_output(workspace, call_id, payload.strip())
         return f"{payload}\n[exit code: {code}]" if payload else f"[exit code: {code}]"
     except Exception as e:
         return f"[Error: worker_unavailable ({type(e).__name__})]"
@@ -878,7 +1006,7 @@ async def tool_record_playbook(workspace, rule_type, rule_content) -> str:
         })
 
 
-async def tool_web_search(query: str) -> str:
+async def tool_web_search(workspace, query: str, call_id: str) -> str:
     try:
         with tempfile.TemporaryDirectory(prefix=".tool-web-") as root:
             result = await tool_sandbox.run_worker(
@@ -904,7 +1032,9 @@ async def tool_web_search(query: str) -> str:
         formatted = []
         for i, r in enumerate(results, 1):
             formatted.append(f"{i}. [{r.get('title')}]({r.get('href')})\n   {r.get('body')}")
-        return "\n\n".join(formatted)
+        return _encapsulate_tool_output(
+            workspace, call_id, "\n\n".join(formatted)
+        )
     except Exception as e:
         return f"[Error: worker_unavailable ({type(e).__name__})]"
 
@@ -943,7 +1073,7 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
         args = tc["arguments"]
         if name == "bash_exec":
             cmd = args.get("command", "")
-            return await tool_bash_exec(workspace, cmd)
+            return await tool_bash_exec(workspace, cmd, tc["id"])
         elif name == "read_file":
             path = args.get("path", "")
             return await tool_read_file(workspace, path)
@@ -956,7 +1086,7 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
             )
         elif name == "web_search":
             q = args.get("query", "")
-            return await tool_web_search(q)
+            return await tool_web_search(workspace, q, tc["id"])
         elif name == "record_playbook":
             return await tool_record_playbook(
                 workspace, args.get("rule_type", ""), args.get("rule_content", "")
@@ -1782,7 +1912,7 @@ def recover_interrupted_runs() -> dict:
             step=record["next_step"],
             next_step=record["next_step"],
             tail_msgs=len(record["tail"]),
-            calls=len(record["executed_call_ids"]),
+            calls=len(record["announced_call_ids"]),
         )
         recovered += 1
     return {"recovered": recovered, "aborted": aborted}
@@ -2822,9 +2952,9 @@ async def on_message(message: discord.Message):
     outcome = RunOutcome()
     total_tools_executed = 0
     current_step = 0
-    # 이미 실행한 호출 식별자. 재시작 뒤 모델이 같은 호출을 다시 요청해도 부작용을
-    # 두 번 일으키지 않는다.
-    executed_call_ids = list(restored["executed_call_ids"]) if restored is not None else []
+    # 모델이 이미 알린 유효한 호출 식별자. 실행 전 거부된 호출도 포함해 재시작
+    # 뒤 같은 id가 다른 호출이나 완료 신호로 되살아나지 않게 한다.
+    announced_call_ids = list(restored["announced_call_ids"]) if restored is not None else []
     run_end_logged = False
     released = False
 
@@ -2913,7 +3043,7 @@ async def on_message(message: discord.Message):
             next_step=resume_from,
             same_origin=same_origin,
             tail_msgs=len(restored["tail"]),
-            calls=len(executed_call_ids),
+            calls=len(announced_call_ids),
             summary_chars=len(restored["summary"]),
         )
         # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
@@ -2922,7 +3052,7 @@ async def on_message(message: discord.Message):
         try:
             await message.channel.send(
                 f"▶️ **[중단된 실행 재개]** run `{workspace.run_id}`을 Step {resume_from}에서 "
-                f"이어갑니다. 이미 실행한 도구 {len(executed_call_ids)}건은 다시 실행하지 않습니다."
+                f"이어갑니다. 이미 알린 도구 호출 {len(announced_call_ids)}건은 다시 받지 않습니다."
             )
         except Exception:
             pass
@@ -3078,7 +3208,7 @@ async def on_message(message: discord.Message):
                     "reason": token.reason or "",
                     "steering": lease["steering"].stats(),
                 },
-                executed_call_ids=executed_call_ids,
+                announced_call_ids=announced_call_ids,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -3090,7 +3220,7 @@ async def on_message(message: discord.Message):
                 reason=reason,
                 error=type(snapshot_error).__name__,
             )
-            return
+            return False
         log_session_event(
             workspace,
             "snapshot",
@@ -3099,8 +3229,9 @@ async def on_message(message: discord.Message):
             next_step=next_step,
             tail_msgs=len(tail),
             summary_chars=len(rolling_summary),
-            calls=len(executed_call_ids),
+            calls=len(announced_call_ids),
         )
+        return True
 
     # 여기부터 에이전트 루프가 보장되므로 지시를 받는다. 직접 답변 런은 이 지점에
     # 오지 않으므로 큐가 닫힌 상태로 남고, 반영할 스텝이 없다는 사실이 접수
@@ -3462,13 +3593,56 @@ async def on_message(message: discord.Message):
                     final_raw = direct_text
                     break
 
+            # 모든 모델 호출은 완료 여부와 무관하게 같은 identity 규칙을 지난다.
+            # 유효한 첫 id는 다른 검사를 통과하지 못해도 즉시 런 전체에 예약한다.
+            announced_before = len(announced_call_ids)
+            batch_call_ids = set()
+            for tc in tool_calls_to_run:
+                call_id = tc["id"]
+                if not isinstance(call_id, str) or not call_id:
+                    tc["identity_error"] = json.dumps(
+                        {
+                            "error": "invalid_tool_call_id",
+                            "reason": "missing_or_non_string",
+                            "tool": tc["name"],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    continue
+                if call_id in batch_call_ids:
+                    tc["identity_error"] = _blocked_tool_result(
+                        "same_batch_duplicate_id", tc["name"], 1, 1
+                    )
+                    continue
+                batch_call_ids.add(call_id)
+                if call_id in announced_call_ids:
+                    tc["identity_error"] = _blocked_tool_result(
+                        "already_announced", tc["name"], 1, 1
+                    )
+                    continue
+                announced_call_ids.append(call_id)
+                tc["identity_error"] = None
+
+            if (
+                len(announced_call_ids) != announced_before
+                and not save_snapshot(iteration + 1, "tool_call_ids")
+            ):
+                outcome.settle(
+                    outcome_mod.FAILED, "도구 호출 식별자 저장 실패"
+                )
+                break
+
             # [finish_task = 유일한 구조화된 완료 신호]
             # 동반 도구 호출 정책: finish_task와 같은 응답에 온 다른 도구 호출은
             # 실행하지 않는다. 완료 판단 이후에 부작용을 남기지 않기 위한 것이고,
             # 무엇이 거부되었는지는 로그와 최종 메시지에 남긴다.
             finish_calls = [
                 tc for tc in tool_calls_to_run
-                if tc["name"] == "finish_task" and tc["argument_error"] is None
+                if tc["name"] == "finish_task"
+                and tc["identity_error"] is None
+                and tc["argument_error"] is None
             ]
             if finish_calls:
                 final_completed_report = finish_calls[0]["arguments"].get("report", "")
@@ -3525,15 +3699,11 @@ async def on_message(message: discord.Message):
                 allowed_signatures = []
                 merged_results = [None] * len(tool_calls_to_run)
                 for call_index, tc in enumerate(tool_calls_to_run):
+                    if tc["identity_error"] is not None:
+                        merged_results[call_index] = tc["identity_error"]
+                        continue
                     if tc["argument_error"] is not None:
                         merged_results[call_index] = tc["argument_error"]
-                        continue
-                    if tc["id"] in executed_call_ids:
-                        # 재시작 이전에 이미 실행한 호출이다. 다시 보내면 같은
-                        # 부작용이 두 번 일어난다.
-                        merged_results[call_index] = _blocked_tool_result(
-                            "already_executed", tc["name"], 1, 1
-                        )
                         continue
                     signature = (
                         tc["name"],
@@ -3586,7 +3756,6 @@ async def on_message(message: discord.Message):
 
                 total_tools_executed += len(allowed_calls)
                 for tc in allowed_calls:
-                    executed_call_ids.append(tc["id"])
                     # 인자 원문 대신 어떤 인자가 왔는지만 남긴다. 도구 인자 JSON을
                     # 그대로 적는 것이 셸 명령과 파일 내용이 로그로 들어온 경로였다.
                     log_session_event(

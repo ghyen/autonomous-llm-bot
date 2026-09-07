@@ -220,7 +220,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 "reason": "사용자 중단",
                 "steering": {"depth": 2, "applied": 1},
             },
-            executed_call_ids=["c1", "c2"],
+            announced_call_ids=["c1", "c2"],
         )
         payload.update(overrides)
         return run_state.save(workspace, **payload)
@@ -245,7 +245,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         self.assertEqual(restored["summary"], saved["summary"])
         self.assertEqual(restored["tail"], saved["tail"])
         self.assertEqual(restored["interrupt"], saved["interrupt"])
-        self.assertEqual(restored["executed_call_ids"], ["c1", "c2"])
+        self.assertEqual(restored["announced_call_ids"], ["c1", "c2"])
 
         ledger = restored["ledger"]
         self.assertEqual(ledger.goal, "장애 원인 규명")
@@ -416,7 +416,7 @@ class SnapshotBoundaryTest(DurableStateTestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record["state"], run_state.RUNNING)
         self.assertEqual(record["next_step"], 2)
-        self.assertEqual(record["executed_call_ids"], ["c1", "c2"])
+        self.assertEqual(record["announced_call_ids"], ["c1", "c2", "c3"])
         self.assertEqual(self._unsettled(record["tail"]), [])
         self.assertEqual(self._orphan_results(record["tail"]), [])
 
@@ -502,10 +502,13 @@ class RestartRecoveryTest(DurableStateTestCase):
         self.assertEqual(ledger.goal, "장애 원인 규명")
         self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=active@v1")
 
-        # 이미 실행한 호출은 결정적 구조화 결과로 차단된다.
-        blocked = json.loads(self.bash_result_of(self.stub, "c1", resumed))
-        self.assertTrue(blocked["blocked"])
-        self.assertEqual(blocked["reason"], "already_executed")
+        # 이미 알린 호출은 실행 전에 차단되고, 최초 호출의 실제 결과가
+        # 유일한 protocol pair로 그대로 보존된다.
+        self.assertEqual(self.bash_result_of(self.stub, "c1", resumed), BASH_RESULT)
+        self.assertEqual(
+            run_state.load(resumed)["announced_call_ids"],
+            ["c1", "c2", "c3", "c9"],
+        )
 
         records = self.records(resumed)
         resumed_records = records[_last_index(records, "run_resumed"):]
@@ -517,6 +520,55 @@ class RestartRecoveryTest(DurableStateTestCase):
         ]
         self.assertTrue(steps)
         self.assertEqual(min(steps), resume_step)
+
+    async def test_rejected_call_id_stays_reserved_after_restart(self):
+        # Production mutation caught: only accepted IDs survive the snapshot,
+        # so a rejected-but-announced ID can dispatch after process recovery.
+        catalog = self.catalog()
+        await self.drive(
+            catalog,
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        "reserved-after-restart", "bash_exec", "not an object"
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("crash-finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            killed=True,
+        )
+        crashed = self.only_run(catalog)
+
+        self.restart()
+        fresh = self.catalog()
+        self.assertEqual(self.recover(fresh)["recovered"], 1)
+        await self.drive(
+            fresh,
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        "reserved-after-restart",
+                        "bash_exec",
+                        {"command": "printf must-not-run"},
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            message_id=ORIGIN_MESSAGE_ID,
+        )
+
+        self.assertEqual(self.bash_exec.await_count, 0)
+        resumed = run_state.load(self.only_run(fresh))
+        self.assertEqual(
+            resumed["announced_call_ids"],
+            ["reserved-after-restart", "crash-finish", "valid-finish"],
+        )
+        for payload in self.stub.payloads("agent"):
+            self.assertTrue(bot.validate_chat_payload(payload).ok)
 
     @staticmethod
     def bash_result_of(stub, call_id, workspace=None):
@@ -635,7 +687,7 @@ class CheckpointBoundaryTest(DurableStateTestCase):
         # 두 경우 모두 완결된 그룹과 다음 커서는 살아남는다.
         for record in (before, after):
             self.assertEqual(record["next_step"], 2)
-            self.assertEqual(record["executed_call_ids"], ["c1", "c2"])
+            self.assertEqual(record["announced_call_ids"], ["c1", "c2", "c3"])
 
         # 차이는 정정 하나뿐이다: 커밋 전에는 없고, 커밋 후에는 있다.
         self.assertEqual(before["ledger"].hypothesis_marker("H_B"), "H_B=active@v1")

@@ -97,10 +97,10 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         original_bash = bot.tool_bash_exec
         original_dispatch = bot.execute_tools_in_parallel
 
-        async def recording_bash(workspace, command):
+        async def recording_bash(workspace, command, call_id):
             self.executed_commands.append(command)
             if use_real_bash:
-                return await original_bash(workspace, command)
+                return await original_bash(workspace, command, call_id)
             if callable(tool_result):
                 return tool_result(command, len(self.executed_commands))
             return tool_result
@@ -206,6 +206,252 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             tool_messages[1]["content"],
             json.dumps(blocked, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
+
+    # Mutation caught: reserving accepted IDs only after scanning the whole
+    # batch lets a second call with the same protocol ID reach dispatch.
+    async def test_same_batch_duplicate_id_is_rejected_before_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("duplicate-id", "bash_exec", {"command": "printf first"}),
+                _tool_call("duplicate-id", "bash_exec", {"command": "printf second"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf first"])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["duplicate-id"]],
+        )
+        next_payload = self.model.agent_payloads[1]
+        self.assertEqual(self._assistant_call_ids(next_payload), ["duplicate-id"])
+        self.assertEqual(
+            [message["tool_call_id"] for message in self._tool_messages(next_payload)],
+            ["duplicate-id"],
+        )
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+
+    # Mutation caught: validating IDs only in the next model payload lets calls
+    # with IDs that cannot participate in the tool protocol execute first.
+    async def test_invalid_ids_are_rejected_before_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call(None, "bash_exec", {"command": "printf none"}),
+                _tool_call("", "bash_exec", {"command": "printf empty"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        next_payload = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+        self.assertFalse(any(
+            bot._msg_tool_calls(message) for message in next_payload
+        ))
+
+    # Mutation caught: reserving an ID only after every other admission check
+    # lets a later duplicate execute when the first occurrence is malformed.
+    async def test_malformed_first_duplicate_id_blocks_later_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("duplicate-id", "bash_exec", "{bad"),
+                _tool_call(
+                    "duplicate-id", "bash_exec", {"command": "printf hidden"}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        next_payload = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+        self.assertEqual(self._assistant_call_ids(next_payload), ["duplicate-id"])
+        tool_messages = self._tool_messages(next_payload)
+        self.assertEqual(
+            [message["tool_call_id"] for message in tool_messages],
+            ["duplicate-id"],
+        )
+        self.assertEqual(
+            json.loads(tool_messages[0]["content"])["error"],
+            "invalid_tool_arguments",
+        )
+
+    # Mutation caught: keeping a rejected ID only in the current batch lets a
+    # later turn dispatch a side effect under that already-announced identity.
+    async def test_rejected_id_cannot_dispatch_on_a_later_turn(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("reserved-id", "bash_exec", "{bad"),
+            ]),
+            _response(tool_calls=[
+                _tool_call(
+                    "reserved-id", "bash_exec", {"command": "printf hidden"}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("fresh-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        repaired = self.model.agent_payloads[2]
+        self.assertTrue(bot.validate_chat_payload(repaired).ok)
+        self.assertEqual(
+            [
+                call["id"]
+                for message in repaired
+                for call in (message.get("tool_calls") or [])
+            ],
+            ["reserved-id"],
+        )
+        result = next(
+            message for message in repaired
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == "reserved-id"
+        )
+        self.assertEqual(json.loads(result["content"])["error"], "invalid_tool_arguments")
+
+    # Mutation caught: selecting finish_task before identity validation lets a
+    # missing or non-string protocol ID complete the run immediately.
+    async def test_invalid_finish_ids_require_a_fresh_identity(self):
+        for invalid_id in (None, 7):
+            with self.subTest(call_id=invalid_id):
+                self._reset_channel_state()
+                invalid_report = f"invalid terminal {invalid_id!r}"
+                message = await self.run_agent([
+                    _response(tool_calls=[
+                        _tool_call(
+                            invalid_id, "finish_task", {"report": invalid_report}
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call(
+                            "valid-finish", "finish_task", {"report": LONG_REPORT}
+                        ),
+                    ]),
+                ])
+
+                self.assertEqual(len(self.model.agent_payloads), 2)
+                self.assertEqual(self.model.responses, [])
+                delivered = "".join(message.replies + message.channel.sent)
+                self.assertNotIn(invalid_report, delivered)
+                self.assertIn(LONG_REPORT.strip(), delivered)
+
+    # Mutation caught: logging an identity-snapshot failure but continuing lets
+    # an undurable call execute or complete before a restart can reserve it.
+    async def test_identity_reservation_failure_blocks_dispatch_and_completion(self):
+        terminal_report = "must not complete after reservation failure"
+        cases = (
+            (
+                "side_effect",
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            "undurable-side-effect",
+                            "bash_exec",
+                            {"command": "printf undurable"},
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call(
+                            "unused-finish",
+                            "finish_task",
+                            {"report": terminal_report},
+                        ),
+                    ]),
+                ],
+            ),
+            (
+                "terminal",
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            "undurable-finish",
+                            "finish_task",
+                            {"report": terminal_report},
+                        ),
+                    ]),
+                ],
+            ),
+        )
+        for label, responses in cases:
+            with self.subTest(path=label):
+                self._reset_channel_state()
+                original_save = bot.run_state.save
+
+                def fail_identity_save(*args, **kwargs):
+                    if kwargs.get("announced_call_ids"):
+                        raise OSError("identity reservation failed")
+                    return original_save(*args, **kwargs)
+
+                with patch.object(
+                    bot.run_state, "save", side_effect=fail_identity_save
+                ):
+                    message = await self.run_agent(responses)
+
+                self.assertEqual(self.executed_commands, [])
+                self.assertEqual(len(self.model.agent_payloads), 1)
+                delivered = "".join(message.replies + message.channel.sent)
+                self.assertNotIn(terminal_report, delivered)
+
+    # Mutation caught: choosing a duplicate-ID terminal before batch validation
+    # refuses its companion and drops the companion's accepted result.
+    async def test_duplicate_finish_id_preserves_the_first_accepted_result(self):
+        invalid_report = "duplicate terminal must not complete"
+        message = await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("shared-id", "bash_exec", {"command": "printf kept"}),
+                _tool_call("shared-id", "finish_task", {"report": invalid_report}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf kept"])
+        self.assertEqual(len(self.model.agent_payloads), 2)
+        paired = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(paired).ok)
+        self.assertEqual(
+            [message["content"] for message in self._tool_messages(paired)],
+            [SUCCESS_RESULT],
+        )
+        delivered = "".join(message.replies + message.channel.sent)
+        self.assertNotIn(invalid_report, delivered)
+        self.assertIn(LONG_REPORT.strip(), delivered)
+
+    # Mutation caught: a terminal reusing an ID announced and rejected on an
+    # earlier turn bypasses the run-wide identity rule and completes the run.
+    async def test_previously_announced_finish_id_cannot_complete(self):
+        invalid_report = "reused terminal must not complete"
+        message = await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("reserved-finish", "bash_exec", "{bad"),
+            ]),
+            _response(tool_calls=[
+                _tool_call(
+                    "reserved-finish", "finish_task", {"report": invalid_report}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(len(self.model.agent_payloads), 3)
+        delivered = "".join(message.replies + message.channel.sent)
+        self.assertNotIn(invalid_report, delivered)
+        self.assertIn(LONG_REPORT.strip(), delivered)
 
     # Mutation caught: canonicalizing arguments without sorted keys treats the
     # same JSON object in a different key order as a second side effect.
@@ -528,9 +774,9 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             bot, workspace
         ):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
-            result = await bot.tool_bash_exec(run, command)
+            result = await bot.tool_bash_exec(run, command, "long-nonzero")
 
-        self.assertIn("출력 결과가 너무 길어", result)
+        self.assertIn("artifacts/out_", result)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
     # Mutation caught: hiding a real noisy subprocess's nonzero status from the

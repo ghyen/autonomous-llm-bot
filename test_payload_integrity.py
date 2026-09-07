@@ -420,7 +420,7 @@ class PayloadRecoveryDispatchTest(unittest.IsolatedAsyncioTestCase):
     async def run_agent(self, script, max_loops=6, log_records=None, dispatch=None):
         self.model = RecordingModel(script)
 
-        async def stub_bash(workspace, command):
+        async def stub_bash(workspace, command, call_id):
             return SUCCESS_RESULT
 
         original_log = bot.log_session_event
