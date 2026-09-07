@@ -1154,6 +1154,63 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             )
             self.assertFalse(resumed.root.exists())
 
+    async def test_canonical_copy_errors_roll_back_and_retry_newest_snapshot(self):
+        payload = "- intact newest snapshot"
+        for operation in ("read", "write"):
+            catalog = run_workspace.RunCatalog(
+                self.workspace_root / operation,
+                self.log_root / operation,
+            )
+            prior = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+            await prior.write("playbook.md", payload, "absent")
+            catalog.finish(prior, "completed")
+            source = prior.root / "playbook.md"
+
+            original_read_bytes = Path.read_bytes
+            original_atomic_write = run_workspace.atomic_write
+            if operation == "read":
+                def fail_copy_read(path):
+                    if path == source:
+                        raise OSError("injected canonical copy read failure")
+                    return original_read_bytes(path)
+
+                copy_failure = patch.object(Path, "read_bytes", new=fail_copy_read)
+            else:
+                def fail_copy_write(path, data):
+                    if Path(path).name == "playbook.md":
+                        raise OSError("injected canonical copy write failure")
+                    return original_atomic_write(path, data)
+
+                copy_failure = patch.object(
+                    run_workspace,
+                    "atomic_write",
+                    new=fail_copy_write,
+                )
+
+            acquisition_error = None
+            with copy_failure:
+                try:
+                    catalog.acquire(TEST_USER_ID, CHANNEL_A)
+                except OSError as error:
+                    acquisition_error = error
+
+            retry = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+            expected_run_ids = {prior.run_id, retry.run_id}
+            with self.subTest(operation=operation, behavior="propagate"):
+                self.assertIsInstance(acquisition_error, OSError)
+            with self.subTest(operation=operation, behavior="roll_back"):
+                self.assertEqual(
+                    {workspace.run_id for workspace in catalog.workspaces()},
+                    expected_run_ids,
+                )
+                self.assertEqual(
+                    {path.name for path in catalog.runs_root.iterdir()},
+                    expected_run_ids,
+                )
+            with self.subTest(operation=operation, behavior="retry"):
+                self.assertEqual(source.read_text(encoding="utf-8"), payload)
+                self.assertEqual(retry.read("playbook.md").get("content"), payload)
+
     async def test_acquire_inherits_canonical_files_from_prior_run_of_same_owner_and_channel(self):
         catalog = self.catalog()
         run1 = catalog.acquire(TEST_USER_ID, CHANNEL_A)

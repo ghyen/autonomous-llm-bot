@@ -296,10 +296,14 @@ class RunCatalog:
         # rather than adopt someone else's directory. secure_directory then fixes
         # the mode, which mkdir's mode argument cannot do under a loose umask.
         workspace.root.mkdir()
-        secure_directory(workspace.root)
-        if inherit_canonical:
-            self._inherit_canonical(workspace)
-        workspace.persist()
+        try:
+            secure_directory(workspace.root)
+            if inherit_canonical:
+                self._inherit_canonical(workspace)
+            workspace.persist()
+        except BaseException:
+            shutil.rmtree(workspace.root)
+            raise
         self._runs[run_id] = workspace
         return workspace
 
@@ -324,14 +328,12 @@ class RunCatalog:
         # Missing canonical files in the newest run are a durable deletion
         # boundary (including reset); never resurrect them from older runs.
         for name in sorted(CANONICAL_NAMES):
-            dest = workspace.root / name
             src = prior.root / name
-            if dest.exists() or not src.is_file():
-                continue
             try:
-                atomic_write(dest, src.read_bytes())
-            except OSError:
+                data = src.read_bytes()
+            except FileNotFoundError:
                 continue
+            atomic_write(workspace.root / name, data)
 
     def _select_prepared(self, workspace):
         for key, selected_id in tuple(self._selected.items()):
