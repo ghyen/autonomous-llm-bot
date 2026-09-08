@@ -2,9 +2,9 @@
 
 Every piece of run state used to live in module-global dicts, so a process
 restart lost the step cursor, the cumulative summary, the authoritative ledger,
-and the ids of the tool calls that had already run. The next message then began
-the same goal again at Step 1 - and a Step 1 record on its own cannot be told
-apart from a genuinely new request, so the loss was not even diagnosable
+and the ids of the tool calls that had already been announced. The next message
+then began the same goal again at Step 1 - and a Step 1 record on its own cannot
+be told apart from a genuinely new request, so the loss was not even diagnosable
 afterwards (issue #6).
 
 This module is that missing layer and nothing more. It is not a log: it is the
@@ -30,7 +30,8 @@ from pathlib import Path
 from ledger import ResearchLedger
 from run_workspace import atomic_write
 
-SCHEMA = 1
+
+SCHEMA = 4
 SUMMARY_VERSION = 2
 FILE_NAME = "state.json"
 
@@ -46,7 +47,8 @@ _REQUIRED = (
     "tail",
     "ledger",
     "interrupt",
-    "executed_call_ids",
+    "announced_call_ids",
+    "tool_fingerprints",
     "trajectory_gap_step",
 )
 
@@ -67,16 +69,16 @@ def save(
     tail,
     ledger,
     interrupt,
-    executed_call_ids,
+    announced_call_ids,
+    tool_fingerprints,
     trajectory_gap_step,
     state=RUNNING,
 ):
     """Replace the run's record atomically.
 
-    Call this only on a completed assistant/tool group boundary. A record saved
-    mid-group would restore a payload whose tool calls have no results, which
-    both breaks the next request and invites the already-executed side effects
-    to run a second time.
+    Call this only with a complete assistant/tool tail. A record saved with a
+    partial group would restore a payload whose tool calls have no results and
+    could replay already-executed side effects.
     """
     if trajectory_gap_step is not None and (
         not isinstance(trajectory_gap_step, int)
@@ -97,7 +99,11 @@ def save(
         "tail": list(tail or []),
         "ledger": ledger.to_dict(),
         "interrupt": dict(interrupt or {}),
-        "executed_call_ids": [str(call_id) for call_id in executed_call_ids or ()],
+        "announced_call_ids": list(announced_call_ids or ()),
+        "tool_fingerprints": [
+            [str(fingerprint), int(step)]
+            for fingerprint, step in tool_fingerprints or ()
+        ],
         "trajectory_gap_step": trajectory_gap_step,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -132,8 +138,29 @@ def load(workspace):
         return None
     if not isinstance(payload["interrupt"], dict):
         return None
-    if not isinstance(payload["executed_call_ids"], list):
+    announced_call_ids = payload["announced_call_ids"]
+    if (
+        not isinstance(announced_call_ids, list)
+        or any(not isinstance(item, str) or not item for item in announced_call_ids)
+        or len(set(announced_call_ids)) != len(announced_call_ids)
+    ):
         return None
+    if not isinstance(payload["tool_fingerprints"], list):
+        return None
+    normalized_fingerprints = []
+    for item in payload["tool_fingerprints"]:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or len(item[0]) != 64
+            or any(char not in "0123456789abcdef" for char in item[0])
+            or not isinstance(item[1], int)
+            or isinstance(item[1], bool)
+            or item[1] < 1
+        ):
+            return None
+        normalized_fingerprints.append([item[0], item[1]])
     trajectory_gap_step = payload["trajectory_gap_step"]
     if trajectory_gap_step is not None and (
         not isinstance(trajectory_gap_step, int)
@@ -147,7 +174,7 @@ def load(workspace):
         return None
     payload["summary"] = str(payload["summary"] or "")
     payload["tail"] = [item for item in payload["tail"] if isinstance(item, dict)]
-    payload["executed_call_ids"] = [str(item) for item in payload["executed_call_ids"]]
+    payload["tool_fingerprints"] = normalized_fingerprints
     return payload
 
 

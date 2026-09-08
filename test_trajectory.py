@@ -15,13 +15,16 @@ import trajectory
 CHANNEL_ID = 987654820
 
 
-def _call(call_id, name, arguments, failed=False):
-    return {
+def _call(call_id, name, arguments, failed=False, artifact_path=None):
+    call = {
         "id": call_id,
         "name": name,
         "arguments": arguments,
         "failed": failed,
     }
+    if artifact_path is not None:
+        call["artifact_path"] = artifact_path
+    return call
 
 
 class TrajectoryTest(unittest.TestCase):
@@ -87,6 +90,57 @@ class TrajectoryTest(unittest.TestCase):
         for record in records:
             self.assertEqual(record["schema"], trajectory.SCHEMA)
             self.assertRegex(record["id"], r"^[0-9a-f]{64}$")
+
+    def test_artifact_path_belongs_only_to_the_executed_ordered_occurrence(self):
+        path = "artifacts/{0}".format(bot._artifact_name("dup"))
+        records = trajectory.append_tool_group(
+            self.workspace,
+            1,
+            [
+                _call(
+                    "dup",
+                    "bash_exec",
+                    {"command": "first"},
+                    artifact_path=path,
+                ),
+                _call(
+                    "dup",
+                    "bash_exec",
+                    {"command": "second"},
+                    artifact_path=path,
+                ),
+            ],
+            ["first", "blocked"],
+            {"dup"},
+        )
+
+        self.assertEqual([record["executed"] for record in records], [True, False])
+        self.assertEqual(
+            [record["artifact_path"] for record in records], [path, None]
+        )
+
+    def test_schema_three_requires_artifact_path_field(self):
+        trajectory.append_tool_group(
+            self.workspace,
+            1,
+            [_call("schema-three", "bash_exec", {"command": "true"})],
+            ["[exit code: 0]"],
+            {"schema-three"},
+        )
+        [record] = self.records()
+        del record["artifact_path"]
+        body = {key: value for key, value in record.items() if key != "id"}
+        record["id"] = __import__("hashlib").sha256(
+            trajectory._canonical(body).encode("utf-8")
+        ).hexdigest()
+        self.path.write_text(
+            trajectory._canonical(record) + "\n", encoding="utf-8"
+        )
+
+        trusted, complete = trajectory.read_records(self.workspace)
+
+        self.assertFalse(complete)
+        self.assertEqual(trusted, [])
 
     def test_read_records_stops_at_the_first_hash_or_parent_break(self):
         # Production mutations caught: trusting an unchanged id after body

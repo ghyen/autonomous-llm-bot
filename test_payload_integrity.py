@@ -15,7 +15,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_support import FakeMessage, run_catalog_patch
+from test_support import FakeMessage
 
 import bot
 import outcome as outcome_mod
@@ -89,6 +89,23 @@ async def _collect(chunks):
 
 
 class StreamingToolCallReassemblyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_finish_reason_survives_delta_less_and_usage_chunks(self):
+        stream = FakeToolCallStream([
+            _chunk(content="partial"),
+            SimpleNamespace(choices=[SimpleNamespace(finish_reason="length", delta=None)]),
+            SimpleNamespace(choices=[]),
+        ])
+
+        async def create(**kwargs):
+            return stream
+
+        stub = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.object(bot, "client", stub):
+            response = await bot.create_streaming_completion(model="stub", messages=[])
+        self.assertEqual(response.choices[0].finish_reason, "length")
+        self.assertEqual(response.choices[0].message.content, "partial")
+        self.assertTrue(stream.closed)
+
     async def test_index_less_argument_fragments_join_one_call(self):
         # Production mutation caught: keying an index-less fragment on
         # len(tool_buffers) splits one streamed call into N half-merged calls.
@@ -371,6 +388,7 @@ class RecordingModel:
             "stage": kwargs.get("stage"),
             "messages": messages,
             "has_tools": "tools" in kwargs,
+            "max_tokens": kwargs.get("max_tokens"),
         })
         step = self.script.pop(0)
         if isinstance(step, Exception):
@@ -400,10 +418,17 @@ class PayloadRecoveryDispatchTest(unittest.IsolatedAsyncioTestCase):
         ):
             state.pop(CHANNEL_ID, None)
 
-    async def run_agent(self, script, max_loops=6, log_records=None, dispatch=None):
+    async def run_agent(
+        self,
+        script,
+        max_loops=6,
+        log_records=None,
+        dispatch=None,
+        playbook_text=None,
+    ):
         self.model = RecordingModel(script)
 
-        async def stub_bash(workspace, command):
+        async def stub_bash(workspace, command, call_id):
             return SUCCESS_RESULT
 
         original_log = bot.log_session_event
@@ -415,7 +440,12 @@ class PayloadRecoveryDispatchTest(unittest.IsolatedAsyncioTestCase):
 
         message = FakeMessage("payload 무결성 점검해줘", CHANNEL_ID)
         with tempfile.TemporaryDirectory() as log_dir, ExitStack() as stack:
-            stack.enter_context(run_catalog_patch(bot, log_dir))
+            catalog = bot.RunCatalog(f"{log_dir}/workspace", f"{log_dir}/logs")
+            if playbook_text is not None:
+                prior = catalog.acquire(message.author.id, message.channel.id)
+                await prior.write("playbook.md", playbook_text, "absent")
+                catalog.finish(prior, "completed")
+            stack.enter_context(patch.object(bot, "RUN_CATALOG", catalog))
             stack.enter_context(patch.object(bot, "MAX_AGENT_LOOPS", max_loops))
             stack.enter_context(patch.object(bot, "CHECKPOINT_INTERVAL", 99))
             stack.enter_context(patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99))
@@ -485,6 +515,38 @@ class PayloadRecoveryDispatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(
             not bot._msg_tool_calls(m) for m in retry["messages"]
         ))
+
+    async def test_playbook_stays_lower_trust_in_normal_and_correlation_retry(self):
+        canary = "HOSTILE_INHERITED_PLAYBOOK_CANARY"
+        await self.run_agent(
+            [
+                RuntimeError("400 Bad Request: invalid tool_call_id in message"),
+                _response(content="복구된 답변입니다."),
+            ],
+            max_loops=1,
+            playbook_text=canary,
+        )
+
+        self.assertEqual(self.model.stages, ["agent", "agent:retry"])
+        for call in self.model.calls:
+            messages = call["messages"]
+            self.assertNotIn(canary, bot._msg_content(messages[0]))
+            carriers = [m for m in messages if canary in bot._msg_content(m)]
+            self.assertEqual(len(carriers), 1)
+            self.assertEqual(bot._msg_role(carriers[0]), "assistant")
+
+    async def test_first_step_retry_honors_lower_agent_token_ceiling(self):
+        with patch.object(bot, "AGENT_STEP_MAX_TOKENS", 303):
+            await self.run_agent([
+                RuntimeError("400 Bad Request: invalid tool_call_id in message"),
+                _response(content="복구된 답변입니다."),
+            ])
+
+        self.assertEqual(self.model.stages, ["agent", "agent:retry"])
+        self.assertEqual(
+            [call["max_tokens"] for call in self.model.calls],
+            [303, 303],
+        )
 
     async def test_erased_tool_protocol_persists_into_the_next_step(self):
         # Production mutation caught: writing the recovery payload to a local

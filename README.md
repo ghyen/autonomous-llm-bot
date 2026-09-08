@@ -8,21 +8,23 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 
 ## ✨ Key Features
 
-- 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 350 iterative tool-execution loops with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
+- 🧠 **Fully Autonomous Goal-Driven Loop**: Runs up to 2,000 iterative tool-execution loops by default with deep reasoning (`<think>`) traces, self-reflection, and goal completion checks.
 - 🧾 **Authoritative Research State (Ledger)**: Goals, evidence, hypotheses and conclusions are held in a per-channel ledger outside the message payload, and re-pinned into every request, interim report, rollover and final report. A refuted hypothesis cannot return to `active` without an explicit reopen citing new evidence, and a conclusion is automatically invalid the moment a premise revision moves. The whole ledger round-trips through the run's durable record, so a restart cannot resurrect a rejected hypothesis as fact.
-- 💾 **Durable Run State**: Each run keeps one atomic record (`runs/<run-id>/state.json`) carrying its run id, originating message id, state, next step cursor, bounded summary and tail, interrupt state, ledger, and the ids of the tool calls already executed. It is written before the first model call and after every completed assistant/tool group, never mid-group. A restart resumes the same run id at its next step or records exactly one explicit abort.
+- 💾 **Durable Run State**: Each run keeps one atomic record (`runs/<run-id>/state.json`) carrying its run id, originating message id, state, next step cursor, bounded summary and tail, interrupt state, ledger, every announced tool-call id, replay-guard fingerprints, and the earliest trajectory coverage gap. It is written before the first model call, before uncertain dispatches, and after every completed assistant/tool group, never with a partial group in its tail. A restart resumes the same run id at its next step or records exactly one explicit abort.
 - 📁 **Owner-Bound Run Workspaces**: Every accepted top-level request receives an opaque `runs/<run-id>/` directory and opaque per-run log. Runs never derive paths from Discord IDs; exact owners can resume or delete inactive runs, while admins receive no implicit workspace access.
-- 🔄 **Canonical File Revisions**: Root `plan.md` and `findings.md` use exact-byte `sha256:` revisions, compare-and-swap writes, and atomic replacement. Per-execution read hashes return bounded references for unchanged content.
-- 🗺️ **Tiered Trajectory Compaction**: Every 10 steps, Tier 1 keeps the latest 10 complete assistant/tool groups verbatim, Tier 2 renders a deterministic one-line index for steps `S-29` through `S-10`, and Tier 3 summarizes only procedural attempts, blockers, and alternatives through `S-30`. Every completed tool group also appends bounded arguments and results to the run-local mode-`0600` `traj.jsonl`; the model can recover an exact old step with `lookup_trajectory`. Goals, facts, conclusions, and hypothesis status remain exclusively in the authoritative ledger, which is always the final section of the system message.
+- 🔄 **Canonical File Revisions**: Root `plan.md`, `findings.md`, and `playbook.md` use exact-byte `sha256:` revisions, compare-and-swap writes, and atomic replacement. `playbook.md` is inherited only by an automatic successor created when no prepared or resumed run is selected for that owner and channel; explicit `!new` and `!reset` prepared runs start blank. `run.json`, `state.json`, and `traj.jsonl` remain run-local reserved state. Per-execution read hashes return bounded references for unchanged content.
+- 🗺️ **Tiered Trajectory Compaction**: Every 10 steps, Tier 1 keeps the latest 10 complete assistant/tool groups verbatim, Tier 2 renders a deterministic one-line index for steps `S-29` through `S-10`, and Tier 3 summarizes only procedural attempts, blockers, and alternatives through `S-30`. Every completed tool group also appends bounded arguments and results to the run-local mode-`0600` `traj.jsonl`; the model can recover an exact old step with `lookup_trajectory`. Goals, facts, conclusions, and hypothesis status remain exclusively in the authoritative ledger, which is always the final section of the system message. Artifact pointers may enter rollover discovery only when they were host-recorded for the current run and still validate as regular files.
 - 🧩 **Run-Local Workspace Skills**: Reusable Python (`.py`), Shell (`.sh`/`.bash`), and Markdown (`.md`) skills are discovered from the current run's `skills/` directory and rendered into its system prompt. They are isolated from other runs and retained only when that exact run is resumed.
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
 - 🛠️ **Built-in Power Tools**:
   - `bash_exec`: Run arbitrary shell commands (curl, python3, grep, jq, etc.) in a disposable macOS Seatbelt worker rooted at the current run directory.
   - `read_file`: Read relative paths from the current run. First or changed reads include a full-byte revision; unchanged reads return a hash reference.
-  - `write_file`: Write ordinary run files, including reusable scripts in `skills/`, directly; root `plan.md` and `findings.md` require an optimistic `expected_revision`.
+  - `write_file`: Write ordinary run files, including reusable scripts in `skills/`, directly; root `plan.md`, `findings.md`, and `playbook.md` require an optimistic `expected_revision`.
   - `web_search`: Live DuckDuckGo search through the explicitly allowlisted worker broker.
+  - `lookup_trajectory`: Recover bounded records from an exact compacted trajectory step; oversized aggregate results are stored as run artifacts.
   - `record_state`: Record goals, evidence, hypotheses and conclusions in the authoritative ledger. Judgements belong here, not in the reasoning trace, which does not survive to the next step.
+  - `record_playbook`: Merge one model-authored environment constraint, invalid path, or successful pattern into canonical `playbook.md` as lower-trust procedural context; system policy and the current user request always take precedence.
   - `finish_task`: Explicit task completion tool to synthesize the final markdown report.
 - 💬 **Mid-Flight Dynamic User Steering**: Users can send messages into the channel while the agent is running; instructions are automatically queued and injected into the agent's next step without restarting.
 - 🛡️ **Pre-Send Payload Validator**: One local validator checks every outgoing payload before it leaves — tool_call ids non-empty and unique, exactly one result per announced call, groups adjacent, no orphan results, `system` only at index 0 — and repairs the live history in place. A tool-correlation error retries once with the tool protocol erased; other 400s settle like any other failure and leave a masked role/id fingerprint.
@@ -41,7 +43,7 @@ User Prompt (Discord) ────────┐
                               │
                ┌──────────────▼──────────────┐
                │   Autonomous Agent Loop     │◄────── Dynamic User Steering Queue
-               │   (Max 350 Steps)           │
+               │  2,000 Steps (configurable) │
                └──────────────┬──────────────┘
                               │
           ┌───────────────────┼───────────────────┐
@@ -122,6 +124,10 @@ DISCORD_ALLOWED_USER_IDS=111111111111111111,222222222222222222
 LLM_BASE_URL=http://127.0.0.1:18080/v1
 MODEL_NAME=default
 DISCORD_FREE_RESPONSE_CHANNELS=123456789012345678
+MAX_AGENT_LOOPS=2000
+CHECKPOINT_INTERVAL=50
+MAX_TOOL_EXECUTIONS_PER_RUN=2000
+AGENT_STEP_MAX_TOKENS=2048
 LLM_CONNECT_TIMEOUT_SECONDS=15
 LLM_IDLE_TIMEOUT_SECONDS=3600
 MODEL_STAGE_TIMEOUT_SECONDS=3600
@@ -140,6 +146,12 @@ LOG_RETENTION_DAYS=14
 LOG_CONTENT_DEBUG=false
 LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 ```
+
+The autonomous loop defaults to 2,000 model iterations, checkpoints every 50
+steps, allows at most 2,000 actual tool executions per run, and limits each
+agent step to 2,048 output tokens. Override those limits with
+`MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`, `MAX_TOOL_EXECUTIONS_PER_RUN`, and
+`AGENT_STEP_MAX_TOKENS`.
 
 Network is deny-by-default. Enable `web_search` only when the operator wants
 the worker to use DuckDuckGo:
@@ -170,6 +182,9 @@ Startup fails, loudly, when:
   `BOT_TOOLS_ENABLED=false` to run a tool-free bot without an allowlist.
 - Any ID list contains a non-numeric entry.
 - Any timeout is not a finite number greater than zero.
+- Any of `MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`,
+  `MAX_TOOL_EXECUTIONS_PER_RUN`, or `AGENT_STEP_MAX_TOKENS` is not a whole
+  integer greater than zero.
 - `LOG_MAX_BYTES` is not a whole number greater than zero.
 - `LOG_RETENTION_DAYS` or `LOG_CONTENT_DEBUG_RETENTION_HOURS` is not a finite
   number greater than zero.
@@ -216,7 +231,7 @@ in the startup diagnostics.
 
 ## 💾 Durable Run State and Restart Recovery
 
-**The 10-step Discord interim progress report is a briefing, not a recovery
+**The 50-step Discord interim progress report is a briefing, not a recovery
 point.** It is sent to a channel and recorded in the log, and nothing ever read
 it back. Recovery uses one separate durable record per run:
 
@@ -226,13 +241,15 @@ it back. Recovery uses one separate durable record per run:
 - Contents: run id, originating Discord message id, run state, next step cursor,
   the bounded cumulative summary, a bounded tail of recent payload messages, the
   interrupt state (cancellation reason and steering queue counters), the full
-  ledger, and the ids of the tool calls already executed.
-- Write boundaries: before the first model call, after every completed
-  assistant/tool group, right after an interim report's ledger corrections are
-  applied, and right after a rollover writes its new summary back. A record is
-  **never** written across a parallel call/result group — a tail whose last group
-  is missing results is dropped whole, because restoring half a group both breaks
-  the next request and would re-run side effects that already happened.
+  ledger, every announced tool-call id, replay-guard fingerprints, and the first
+  trajectory step whose durable coverage is uncertain.
+- Write boundaries: before the first model call, before dispatch when reserving
+  uncertain fingerprints and a conservative trajectory gap, after every
+  completed assistant/tool group, right after an interim report's ledger
+  corrections are applied, and right after a rollover writes its new summary
+  back. A record is **never** written with a partial parallel call/result group
+  in its tail — an incomplete final group is dropped whole, because restoring
+  half a group both breaks the next request and could re-run side effects.
 - Bound: the tail keeps 12 messages of at most 2,000 characters each. Anything
   older is represented by the cumulative summary, which is what the summary is
   for.
@@ -244,9 +261,9 @@ exactly one `run_abort` record is written and the record is deleted. A record
 that does not match the schema is discarded, never migrated. There is no third
 path: silently restarting at Step 1 is what made a restart indistinguishable
 from a new request. A resumed run announces itself in the channel and logs a
-`run_resumed` record before its first step, and a tool call whose id already ran
-is answered with a deterministic `already_executed` result instead of being
-dispatched again.
+`run_resumed` record before its first step. Any reused id that was already
+announced is refused with a deterministic `already_announced` result before
+dispatch.
 
 A run that ends normally marks its record ended, so startup leaves it alone
 while `!resume <run-id>` can still pick it up. `!reset`, `!new`, `!clear` and
@@ -291,21 +308,20 @@ upstream failure, exhaustion, and normal completion remain distinct in the final
 status.
 
 **Tool execution guardrails:** ordinary tool calls are filtered only after the
-post-dashboard cancellation check and before dispatch. A call whose id already
-executed before a restart is answered with a deterministic `already_executed`
-result and never dispatched. A signature is the
-tool name plus its compact, key-sorted JSON arguments. Within one model response,
-only the first identical signature can execute; every original call ID still gets
+post-dashboard cancellation check and before dispatch. A reused id that was
+already announced is answered with a deterministic `already_announced` result
+and never dispatched. A fingerprint is derived from the tool's effective
+side-effecting fields rather than ignored metadata. Within one model response,
+only the first identical action can execute; every original call ID still gets
 a tool result, with blocked calls receiving deterministic structured JSON. The
 same unchanged call may fail twice consecutively, but its third and later
 immediately consecutive attempts are blocked until a different signature is
 dispatched or a call succeeds. Failures are limited to the existing explicit
 contracts: a leading `[Error`, a nonzero `bash_exec` exit-code marker, or a
-`record_state` refusal. Each run dispatches at most 350 actual tool executions;
-blocked calls consume no budget. These fixed code-level limits are
-`MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2` and
-`MAX_TOOL_EXECUTIONS_PER_RUN = 350`; they intentionally have no configuration
-surface.
+structured failure from a workspace, trajectory, or state tool. Each run
+dispatches at most `MAX_TOOL_EXECUTIONS_PER_RUN` actual tool executions (2,000
+by default); blocked calls consume no budget. The consecutive failure cap is
+`MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2`.
 
 ---
 
@@ -369,13 +385,17 @@ memory ceiling with a fail-closed RSS monitor over the worker and its child
 tree. Workspace bytes are sampled every 50 ms; this is a bounded monitoring
 ceiling, not a filesystem quota.
 
-Only root `plan.md` and `findings.md` are canonical. Their revision is
+Root `plan.md`, `findings.md`, and `playbook.md` are canonical. Their revision is
 `sha256:<64 lowercase hex>` over exact bytes, or `absent` before creation. A
 write must provide the exact last revision; comparison occurs under that file's
 lock, stale writes return `conflict` without changing bytes, and valid writes
 flush/fsync a sibling temporary file before atomic replacement. Concurrent
-writers using the same revision yield one success and one conflict. First or
-changed canonical reads return complete content and revision; unchanged reads
+writers using the same revision yield one success and one conflict. Only
+`playbook.md` is inherited, and only by an automatic successor created when no
+prepared or resumed run is selected for that owner and channel. Explicit `!new`
+and `!reset` prepared runs start blank. `plan.md` and `findings.md` start absent,
+while `run.json`, `state.json`, and `traj.jsonl` remain reserved run state. First
+or changed canonical reads return complete content and revision; unchanged reads
 return only a hash reference. Ordinary changed reads retain the 4,000-character
 display cap. Every read hashes full bytes, successful writes seed the cache, and
 the per-execution LRU holds at most 128 entries; resume begins empty.
@@ -451,6 +471,32 @@ tests is synthetic.
 
 All three commands also run in CI (`.github/workflows/ci.yml`) on macOS with
 Python 3.10 and 3.12.
+
+### Local LLM Integration Check
+
+With the local server running, use the bot's Python environment:
+
+```bash
+RUN_LOCAL_LLM_SMOKE=1 python -m unittest test_local_llm_smoke -v
+```
+
+This opt-in check uses the configured endpoint and model, real streaming and
+sandboxed tools, a temporary run workspace, and fake Discord messages. It checks
+`bash_exec`, `read_file`, and `finish_task` across multiple steps, including
+`reasoning_effort=none` and the absence of reasoning output. It sends no Discord
+messages and has a ten-minute total timeout. Ordinary test discovery skips it.
+
+The default 2,000-step/tool budgets are ceilings, not a 24-hour runtime guarantee.
+At 15-30 seconds per step, 2,000 steps cover roughly 8-17 hours before checkpoint
+and compaction overhead. Cold prompt processing can take longer. Token caps bound
+output size; `MODEL_STAGE_TIMEOUT_SECONDS` bounds request time. A passing smoke
+check does not replace a 24-hour soak test.
+
+For the Qwen hybrid / rapid-mlx 0.12.18 deployment, prefix-cache reuse still
+reproduced a token-exhaustion stall with thinking disabled. The serving host
+currently uses `--disable-prefix-cache`; see the
+[verification report](docs/local-llm-verification-20260906.md) for measurements
+and the successful three-step live check.
 
 ---
 

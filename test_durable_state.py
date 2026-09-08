@@ -218,7 +218,11 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 "reason": "사용자 중단",
                 "steering": {"depth": 2, "applied": 1},
             },
-            executed_call_ids=["c1", "c2"],
+            announced_call_ids=["c1", "c2"],
+            tool_fingerprints=[
+                ["a" * 64, 3],
+                ["b" * 64, 6],
+            ],
             trajectory_gap_step=None,
         )
         payload.update(overrides)
@@ -231,6 +235,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         catalog = self.catalog()
         workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
         saved = self._saved(workspace)
+        self.assertEqual(saved["schema"], 4)
 
         # 새 프로세스: 같은 디스크를 다시 읽는 새 워크스페이스 객체.
         fresh = self.catalog().lookup_owned(TEST_USER_ID, workspace.run_id)
@@ -244,7 +249,11 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         self.assertEqual(restored["summary"], saved["summary"])
         self.assertEqual(restored["tail"], saved["tail"])
         self.assertEqual(restored["interrupt"], saved["interrupt"])
-        self.assertEqual(restored["executed_call_ids"], ["c1", "c2"])
+        self.assertEqual(restored["announced_call_ids"], ["c1", "c2"])
+        self.assertEqual(
+            restored["tool_fingerprints"],
+            [["a" * 64, 3], ["b" * 64, 6]],
+        )
         self.assertIsNone(restored["trajectory_gap_step"])
 
         ledger = restored["ledger"]
@@ -281,9 +290,10 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         path = run_state.snapshot_path(workspace)
 
         payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["schema"] = run_state.SCHEMA + 1
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        self.assertIsNone(run_state.load(workspace))
+        for mismatched_schema in (1, 2, 3, run_state.SCHEMA + 1):
+            payload["schema"] = mismatched_schema
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertIsNone(run_state.load(workspace))
 
         path.write_text("{ this is not json", encoding="utf-8")
         self.assertIsNone(run_state.load(workspace))
@@ -487,7 +497,7 @@ class SnapshotBoundaryTest(DurableStateTestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record["state"], run_state.RUNNING)
         self.assertEqual(record["next_step"], 2)
-        self.assertEqual(record["executed_call_ids"], ["c1", "c2"])
+        self.assertEqual(record["announced_call_ids"], ["c1", "c2", "c3"])
         self.assertEqual(self._unsettled(record["tail"]), [])
         self.assertEqual(self._orphan_results(record["tail"]), [])
 
@@ -526,6 +536,177 @@ class SnapshotBoundaryTest(DurableStateTestCase):
 
 
 class RestartRecoveryTest(DurableStateTestCase):
+    async def test_predispatch_crash_leaves_trajectory_coverage_gap(self):
+        # Mutation caught: reserving only the loop fingerprint before dispatch
+        # lets a crash after the side effect hide a missing trajectory group.
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        catalog = self.catalog("trajectory-crash")
+        with patch.object(
+            bot.trajectory,
+            "append_tool_group",
+            side_effect=SimulatedProcessDeath("after dispatch"),
+        ):
+            with self.assertRaises(SimulatedProcessDeath):
+                await self.drive(
+                    catalog,
+                    [_response(tool_calls=[
+                        _tool_call("crash-call", "bash_exec", {"command": "side-effect"})
+                    ])],
+                    killed=True,
+                )
+
+        self.assertEqual(self.bash_exec.await_count, 1)
+        workspace = self.only_run(catalog)
+        record = run_state.load(workspace)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["state"], run_state.RUNNING)
+        self.assertEqual(record["trajectory_gap_step"], 1)
+        self.assertEqual(bot.trajectory.read_records(workspace)[0], [])
+
+    async def test_post_result_fingerprint_save_failure_stops_before_next_turn(self):
+        # Mutation caught: ignoring the completed-group save result lets another
+        # model turn run even though the successful action is not restart-safe.
+        catalog = self.catalog()
+        original_save = run_state.save
+
+        def fail_completed_group_save(workspace, **kwargs):
+            if kwargs.get("tool_fingerprints") and kwargs.get("next_step") == 2:
+                raise OSError("fingerprint persistence failed")
+            return original_save(workspace, **kwargs)
+
+        with patch.object(
+            bot.run_state, "save", side_effect=fail_completed_group_save
+        ):
+            await self.drive(
+                catalog,
+                [
+                    _response(tool_calls=[
+                        _tool_call("persisted-1", "bash_exec", {"command": "first"})
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("must-not-run", "bash_exec", {"command": "second"})
+                    ]),
+                ],
+            )
+
+        self.assertEqual(self.bash_exec.await_count, 1)
+        self.assertEqual(len(self.stub.payloads("agent")), 1)
+        failed_workspace = self.only_run(catalog)
+        record = run_state.load(failed_workspace)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["state"], "failed")
+
+        self.restart()
+        self.assertEqual(self.recover(self.catalog())["recovered"], 0)
+
+        # A failed run remains explicitly resumable. Its stale snapshot must
+        # still reserve the action under a fresh protocol ID.
+        fresh = self.catalog()
+        fresh.resume(TEST_USER_ID, CHANNEL_ID, failed_workspace.run_id)
+        await self.drive(
+            fresh,
+            [
+                _response(tool_calls=[
+                    _tool_call("resumed-fresh", "bash_exec", {"command": "first"})
+                ]),
+                _response(tool_calls=[
+                    _tool_call("resumed-finish", "finish_task", {"report": LONG_REPORT})
+                ]),
+            ],
+            message_id=ORIGIN_MESSAGE_ID,
+        )
+
+        resumed = self.only_run(fresh)
+        self.assertEqual(self.bash_exec.await_count, 0)
+        blocked = json.loads(self.bash_result_of(self.stub, "resumed-fresh", resumed))
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+
+    async def test_uncertain_fingerprint_reservation_failure_blocks_dispatch(self):
+        # Mutation caught: treating the pre-dispatch uncertainty snapshot as
+        # best-effort executes an action that cannot be made replay-safe.
+        catalog = self.catalog("reservation-failure")
+        original_save = run_state.save
+
+        def fail_reservation_save(workspace, **kwargs):
+            if kwargs.get("tool_fingerprints") and kwargs.get("next_step") == 1:
+                raise OSError("uncertain fingerprint reservation failed")
+            return original_save(workspace, **kwargs)
+
+        with patch.object(
+            bot.run_state, "save", side_effect=fail_reservation_save
+        ):
+            await self.drive(
+                catalog,
+                [
+                    _response(tool_calls=[
+                        _tool_call("never-dispatch", "bash_exec", {"command": "unsafe"})
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("never-finish", "finish_task", {"report": LONG_REPORT})
+                    ]),
+                ],
+            )
+
+        self.assertEqual(self.bash_exec.await_count, 0)
+        self.assertEqual(len(self.stub.payloads("agent")), 1)
+        record = run_state.load(self.only_run(catalog))
+        self.assertIsNotNone(record)
+        self.assertEqual(record["state"], "failed")
+
+    async def test_uncertain_fingerprint_survives_termination_write_failure(self):
+        # Mutation caught: relying on the terminal marker alone leaves a stale
+        # RUNNING record replayable when that marker cannot be persisted.
+        catalog = self.catalog("termination-failure")
+        original_save = run_state.save
+
+        def fail_completed_group_save(workspace, **kwargs):
+            if kwargs.get("tool_fingerprints") and kwargs.get("next_step") == 2:
+                raise OSError("fingerprint persistence failed")
+            return original_save(workspace, **kwargs)
+
+        with patch.object(
+            bot.run_state, "save", side_effect=fail_completed_group_save
+        ):
+            await self.drive(
+                catalog,
+                [
+                    _response(tool_calls=[
+                        _tool_call("uncertain-1", "bash_exec", {"command": "uncertain"})
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("must-not-run", "bash_exec", {"command": "second"})
+                    ]),
+                ],
+                killed=True,
+            )
+
+        self.assertEqual(self.bash_exec.await_count, 1)
+        stale_workspace = self.only_run(catalog)
+        self.assertEqual(run_state.load(stale_workspace)["state"], run_state.RUNNING)
+
+        self.restart()
+        fresh = self.catalog("termination-failure")
+        self.assertEqual(self.recover(fresh)["recovered"], 1)
+        await self.drive(
+            fresh,
+            [
+                _response(tool_calls=[
+                    _tool_call("uncertain-fresh", "bash_exec", {"command": "uncertain"})
+                ]),
+                _response(tool_calls=[
+                    _tool_call("uncertain-finish", "finish_task", {"report": LONG_REPORT})
+                ]),
+            ],
+            message_id=ORIGIN_MESSAGE_ID,
+        )
+
+        resumed = self.only_run(fresh)
+        self.assertEqual(self.bash_exec.await_count, 0)
+        blocked = json.loads(self.bash_result_of(self.stub, "uncertain-fresh", resumed))
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+
     async def _crash_after_one_group(self, catalog):
         await self.drive(
             catalog,
@@ -539,6 +720,37 @@ class RestartRecoveryTest(DurableStateTestCase):
             killed=True,
         )
         return self.only_run(catalog)
+
+    async def test_1_restart_restores_the_fingerprint_window_for_a_new_call_id(self):
+        # Production mutation caught: restoring only executed call ids lets the
+        # model issue the same successful action under a new id after restart.
+        crashed = await self._crash_after_one_group(self.catalog())
+        saved = run_state.load(crashed)
+        self.assertTrue(saved["tool_fingerprints"])
+
+        self.restart()
+        fresh = self.catalog()
+        self.assertEqual(self.recover(fresh)["recovered"], 1)
+
+        await self.drive(
+            fresh,
+            [
+                _response(tool_calls=[
+                    _tool_call("c-new", "bash_exec", {"command": "reproduce.sh"})
+                ]),
+                _response(tool_calls=[
+                    _tool_call("c-finish", "finish_task", {"report": LONG_REPORT})
+                ]),
+            ],
+            message_id=ORIGIN_MESSAGE_ID,
+        )
+
+        resumed = self.only_run(fresh)
+        self.assertEqual(resumed.run_id, crashed.run_id)
+        self.assertEqual(self.bash_exec.await_count, 0)
+        blocked = json.loads(self.bash_result_of(self.stub, "c-new", resumed))
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["first_step"], 1)
 
     async def test_1_restart_resumes_the_same_run_at_the_next_step(self):
         # Production mutation caught: rebuilding the payload and the step cursor
@@ -573,10 +785,13 @@ class RestartRecoveryTest(DurableStateTestCase):
         self.assertEqual(ledger.goal, "장애 원인 규명")
         self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=active@v1")
 
-        # 이미 실행한 호출은 결정적 구조화 결과로 차단된다.
-        blocked = json.loads(self.bash_result_of(self.stub, "c1", resumed))
-        self.assertTrue(blocked["blocked"])
-        self.assertEqual(blocked["reason"], "already_executed")
+        # 이미 알린 호출은 실행 전에 차단되고, 최초 호출의 실제 결과가
+        # 유일한 protocol pair로 그대로 보존된다.
+        self.assertEqual(self.bash_result_of(self.stub, "c1", resumed), BASH_RESULT)
+        self.assertEqual(
+            run_state.load(resumed)["announced_call_ids"],
+            ["c1", "c2", "c3", "c9"],
+        )
 
         records = self.records(resumed)
         resumed_records = records[_last_index(records, "run_resumed"):]
@@ -588,6 +803,55 @@ class RestartRecoveryTest(DurableStateTestCase):
         ]
         self.assertTrue(steps)
         self.assertEqual(min(steps), resume_step)
+
+    async def test_rejected_call_id_stays_reserved_after_restart(self):
+        # Production mutation caught: only accepted IDs survive the snapshot,
+        # so a rejected-but-announced ID can dispatch after process recovery.
+        catalog = self.catalog()
+        await self.drive(
+            catalog,
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        "reserved-after-restart", "bash_exec", "not an object"
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("crash-finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            killed=True,
+        )
+        crashed = self.only_run(catalog)
+
+        self.restart()
+        fresh = self.catalog()
+        self.assertEqual(self.recover(fresh)["recovered"], 1)
+        await self.drive(
+            fresh,
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        "reserved-after-restart",
+                        "bash_exec",
+                        {"command": "printf must-not-run"},
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            message_id=ORIGIN_MESSAGE_ID,
+        )
+
+        self.assertEqual(self.bash_exec.await_count, 0)
+        resumed = run_state.load(self.only_run(fresh))
+        self.assertEqual(
+            resumed["announced_call_ids"],
+            ["reserved-after-restart", "crash-finish", "valid-finish"],
+        )
+        for payload in self.stub.payloads("agent"):
+            self.assertTrue(bot.validate_chat_payload(payload).ok)
 
     @staticmethod
     def bash_result_of(stub, call_id, workspace=None):
@@ -671,7 +935,8 @@ class RestartRecoveryTest(DurableStateTestCase):
             tail=[],
             ledger=refuted_ledger(),
             interrupt={},
-            executed_call_ids=[],
+            announced_call_ids=[],
+            tool_fingerprints=[],
             trajectory_gap_step=None,
             state="stopped",
         )
@@ -742,7 +1007,7 @@ class CheckpointBoundaryTest(DurableStateTestCase):
         # 두 경우 모두 완결된 그룹과 다음 커서는 살아남는다.
         for record in (before, after):
             self.assertEqual(record["next_step"], 2)
-            self.assertEqual(record["executed_call_ids"], ["c1", "c2"])
+            self.assertEqual(record["announced_call_ids"], ["c1", "c2", "c3"])
 
         # 차이는 정정 하나뿐이다: 커밋 전에는 없고, 커밋 후에는 있다.
         self.assertEqual(before["ledger"].hypothesis_marker("H_B"), "H_B=active@v1")

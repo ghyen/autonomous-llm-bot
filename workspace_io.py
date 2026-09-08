@@ -1,13 +1,15 @@
 """Filesystem primitives shared by the parent catalog and sandbox worker."""
 
+import errno
 import hashlib
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 
 
-CANONICAL_NAMES = frozenset(("plan.md", "findings.md"))
+CANONICAL_NAMES = frozenset(("plan.md", "findings.md", "playbook.md"))
 RESERVED_NAMES = frozenset(("run.json", "state.json", "traj.jsonl"))
 ROOT_NAMES = CANONICAL_NAMES | RESERVED_NAMES
 REVISION_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
@@ -43,6 +45,55 @@ def _workspace_root(root):
     if not root.is_dir():
         raise ValueError("workspace is not a directory")
     return root
+
+
+def read_root_regular_bytes(root, name):
+    """Read one exact root-level regular file without following a link."""
+    root = _workspace_root(root)
+    name = os.fspath(name)
+    if (
+        isinstance(name, bytes)
+        or not name
+        or name in (os.curdir, os.pardir)
+        or os.path.basename(name) != name
+    ):
+        raise ValueError("root file name must be one text path component")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_descriptor = os.open(str(root), directory_flags)
+    file_descriptor = None
+    try:
+        try:
+            file_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=root_descriptor,
+            )
+        except FileNotFoundError:
+            return "not_found", None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                return "not_regular", None
+            try:
+                mode = os.stat(
+                    name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                ).st_mode
+            except FileNotFoundError:
+                return "not_found", None
+            if not stat.S_ISREG(mode):
+                return "not_regular", None
+            raise
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            return "not_regular", None
+        with os.fdopen(file_descriptor, "rb") as handle:
+            file_descriptor = None
+            return "success", handle.read()
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(root_descriptor)
 
 
 def resolve_path(root, path):

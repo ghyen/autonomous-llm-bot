@@ -20,6 +20,7 @@ from workspace_io import (
     atomic_write,
     is_canonical,
     read_bytes,
+    read_root_regular_bytes,
     resolve_path,
     revision,
     write_bytes,
@@ -296,10 +297,14 @@ class RunCatalog:
         # rather than adopt someone else's directory. secure_directory then fixes
         # the mode, which mkdir's mode argument cannot do under a loose umask.
         workspace.root.mkdir()
-        secure_directory(workspace.root)
-        if inherit_canonical:
-            self._inherit_canonical(workspace)
-        workspace.persist()
+        try:
+            secure_directory(workspace.root)
+            if inherit_canonical:
+                self._inherit_canonical(workspace)
+            workspace.persist()
+        except BaseException:
+            shutil.rmtree(workspace.root)
+            raise
         self._runs[run_id] = workspace
         return workspace
 
@@ -313,26 +318,21 @@ class RunCatalog:
         ]
         if not candidates:
             return
-        candidates.sort(
+        prior = max(
+            candidates,
             key=lambda item: (
                 str(item.updated_at),
                 str(item.created_at),
                 item.run_id,
             ),
-            reverse=True,
         )
-        for name in sorted(CANONICAL_NAMES):
-            dest = workspace.root / name
-            if dest.exists():
+        # Missing playbook.md in the newest run is a durable deletion boundary
+        # (including reset); never resurrect it from older runs.
+        for name in ("playbook.md",):
+            status, data = read_root_regular_bytes(prior.root, name)
+            if status != "success":
                 continue
-            for prior in candidates:
-                src = prior.root / name
-                if src.is_file():
-                    try:
-                        atomic_write(dest, src.read_bytes())
-                        break
-                    except OSError:
-                        continue
+            atomic_write(workspace.root / name, data)
 
     def _select_prepared(self, workspace):
         for key, selected_id in tuple(self._selected.items()):

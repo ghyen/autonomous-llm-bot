@@ -226,6 +226,114 @@ class LoadConfigTest(unittest.TestCase):
                     load_config(env=env(TOOL_NETWORK_ALLOWLIST=raw), env_file=None)
 
 
+class AgentLimitConfigTest(unittest.TestCase):
+    FIELDS = {
+        "MAX_AGENT_LOOPS": "max_agent_loops",
+        "CHECKPOINT_INTERVAL": "checkpoint_interval",
+        "MAX_TOOL_EXECUTIONS_PER_RUN": "max_tool_executions_per_run",
+        "AGENT_STEP_MAX_TOKENS": "agent_step_max_tokens",
+    }
+
+    def test_defaults_match_the_documented_limits(self):
+        config = load_config(env=env(), env_file=None)
+        self.assertEqual(
+            (
+                config.max_agent_loops,
+                config.checkpoint_interval,
+                config.max_tool_executions_per_run,
+                config.agent_step_max_tokens,
+            ),
+            (2000, 50, 2000, 2048),
+        )
+
+    def test_environment_overrides_are_applied(self):
+        config = load_config(
+            env=env(
+                MAX_AGENT_LOOPS="101",
+                CHECKPOINT_INTERVAL="11",
+                MAX_TOOL_EXECUTIONS_PER_RUN="202",
+                AGENT_STEP_MAX_TOKENS="303",
+            ),
+            env_file=None,
+        )
+        self.assertEqual(
+            (
+                config.max_agent_loops,
+                config.checkpoint_interval,
+                config.max_tool_executions_per_run,
+                config.agent_step_max_tokens,
+            ),
+            (101, 11, 202, 303),
+        )
+
+    def test_env_file_overrides_are_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, ".env")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "DISCORD_BOT_TOKEN=dummy-invalid-token\n"
+                    "DISCORD_ALLOWED_USER_IDS=111111111111111111\n"
+                    "MAX_AGENT_LOOPS=102\n"
+                    "CHECKPOINT_INTERVAL=12\n"
+                    "MAX_TOOL_EXECUTIONS_PER_RUN=203\n"
+                    "AGENT_STEP_MAX_TOKENS=304\n"
+                )
+            config = load_config(env={}, env_file=path)
+
+        self.assertEqual(
+            (
+                config.max_agent_loops,
+                config.checkpoint_interval,
+                config.max_tool_executions_per_run,
+                config.agent_step_max_tokens,
+            ),
+            (102, 12, 203, 304),
+        )
+
+    def test_invalid_or_nonpositive_values_fail_with_the_field_name(self):
+        for field in self.FIELDS:
+            for bad in ("not-an-int", "0", "-1", "1.5"):
+                with self.subTest(field=field, value=bad):
+                    with self.assertRaises(ConfigError) as caught:
+                        load_config(env=env(**{field: bad}), env_file=None)
+                    self.assertIn(field, str(caught.exception))
+
+    def test_diagnostics_report_effective_agent_limits(self):
+        text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))
+        self.assertIn(
+            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=2048",
+            text,
+        )
+
+    def test_invalid_limit_fails_before_workspace_catalog_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = os.path.join(tmp, "workspace")
+            logs = os.path.join(tmp, "logs")
+            child_env = dict(os.environ)
+            child_env.update(MINIMAL_ENV)
+            child_env.update({
+                "DISCORD_ADMIN_USER_IDS": "",
+                "DISCORD_FREE_RESPONSE_CHANNELS": "",
+                "LLM_BASE_URL": "http://127.0.0.1:18080/v1",
+                "MAX_AGENT_LOOPS": "not-an-int",
+                "WORKSPACE_DIR": workspace,
+                "SYSTEM_LOG_DIR": logs,
+            })
+            probe = subprocess.run(
+                [sys.executable, "-c", "import bot"],
+                cwd=os.path.dirname(__file__),
+                env=child_env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            self.assertNotEqual(probe.returncode, 0)
+            self.assertIn("MAX_AGENT_LOOPS", probe.stdout + probe.stderr)
+            self.assertFalse(os.path.exists(workspace))
+            self.assertFalse(os.path.exists(logs))
+
+
 class DiagnosticsTest(unittest.TestCase):
     def test_diagnostics_never_echo_the_token(self):
         secret = "dummy-invalid-token-abcdef123456"

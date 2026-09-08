@@ -9,12 +9,14 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 from collections import OrderedDict
 from pathlib import Path
 
 
-SCHEMA = 2
+SCHEMA = 3
+_ARTIFACT_PATH = re.compile(r"\Aartifacts/out_\.[0-9a-f]{64}\.log\Z")
 FILE_NAME = "traj.jsonl"
 ARGUMENT_STRING_MAX_CHARS = 1000
 RESULT_MAX_CHARS = 4000
@@ -102,6 +104,7 @@ def _decode_records(data, require_complete=False):
         record_id = body.pop("id", None)
         step = record.get("step")
         group_end = record.get("group_end")
+        artifact_path = record.get("artifact_path")
         if (
             not isinstance(record_id, str)
             or len(record_id) != 64
@@ -113,6 +116,14 @@ def _decode_records(data, require_complete=False):
             or isinstance(step, bool)
             or step < 1
             or not isinstance(group_end, bool)
+            or "artifact_path" not in record
+            or (
+                artifact_path is not None
+                and (
+                    not isinstance(artifact_path, str)
+                    or _ARTIFACT_PATH.fullmatch(artifact_path) is None
+                )
+            )
         ):
             invalid = True
             break
@@ -192,7 +203,11 @@ def append_tool_group(workspace, step, tool_calls, results, executed_ids):
         if prior:
             parent = prior[-1]["id"]
 
-        executed_ids = {str(call_id) for call_id in executed_ids or ()}
+        remaining_executed_ids = {
+            call_id
+            for call_id in executed_ids or ()
+            if isinstance(call_id, str) and call_id
+        }
         records = []
         for index, (call, raw_result) in enumerate(zip(tool_calls, results)):
             arguments = call.get("arguments")
@@ -200,19 +215,36 @@ def append_tool_group(workspace, step, tool_calls, results, executed_ids):
                 arguments = {}
             raw_arguments = _canonical(arguments)
             result = str(raw_result or "")
+            raw_call_id = call.get("id")
+            call_id = str(raw_call_id or "")
+            executed = (
+                isinstance(raw_call_id, str)
+                and bool(raw_call_id)
+                and raw_call_id in remaining_executed_ids
+            )
+            if executed:
+                remaining_executed_ids.discard(raw_call_id)
+            artifact_path = call.get("artifact_path")
+            if (
+                not executed
+                or not isinstance(artifact_path, str)
+                or not _ARTIFACT_PATH.fullmatch(artifact_path)
+            ):
+                artifact_path = None
             body = {
                 "schema": SCHEMA,
                 "parent": parent,
                 "step": step,
                 "group_end": index == len(tool_calls) - 1,
-                "call_id": str(call.get("id") or ""),
+                "call_id": call_id,
                 "tool": str(call.get("name") or ""),
                 "arguments": _bounded_value(arguments),
                 "arguments_chars": len(raw_arguments),
                 "result": _clip_middle(result, RESULT_MAX_CHARS),
                 "result_chars": len(result),
                 "failed": bool(call.get("failed")),
-                "executed": str(call.get("id") or "") in executed_ids,
+                "executed": executed,
+                "artifact_path": artifact_path,
             }
             record_id = hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
             record = dict(body)

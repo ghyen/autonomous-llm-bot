@@ -98,10 +98,10 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         original_bash = bot.tool_bash_exec
         original_dispatch = bot.execute_tools_in_parallel
 
-        async def recording_bash(workspace, command):
+        async def recording_bash(workspace, command, call_id):
             self.executed_commands.append(command)
             if use_real_bash:
-                return await original_bash(workspace, command)
+                return await original_bash(workspace, command, call_id)
             if callable(tool_result):
                 return tool_result(command, len(self.executed_commands))
             return tool_result
@@ -208,6 +208,415 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             json.dumps(blocked, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
 
+    # Mutation caught: reserving accepted IDs only after scanning the whole
+    # batch lets a second call with the same protocol ID reach dispatch.
+    async def test_same_batch_duplicate_id_is_rejected_before_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("duplicate-id", "bash_exec", {"command": "printf first"}),
+                _tool_call("duplicate-id", "bash_exec", {"command": "printf second"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf first"])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["duplicate-id"]],
+        )
+        next_payload = self.model.agent_payloads[1]
+        self.assertEqual(self._assistant_call_ids(next_payload), ["duplicate-id"])
+        self.assertEqual(
+            [message["tool_call_id"] for message in self._tool_messages(next_payload)],
+            ["duplicate-id"],
+        )
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+
+    async def test_duplicate_id_trajectory_marks_only_the_dispatched_occurrence(self):
+        # Mutation caught: ID-set membership aliases the blocked duplicate to
+        # the first call and records both trajectory occurrences as executed.
+        captured = []
+        original_append = trajectory.append_tool_group
+
+        def capture_records(*args, **kwargs):
+            records = original_append(*args, **kwargs)
+            captured.extend(records)
+            return records
+
+        with patch.object(
+            trajectory, "append_tool_group", side_effect=capture_records
+        ):
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call(
+                        "duplicate-trajectory",
+                        "bash_exec",
+                        {"command": "printf first"},
+                    ),
+                    _tool_call(
+                        "duplicate-trajectory",
+                        "bash_exec",
+                        {"command": "printf blocked"},
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(self.executed_commands, ["printf first"])
+        self.assertEqual(
+            [record["call_id"] for record in captured],
+            ["duplicate-trajectory", "duplicate-trajectory"],
+        )
+        self.assertEqual(
+            [record["executed"] for record in captured],
+            [True, False],
+        )
+
+    # Mutation caught: coercing raw call IDs to strings before assigning
+    # occurrence ownership lets rejected integer 7 steal string "7"'s artifact.
+    async def test_non_string_id_cannot_steal_trajectory_artifact_ownership(self):
+        script = 'import sys; sys.stdout.write("x" * 5001)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        captured = []
+        original_append = trajectory.append_tool_group
+
+        def capture_records(*args, **kwargs):
+            records = original_append(*args, **kwargs)
+            captured.extend(records)
+            return records
+
+        with patch.object(
+            trajectory, "append_tool_group", side_effect=capture_records
+        ):
+            await self.run_agent(
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            7,
+                            "bash_exec",
+                            {"command": "printf rejected"},
+                        ),
+                        _tool_call(
+                            "7",
+                            "bash_exec",
+                            {"command": command},
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                    ]),
+                ],
+                use_real_bash=True,
+            )
+
+        self.assertEqual(self.executed_commands, [command])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["7"]],
+        )
+        self.assertEqual(
+            [record["executed"] for record in captured],
+            [False, True],
+        )
+        self.assertEqual(
+            [record["artifact_path"] for record in captured],
+            [
+                None,
+                "artifacts/out_.7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451.log",
+            ],
+        )
+
+    # Mutation caught: hashing rejected raw list/dict IDs during execution-token
+    # consumption raises before recording rejection or later valid ownership.
+    async def test_unhashable_ids_reject_without_stealing_artifact_ownership(self):
+        script = 'import sys; sys.stdout.write("x" * 5001)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        captured = []
+        original_append = trajectory.append_tool_group
+
+        def capture_records(*args, **kwargs):
+            records = original_append(*args, **kwargs)
+            captured.extend(records)
+            return records
+
+        with patch.object(
+            trajectory, "append_tool_group", side_effect=capture_records
+        ):
+            message = await self.run_agent(
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            ["rejected-list"],
+                            "bash_exec",
+                            {"command": "printf rejected-list"},
+                        ),
+                        _tool_call(
+                            {"rejected": "dict"},
+                            "bash_exec",
+                            {"command": "printf rejected-dict"},
+                        ),
+                        _tool_call(
+                            "7",
+                            "bash_exec",
+                            {"command": command},
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                    ]),
+                ],
+                use_real_bash=True,
+            )
+
+        self.assertIn("중복 도구 제어 확인 완료.", message.replies[-1])
+        self.assertEqual(self.executed_commands, [command])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["7"]],
+        )
+        self.assertEqual(
+            [json.loads(record["result"])["error"] for record in captured[:2]],
+            ["invalid_tool_call_id", "invalid_tool_call_id"],
+        )
+        self.assertEqual(
+            [record["executed"] for record in captured],
+            [False, False, True],
+        )
+        self.assertEqual(
+            [record["artifact_path"] for record in captured],
+            [
+                None,
+                None,
+                "artifacts/out_.7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451.log",
+            ],
+        )
+
+    # Mutation caught: validating IDs only in the next model payload lets calls
+    # with IDs that cannot participate in the tool protocol execute first.
+    async def test_invalid_ids_are_rejected_before_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call(None, "bash_exec", {"command": "printf none"}),
+                _tool_call("", "bash_exec", {"command": "printf empty"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        next_payload = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+        self.assertFalse(any(
+            bot._msg_tool_calls(message) for message in next_payload
+        ))
+
+    # Mutation caught: reserving an ID only after every other admission check
+    # lets a later duplicate execute when the first occurrence is malformed.
+    async def test_malformed_first_duplicate_id_blocks_later_dispatch(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("duplicate-id", "bash_exec", "{bad"),
+                _tool_call(
+                    "duplicate-id", "bash_exec", {"command": "printf hidden"}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        next_payload = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+        self.assertEqual(self._assistant_call_ids(next_payload), ["duplicate-id"])
+        tool_messages = self._tool_messages(next_payload)
+        self.assertEqual(
+            [message["tool_call_id"] for message in tool_messages],
+            ["duplicate-id"],
+        )
+        self.assertEqual(
+            json.loads(tool_messages[0]["content"])["error"],
+            "invalid_tool_arguments",
+        )
+
+    # Mutation caught: keeping a rejected ID only in the current batch lets a
+    # later turn dispatch a side effect under that already-announced identity.
+    async def test_rejected_id_cannot_dispatch_on_a_later_turn(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("reserved-id", "bash_exec", "{bad"),
+            ]),
+            _response(tool_calls=[
+                _tool_call(
+                    "reserved-id", "bash_exec", {"command": "printf hidden"}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("fresh-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, [])
+        self.assertEqual(self.dispatched_batches, [])
+        repaired = self.model.agent_payloads[2]
+        self.assertTrue(bot.validate_chat_payload(repaired).ok)
+        self.assertEqual(
+            [
+                call["id"]
+                for message in repaired
+                for call in (message.get("tool_calls") or [])
+            ],
+            ["reserved-id"],
+        )
+        result = next(
+            message for message in repaired
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == "reserved-id"
+        )
+        self.assertEqual(json.loads(result["content"])["error"], "invalid_tool_arguments")
+
+    # Mutation caught: selecting finish_task before identity validation lets a
+    # missing or non-string protocol ID complete the run immediately.
+    async def test_invalid_finish_ids_require_a_fresh_identity(self):
+        for invalid_id in (None, 7):
+            with self.subTest(call_id=invalid_id):
+                self._reset_channel_state()
+                invalid_report = f"invalid terminal {invalid_id!r}"
+                message = await self.run_agent([
+                    _response(tool_calls=[
+                        _tool_call(
+                            invalid_id, "finish_task", {"report": invalid_report}
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call(
+                            "valid-finish", "finish_task", {"report": LONG_REPORT}
+                        ),
+                    ]),
+                ])
+
+                self.assertEqual(len(self.model.agent_payloads), 2)
+                self.assertEqual(self.model.responses, [])
+                delivered = "".join(message.replies + message.channel.sent)
+                self.assertNotIn(invalid_report, delivered)
+                self.assertIn(LONG_REPORT.strip(), delivered)
+
+    # Mutation caught: logging an identity-snapshot failure but continuing lets
+    # an undurable call execute or complete before a restart can reserve it.
+    async def test_identity_reservation_failure_blocks_dispatch_and_completion(self):
+        terminal_report = "must not complete after reservation failure"
+        cases = (
+            (
+                "side_effect",
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            "undurable-side-effect",
+                            "bash_exec",
+                            {"command": "printf undurable"},
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call(
+                            "unused-finish",
+                            "finish_task",
+                            {"report": terminal_report},
+                        ),
+                    ]),
+                ],
+            ),
+            (
+                "terminal",
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            "undurable-finish",
+                            "finish_task",
+                            {"report": terminal_report},
+                        ),
+                    ]),
+                ],
+            ),
+        )
+        for label, responses in cases:
+            with self.subTest(path=label):
+                self._reset_channel_state()
+                original_save = bot.run_state.save
+
+                def fail_identity_save(*args, **kwargs):
+                    if kwargs.get("announced_call_ids"):
+                        raise OSError("identity reservation failed")
+                    return original_save(*args, **kwargs)
+
+                with patch.object(
+                    bot.run_state, "save", side_effect=fail_identity_save
+                ):
+                    message = await self.run_agent(responses)
+
+                self.assertEqual(self.executed_commands, [])
+                self.assertEqual(len(self.model.agent_payloads), 1)
+                delivered = "".join(message.replies + message.channel.sent)
+                self.assertNotIn(terminal_report, delivered)
+
+    # Mutation caught: choosing a duplicate-ID terminal before batch validation
+    # refuses its companion and drops the companion's accepted result.
+    async def test_duplicate_finish_id_preserves_the_first_accepted_result(self):
+        invalid_report = "duplicate terminal must not complete"
+        message = await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("shared-id", "bash_exec", {"command": "printf kept"}),
+                _tool_call("shared-id", "finish_task", {"report": invalid_report}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf kept"])
+        self.assertEqual(len(self.model.agent_payloads), 2)
+        paired = self.model.agent_payloads[1]
+        self.assertTrue(bot.validate_chat_payload(paired).ok)
+        self.assertEqual(
+            [message["content"] for message in self._tool_messages(paired)],
+            [SUCCESS_RESULT],
+        )
+        delivered = "".join(message.replies + message.channel.sent)
+        self.assertNotIn(invalid_report, delivered)
+        self.assertIn(LONG_REPORT.strip(), delivered)
+
+    # Mutation caught: a terminal reusing an ID announced and rejected on an
+    # earlier turn bypasses the run-wide identity rule and completes the run.
+    async def test_previously_announced_finish_id_cannot_complete(self):
+        invalid_report = "reused terminal must not complete"
+        message = await self.run_agent([
+            _response(tool_calls=[
+                _raw_tool_call("reserved-finish", "bash_exec", "{bad"),
+            ]),
+            _response(tool_calls=[
+                _tool_call(
+                    "reserved-finish", "finish_task", {"report": invalid_report}
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call("valid-finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(len(self.model.agent_payloads), 3)
+        delivered = "".join(message.replies + message.channel.sent)
+        self.assertNotIn(invalid_report, delivered)
+        self.assertIn(LONG_REPORT.strip(), delivered)
+
     # Mutation caught: canonicalizing arguments without sorted keys treats the
     # same JSON object in a different key order as a second side effect.
     async def test_same_batch_key_order_variant_is_the_same_signature(self):
@@ -278,6 +687,41 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked["count"], 2)
         self.assertTrue(blocked["blocked"])
         self.assertEqual(blocked["directive"], BLOCK_DIRECTIVE)
+
+    # Mutation caught: treating force as action data lets the model alternate
+    # policy metadata to reset an otherwise consecutive failure streak.
+    async def test_force_metadata_does_not_reset_the_failure_streak(self):
+        attempts = [
+            {"command": "always-fail"},
+            {"command": "always-fail", "force": True},
+            {"command": "always-fail", "force": False},
+        ]
+        await self.run_agent(
+            [
+                _response(tool_calls=[
+                    _tool_call(
+                        f"force-failure-{attempt}", "bash_exec", arguments
+                    ),
+                ])
+                for attempt, arguments in enumerate(attempts, start=1)
+            ] + [
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ],
+            tool_result="[Error: synthetic failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["always-fail", "always-fail"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["force-failure-1"], ["force-failure-2"]],
+        )
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[3])[-1]["content"]
+        )
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["count"], 2)
 
     # Mutation caught: describing an all-blocked batch as active terminal or
     # network I/O misreports a request that never reaches the dispatcher.
@@ -448,7 +892,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.run_agent(
             [
                 _response(tool_calls=[
-                    _tool_call(f"success-reset-{attempt}", "bash_exec", {"command": "recovering-A"}),
+                    _tool_call(
+                        f"success-reset-{attempt}",
+                        "bash_exec",
+                        {"command": "recovering-A", "force": True},
+                    ),
                 ])
                 for attempt in range(1, 5)
             ] + [
@@ -478,7 +926,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.run_agent(
             [
                 _response(tool_calls=[
-                    _tool_call(f"prose-{attempt}", "bash_exec", {"command": "prose-A"}),
+                    _tool_call(
+                        f"prose-{attempt}",
+                        "bash_exec",
+                        {"command": "prose-A", "force": True},
+                    ),
                 ])
                 for attempt in range(1, 5)
             ] + [
@@ -502,7 +954,11 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.run_agent(
             [
                 _response(tool_calls=[
-                    _tool_call(f"stdout-marker-{attempt}", "bash_exec", {"command": "marker-A"}),
+                    _tool_call(
+                        f"stdout-marker-{attempt}",
+                        "bash_exec",
+                        {"command": "marker-A", "force": True},
+                    ),
                 ])
                 for attempt in range(1, 4)
             ] + [
@@ -529,9 +985,9 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             bot, workspace
         ):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
-            result = await bot.tool_bash_exec(run, command)
+            result = await bot.tool_bash_exec(run, command, "long-nonzero")
 
-        self.assertIn("출력 결과가 너무 길어", result)
+        self.assertIn("artifacts/out_", result)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
     # Mutation caught: hiding a real noisy subprocess's nonzero status from the
@@ -665,6 +1121,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
                     _response(tool_calls=[
                         _tool_call(f"read-success-{attempt}", "read_file", {
                             "path": "error_like.txt",
+                            "force": True,
                         }),
                     ])
                     for attempt in range(1, 4)
@@ -1249,6 +1706,260 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(appended_steps, [1, 3])
         self.assertIsNone(saved_gaps[1])
         self.assertEqual(saved_gaps[-2:], [2, 2])
+    # --- Issue #50: harness-level loop guard over a multi-step window ---
+
+    @staticmethod
+    def _bash(call_id, command, force=None):
+        arguments = {"command": command}
+        if force is not None:
+            arguments["force"] = force
+        return _tool_call(call_id, "bash_exec", arguments)
+
+    @staticmethod
+    def _finish():
+        return _response(tool_calls=[
+            _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+        ])
+
+    def _last_blocked(self, payload_index):
+        content = self._tool_messages(self.model.agent_payloads[payload_index])[-1]
+        return json.loads(content["content"])
+
+    # Mutation caught: hashing ignored metadata lets the model change data that
+    # dispatch never consumes and replay the same effective side effect.
+    async def test_ignored_metadata_cannot_bypass_effective_action_identity(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call(
+                    "metadata-1",
+                    "bash_exec",
+                    {"command": "printf once", "tag": 1},
+                ),
+            ]),
+            _response(tool_calls=[
+                _tool_call(
+                    "metadata-2",
+                    "bash_exec",
+                    {"command": "printf once", "tag": 2},
+                ),
+            ]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf once"])
+        self.assertEqual(len(self.dispatched_batches), 1)
+        blocked = self._last_blocked(2)
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["tool"], "bash_exec")
+
+    # Mutation caught: admitting a forced duplicate against stale pre-batch
+    # failure state lets two pending copies exceed the consecutive-failure cap.
+    async def test_forced_pending_duplicate_cannot_exceed_failure_cap(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[self._bash("pending-1", "always-fail")]),
+                _response(tool_calls=[
+                    self._bash("pending-2", "always-fail"),
+                    self._bash("pending-forced", "always-fail", force=True),
+                ]),
+                self._finish(),
+            ],
+            tool_result="[Error: synthetic failure]",
+        )
+
+        self.assertEqual(self.executed_commands, ["always-fail", "always-fail"])
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["pending-1"], ["pending-2"]],
+        )
+        tools = self._tool_messages(self.model.agent_payloads[2])[-2:]
+        self.assertEqual(
+            [tool["tool_call_id"] for tool in tools],
+            ["pending-2", "pending-forced"],
+        )
+        blocked = json.loads(tools[1]["content"])
+        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["count"], bot.MAX_CONSECUTIVE_FAILED_TOOL_CALLS)
+
+    # Mutation caught: a guard that only remembers the immediately preceding
+    # call lets a truncated-reasoning relapse re-run a command whose result is
+    # already in context, which is the Step 30 -> Step 36 curl replay.
+    async def test_identical_successful_call_repeated_inside_the_window_is_blocked(self):
+        await self.run_agent([
+            _response(tool_calls=[self._bash("loop-1", "curl https://example.com/a")]),
+            _response(tool_calls=[self._bash("loop-2", "curl https://example.com/b")]),
+            _response(tool_calls=[self._bash("loop-3", "curl https://example.com/a")]),
+            self._finish(),
+        ])
+
+        self.assertEqual(
+            self.executed_commands,
+            ["curl https://example.com/a", "curl https://example.com/b"],
+        )
+        self.assertEqual(len(self.dispatched_batches), 2)
+        blocked = self._last_blocked(3)
+        self.assertTrue(blocked["blocked"])
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["tool"], "bash_exec")
+        self.assertEqual(blocked["limit"], bot.TOOL_LOOP_GUARD_WINDOW)
+        self.assertEqual(blocked["first_step"], 1)
+        self.assertIn("Step 1", blocked["directive"])
+
+    # Mutation caught: without an escape hatch the guard also blocks the
+    # legitimate retries it cannot distinguish, such as polling a job log.
+    async def test_force_lets_an_intentional_retry_through(self):
+        await self.run_agent([
+            _response(tool_calls=[self._bash("poll-1", "cat job.log")]),
+            _response(tool_calls=[self._bash("poll-2", "cat job.log", force=True)]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["cat job.log"] * 2)
+        self.assertEqual(len(self.dispatched_batches), 2)
+
+    # Mutation caught: hashing force along with the real arguments makes
+    # force=true produce a different fingerprint, so the flag silently disables
+    # the guard for every later call instead of overriding one of them.
+    async def test_force_is_excluded_from_the_fingerprint(self):
+        self.assertEqual(
+            bot._tool_fingerprint("bash_exec", {"command": "cat job.log"}),
+            bot._tool_fingerprint("bash_exec", {"command": "cat job.log", "force": True}),
+        )
+
+        await self.run_agent([
+            _response(tool_calls=[self._bash("fp-1", "cat job.log")]),
+            _response(tool_calls=[self._bash("fp-2", "cat job.log", force=True)]),
+            _response(tool_calls=[self._bash("fp-3", "cat job.log")]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["cat job.log"] * 2)
+        self.assertEqual(self._last_blocked(3)["reason"], "loop_guard_repeat")
+
+    # Mutation caught: retaining the original step after a successful forced
+    # repeat lets the refreshed action expire from the window one step later.
+    async def test_successful_forced_repeat_refreshes_the_window(self):
+        filler = [
+            _response(tool_calls=[self._bash(f"refresh-{step}", f"probe-{step}")])
+            for step in range(2, bot.TOOL_LOOP_GUARD_WINDOW + 1)
+        ]
+        await self.run_agent(
+            [_response(tool_calls=[self._bash("refresh-1", "cat refresh.log")])]
+            + filler
+            + [
+                _response(tool_calls=[
+                    self._bash("refresh-forced", "cat refresh.log", force=True)
+                ]),
+                _response(tool_calls=[
+                    self._bash("refresh-blocked", "cat refresh.log")
+                ]),
+                self._finish(),
+            ]
+        )
+
+        self.assertEqual(self.executed_commands.count("cat refresh.log"), 2)
+        blocked = self._last_blocked(-1)
+        self.assertEqual(blocked["reason"], "loop_guard_repeat")
+        self.assertEqual(blocked["first_step"], bot.TOOL_LOOP_GUARD_WINDOW + 1)
+
+    # Mutation caught: an unbounded memory of every call ever made turns a
+    # long run's legitimate re-check into a permanent refusal.
+    async def test_identical_call_outside_the_window_runs_again(self):
+        filler = [
+            _response(tool_calls=[self._bash(f"win-{step}", f"probe-{step}")])
+            for step in range(2, bot.TOOL_LOOP_GUARD_WINDOW + 2)
+        ]
+        await self.run_agent(
+            [_response(tool_calls=[self._bash("win-1", "probe-repeat")])]
+            + filler
+            + [
+                _response(tool_calls=[self._bash("win-last", "probe-repeat")]),
+                self._finish(),
+            ]
+        )
+
+        self.assertEqual(self.executed_commands.count("probe-repeat"), 2)
+
+    # Mutation caught: force=false is policy metadata, not a distinct action;
+    # including it in same-batch identity lets the model execute the same side
+    # effect twice without actually requesting an override.
+    async def test_force_false_cannot_bypass_same_batch_identity(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                self._bash("false-1", "printf same"),
+                self._bash("false-2", "printf same", force=False),
+            ]),
+            self._finish(),
+        ])
+
+        self.assertEqual(self.executed_commands, ["printf same"])
+        tools = self._tool_messages(self.model.agent_payloads[1])[-2:]
+        self.assertEqual([item["tool_call_id"] for item in tools], ["false-1", "false-2"])
+        self.assertEqual(json.loads(tools[1]["content"])["reason"], "same_batch_duplicate")
+
+    # Mutation caught: a window held only in memory restarts empty, so the
+    # relapse this guard exists to stop survives exactly the restart that
+    # caused the reasoning truncation in the first place.
+    async def test_snapshot_carries_the_window_for_a_restart(self):
+        captured = []
+        original_save = bot.run_state.save
+
+        def capturing_save(workspace, **kwargs):
+            captured.append(list(kwargs.get("tool_fingerprints") or ()))
+            return original_save(workspace, **kwargs)
+
+        with patch.object(bot.run_state, "save", capturing_save):
+            await self.run_agent([
+                _response(tool_calls=[self._bash("persist-1", "probe-persist")]),
+                self._finish(),
+            ])
+
+        recorded = [entry for entries in captured for entry in entries]
+        self.assertTrue(recorded, "no fingerprint reached the durable record")
+        fingerprint, step = recorded[-1]
+        self.assertEqual(
+            fingerprint, bot._tool_fingerprint("bash_exec", {"command": "probe-persist"})
+        )
+        self.assertEqual(step, 1)
+
+    # Mutation caught: guarding record_state stalls authoritative state updates,
+    # which are cheap, idempotent, and already have their own refusal path.
+    async def test_state_and_write_tools_are_outside_the_guard(self):
+        self.assertEqual(
+            sorted(bot.TOOL_LOOP_GUARD_TOOLS),
+            ["bash_exec", "read_file", "web_search"],
+        )
+        schemas = {
+            entry["function"]["name"]: entry["function"]["parameters"]
+            for entry in bot.agent_tool_params()["tools"]
+        }
+        for name in bot.TOOL_LOOP_GUARD_TOOLS:
+            with self.subTest(tool=name):
+                self.assertEqual(
+                    schemas[name]["properties"]["force"],
+                    {
+                        "type": "boolean",
+                        "description": schemas[name]["properties"]["force"]["description"],
+                    },
+                )
+                self.assertNotIn("force", schemas[name]["required"])
+        self.assertNotIn("force", schemas["write_file"]["properties"])
+        self.assertNotIn("force", schemas["record_state"]["properties"])
+
+    # Mutation caught: recording failed calls makes the loop guard fire on the
+    # second attempt, so consecutive_failure_limit becomes unreachable and its
+    # more specific reason never reaches the model.
+    async def test_failed_repeats_stay_with_the_consecutive_failure_gate(self):
+        await self.run_agent(
+            [
+                _response(tool_calls=[self._bash(f"fail-{attempt}", "broken-command")])
+                for attempt in range(1, 4)
+            ] + [self._finish()],
+            tool_result="[Error: still broken]",
+        )
+
+        self.assertEqual(self.executed_commands, ["broken-command"] * 2)
+        self.assertEqual(self._last_blocked(3)["reason"], "consecutive_failure_limit")
 
 
 if __name__ == "__main__":

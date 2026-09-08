@@ -186,7 +186,7 @@ class StopLatencyTest(CancellationTestCase):
                 return _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "wedged"})])
             return _response(content="계속")
 
-        async def wedged_tool(workspace, command):
+        async def wedged_tool(workspace, command, call_id):
             self.stage_started.set()
             await asyncio.sleep(60)
             return "never"
@@ -254,7 +254,7 @@ class NoStageAfterCancellationTest(CancellationTestCase):
             await asyncio.sleep(60)
             return _response(content="never")
 
-        async def tool(workspace, command):
+        async def tool(workspace, command, call_id):
             tool_calls.append(command)
             return "ok"
 
@@ -925,7 +925,7 @@ class ToolBatchCleanupTest(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         expected = AttributeError("tool failed")
 
-        async def tool(workspace, command):
+        async def tool(workspace, command, call_id):
             if command == "fail":
                 await sibling_started.wait()
                 raise expected
@@ -936,8 +936,8 @@ class ToolBatchCleanupTest(unittest.IsolatedAsyncioTestCase):
                 sibling_finalized.set()
 
         calls = [
-            {"name": "bash_exec", "arguments": {"command": "fail"}},
-            {"name": "bash_exec", "arguments": {"command": "block"}},
+            {"id": "c1", "name": "bash_exec", "arguments": {"command": "fail"}},
+            {"id": "c2", "name": "bash_exec", "arguments": {"command": "block"}},
         ]
 
         try:
@@ -971,7 +971,7 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "CONFIG", tight):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
             result = await bot.tool_bash_exec(
-                run, f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}"
+                run, f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}", "timeout-probe"
             )
 
         self.assertIn("timed out", result)
@@ -989,7 +989,7 @@ class ProcessTreeTest(unittest.IsolatedAsyncioTestCase):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
             task = asyncio.ensure_future(
                 bot.tool_bash_exec(
-                    run, f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}"
+                    run, f"sh -c 'sleep 40 # {marker}' & sleep 40 # {marker}", "cancel-probe"
                 )
             )
             await asyncio.sleep(0.4)
