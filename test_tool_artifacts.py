@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 from test_support import TEST_USER_ID, run_catalog_patch
 
 import bot
+import trajectory
 
 
 CHANNEL_ID = 987654830
@@ -248,6 +249,66 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("5010", counted)
         self.assertRegex(counted, r"\[exit code: 0\]\s*$")
+
+    async def test_parallel_artifact_slots_follow_long_and_short_calls(self):
+        artifact_paths = [None, None]
+        long_result, short_result = await bot.execute_tools_in_parallel(
+            self.run,
+            [
+                {
+                    "id": "long-dispatch",
+                    "name": "bash_exec",
+                    "arguments": {"command": long_bash_command()},
+                },
+                {
+                    "id": "short-dispatch",
+                    "name": "bash_exec",
+                    "arguments": {"command": "printf ok"},
+                },
+            ],
+            artifact_paths=artifact_paths,
+        )
+
+        self.assertEqual(
+            artifact_paths, [artifact_path(long_result), None]
+        )
+        self.assertEqual(short_result, "[stdout]\nok\n[exit code: 0]")
+
+    async def test_lookup_trajectory_response_is_aggregate_bounded(self):
+        calls = [
+            {
+                "id": f"lookup-source-{index}",
+                "name": "bash_exec",
+                "arguments": {"command": f"probe-{index}"},
+                "failed": False,
+            }
+            for index in range(20)
+        ]
+        trajectory.append_tool_group(
+            self.run,
+            7,
+            calls,
+            ["x" * 5000 for _ in calls],
+            {call["id"] for call in calls},
+        )
+
+        artifact_paths = [None]
+        [result] = await bot.execute_tools_in_parallel(
+            self.run,
+            [{
+                "id": "lookup-envelope",
+                "name": "lookup_trajectory",
+                "arguments": {"step": 7},
+            }],
+            artifact_paths=artifact_paths,
+        )
+
+        self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
+        path = artifact_path(result)
+        self.assertEqual(artifact_paths, [path])
+        stored = json.loads((self.run.root / path).read_text(encoding="utf-8"))
+        self.assertEqual(stored["total"], 20)
+        self.assertEqual(len(stored["records"]), 20)
 
 
 if __name__ == "__main__":

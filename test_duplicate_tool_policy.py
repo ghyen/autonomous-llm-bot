@@ -13,6 +13,7 @@ from unittest.mock import patch
 from test_support import FakeMessage, TEST_USER_ID, run_catalog_patch
 
 import bot
+import trajectory
 
 
 CHANNEL_ID = 987654800
@@ -233,6 +234,169 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             ["duplicate-id"],
         )
         self.assertTrue(bot.validate_chat_payload(next_payload).ok)
+
+    async def test_duplicate_id_trajectory_marks_only_the_dispatched_occurrence(self):
+        # Mutation caught: ID-set membership aliases the blocked duplicate to
+        # the first call and records both trajectory occurrences as executed.
+        captured = []
+        original_append = trajectory.append_tool_group
+
+        def capture_records(*args, **kwargs):
+            records = original_append(*args, **kwargs)
+            captured.extend(records)
+            return records
+
+        with patch.object(
+            trajectory, "append_tool_group", side_effect=capture_records
+        ):
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call(
+                        "duplicate-trajectory",
+                        "bash_exec",
+                        {"command": "printf first"},
+                    ),
+                    _tool_call(
+                        "duplicate-trajectory",
+                        "bash_exec",
+                        {"command": "printf blocked"},
+                    ),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(self.executed_commands, ["printf first"])
+        self.assertEqual(
+            [record["call_id"] for record in captured],
+            ["duplicate-trajectory", "duplicate-trajectory"],
+        )
+        self.assertEqual(
+            [record["executed"] for record in captured],
+            [True, False],
+        )
+
+    # Mutation caught: coercing raw call IDs to strings before assigning
+    # occurrence ownership lets rejected integer 7 steal string "7"'s artifact.
+    async def test_non_string_id_cannot_steal_trajectory_artifact_ownership(self):
+        script = 'import sys; sys.stdout.write("x" * 5001)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        captured = []
+        original_append = trajectory.append_tool_group
+
+        def capture_records(*args, **kwargs):
+            records = original_append(*args, **kwargs)
+            captured.extend(records)
+            return records
+
+        with patch.object(
+            trajectory, "append_tool_group", side_effect=capture_records
+        ):
+            await self.run_agent(
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            7,
+                            "bash_exec",
+                            {"command": "printf rejected"},
+                        ),
+                        _tool_call(
+                            "7",
+                            "bash_exec",
+                            {"command": command},
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                    ]),
+                ],
+                use_real_bash=True,
+            )
+
+        self.assertEqual(self.executed_commands, [command])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["7"]],
+        )
+        self.assertEqual(
+            [record["executed"] for record in captured],
+            [False, True],
+        )
+        self.assertEqual(
+            [record["artifact_path"] for record in captured],
+            [
+                None,
+                "artifacts/out_.7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451.log",
+            ],
+        )
+
+    # Mutation caught: hashing rejected raw list/dict IDs during execution-token
+    # consumption raises before recording rejection or later valid ownership.
+    async def test_unhashable_ids_reject_without_stealing_artifact_ownership(self):
+        script = 'import sys; sys.stdout.write("x" * 5001)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        captured = []
+        original_append = trajectory.append_tool_group
+
+        def capture_records(*args, **kwargs):
+            records = original_append(*args, **kwargs)
+            captured.extend(records)
+            return records
+
+        with patch.object(
+            trajectory, "append_tool_group", side_effect=capture_records
+        ):
+            message = await self.run_agent(
+                [
+                    _response(tool_calls=[
+                        _tool_call(
+                            ["rejected-list"],
+                            "bash_exec",
+                            {"command": "printf rejected-list"},
+                        ),
+                        _tool_call(
+                            {"rejected": "dict"},
+                            "bash_exec",
+                            {"command": "printf rejected-dict"},
+                        ),
+                        _tool_call(
+                            "7",
+                            "bash_exec",
+                            {"command": command},
+                        ),
+                    ]),
+                    _response(tool_calls=[
+                        _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                    ]),
+                ],
+                use_real_bash=True,
+            )
+
+        self.assertIn("중복 도구 제어 확인 완료.", message.replies[-1])
+        self.assertEqual(self.executed_commands, [command])
+        self.assertEqual(
+            [[call_id for call_id, _name, _arguments in batch]
+             for batch in self.dispatched_batches],
+            [["7"]],
+        )
+        self.assertEqual(
+            [json.loads(record["result"])["error"] for record in captured[:2]],
+            ["invalid_tool_call_id", "invalid_tool_call_id"],
+        )
+        self.assertEqual(
+            [record["executed"] for record in captured],
+            [False, False, True],
+        )
+        self.assertEqual(
+            [record["artifact_path"] for record in captured],
+            [
+                None,
+                None,
+                "artifacts/out_.7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451.log",
+            ],
+        )
 
     # Mutation caught: validating IDs only in the next model payload lets calls
     # with IDs that cannot participate in the tool protocol execute first.
@@ -1465,6 +1629,83 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("요청 도구", live_status)
         self.assertNotIn("총 도구: `101개`", live_status)
 
+    # Mutation caught: recording before merged_results is complete loses blocked
+    # calls or writes None, while recording only allowed calls hides the harness
+    # decisions that explain why a path was not executed.
+    async def test_completed_tool_group_is_appended_to_the_trajectory_once(self):
+        captured = []
+        real_append = trajectory.append_tool_group
+
+        def recording_append(workspace, step, calls, results, executed_ids):
+            captured.append({
+                "step": step,
+                "calls": [dict(call) for call in calls],
+                "results": list(results),
+                "executed_ids": set(executed_ids),
+            })
+            return real_append(workspace, step, calls, results, executed_ids)
+
+        with patch.object(bot.trajectory, "append_tool_group", recording_append):
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call("trail-1", "bash_exec", {"command": "printf trail"}),
+                    _tool_call("trail-2", "bash_exec", {"command": "printf trail"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(len(captured), 1)
+        group = captured[0]
+        self.assertEqual(group["step"], 1)
+        self.assertEqual([call["id"] for call in group["calls"]], ["trail-1", "trail-2"])
+        self.assertEqual(group["executed_ids"], {"trail-1"})
+        self.assertTrue(all(isinstance(result, str) for result in group["results"]))
+        blocked = json.loads(group["results"][1])
+        self.assertEqual(blocked["reason"], "same_batch_duplicate")
+        self.assertFalse(group["calls"][0]["failed"])
+        self.assertFalse(group["calls"][1]["failed"])
+
+    async def test_trajectory_write_failure_latches_the_first_durable_gap(self):
+        # Production mutation caught: a zero-byte Step 2 append failure followed
+        # by a valid Step 3 chain must not be forgotten at the next snapshot.
+        real_append = trajectory.append_tool_group
+        real_save = bot.run_state.save
+        appended_steps = []
+        saved_gaps = []
+
+        def failing_append(workspace, step, calls, results, executed_ids):
+            if step == 2:
+                raise OSError("injected zero-byte trajectory failure")
+            appended_steps.append(step)
+            return real_append(workspace, step, calls, results, executed_ids)
+
+        def recording_save(*args, **kwargs):
+            saved_gaps.append(kwargs.get("trajectory_gap_step"))
+            return real_save(*args, **kwargs)
+
+        with patch.object(bot.trajectory, "append_tool_group", failing_append), patch.object(
+            bot.run_state, "save", recording_save
+        ):
+            await self.run_agent([
+                _response(tool_calls=[
+                    _tool_call("gap-1", "bash_exec", {"command": "printf one"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("gap-2", "bash_exec", {"command": "printf two"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("gap-3", "bash_exec", {"command": "printf three"}),
+                ]),
+                _response(tool_calls=[
+                    _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+                ]),
+            ])
+
+        self.assertEqual(appended_steps, [1, 3])
+        self.assertIsNone(saved_gaps[1])
+        self.assertEqual(saved_gaps[-2:], [2, 2])
     # --- Issue #50: harness-level loop guard over a multi-step window ---
 
     @staticmethod

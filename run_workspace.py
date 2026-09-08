@@ -20,6 +20,7 @@ from workspace_io import (
     atomic_write,
     is_canonical,
     read_bytes,
+    read_root_regular_bytes,
     resolve_path,
     revision,
     write_bytes,
@@ -325,13 +326,11 @@ class RunCatalog:
                 item.run_id,
             ),
         )
-        # Missing canonical files in the newest run are a durable deletion
-        # boundary (including reset); never resurrect them from older runs.
-        for name in sorted(CANONICAL_NAMES):
-            src = prior.root / name
-            try:
-                data = src.read_bytes()
-            except FileNotFoundError:
+        # Missing playbook.md in the newest run is a durable deletion boundary
+        # (including reset); never resurrect it from older runs.
+        for name in ("playbook.md",):
+            status, data = read_root_regular_bytes(prior.root, name)
+            if status != "success":
                 continue
             atomic_write(workspace.root / name, data)
 

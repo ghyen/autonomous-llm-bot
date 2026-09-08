@@ -375,40 +375,63 @@ class RolloverBoundaryTest(unittest.IsolatedAsyncioTestCase):
     # Mutation caught: replacing the typed rollover timeout fallback with a
     # re-raise loses the bounded local summary even though source is preserved.
     async def test_rollover_timeout_uses_bounded_local_compaction(self):
-        messages = []
-        for step in range(10):
-            messages.extend([
-                {
-                    "role": "assistant",
-                    "content": f"step {step} 판단",
-                    "tool_calls": [{
-                        "id": f"c{step}",
-                        "type": "function",
-                        "function": {
-                            "name": "bash_exec",
-                            "arguments": json.dumps({"command": f"probe {step}"}),
-                        },
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(root=temp_dir)
+            for step in range(1, 11):
+                bot.trajectory.append_tool_group(
+                    workspace,
+                    step,
+                    [{
+                        "id": f"traj-{step}",
+                        "name": "bash_exec",
+                        "arguments": {"command": f"probe {step}"},
+                        "failed": True,
                     }],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": f"c{step}",
-                    "name": "bash_exec",
-                    "content": f"step {step} 결과",
-                },
-            ])
+                    [f"[stderr]\nblocked-{step}\n[exit code: 1]"],
+                    {f"traj-{step}"},
+                )
 
-        with patch.object(
-            bot,
-            "run_completion_stage",
-            AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
-        ):
-            rolled, summary = await bot.rollover_agent_context(
-                TEST_WORKSPACE, messages, "기존 요약", 10
+            messages = []
+            for step in range(11):
+                messages.extend([
+                    {
+                        "role": "assistant",
+                        "content": f"step {step} 판단",
+                        "tool_calls": [{
+                            "id": f"c{step}",
+                            "type": "function",
+                            "function": {
+                                "name": "bash_exec",
+                                "arguments": json.dumps({"command": f"probe {step}"}),
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"c{step}",
+                        "name": "bash_exec",
+                        "content": f"step {step} 결과",
+                    },
+                ])
+
+            existing = bot.format_tiered_summary(
+                tier3="- 이전 절차 요약",
+                tier3_through=0,
+                tier2_lines=[],
+                discoveries=[],
             )
+            with patch.object(
+                bot,
+                "run_completion_stage",
+                AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
+            ):
+                rolled, summary = await bot.rollover_agent_context(
+                    workspace, messages, existing, 40
+                )
 
-        self.assertIn("기존 요약", summary)
-        self.assertIn("step 0", summary)
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertIn("이전 절차 요약", parsed["tier3"])
+        self.assertIn("Step 1-10", parsed["tier3"])
         self.assertLessEqual(len(summary), bot.ROLLING_SUMMARY_MAX_CHARS)
         self.assertEqual(bot._msg_role(rolled[0]), "system")
         self.assertIn("롤링 컨텍스트 재개", bot._msg_content(rolled[1]))

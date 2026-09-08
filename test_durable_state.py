@@ -96,11 +96,9 @@ class ModelStub:
         self.calls.append((kind, messages))
 
         if kind == "rollover":
-            return _response(content=bot.format_hierarchical_summary(
-                milestones=["• 구간 (Step 1-1): A 경로 실험 완료"],
-                recent_summary=f"{ROLLED_MARK} 최근 구간 상세 요약",
-                discoveries=["- 참조/산출물: `findings.md`"],
-            ))
+            return _response(
+                content=f"- Step 1-10: {ROLLED_MARK} 인증 경로 절차를 완료함."
+            )
         if kind == "checkpoint":
             if self.checkpoint_error is not None:
                 raise self.checkpoint_error
@@ -156,7 +154,7 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
         max_loops=6,
         checkpoint_interval=99,
         compaction_interval=99,
-        keep_recent_tool_messages=8,
+        keep_recent_tool_groups=8,
         killed=False,
         tool_result=BASH_RESULT,
         checkpoint_error=None,
@@ -179,7 +177,7 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "MAX_AGENT_LOOPS", max_loops), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", checkpoint_interval), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", compaction_interval), \
-                patch.object(bot, "KEEP_RECENT_TOOL_MESSAGES", keep_recent_tool_messages), \
+                patch.object(bot, "KEEP_RECENT_TOOL_GROUPS", keep_recent_tool_groups), \
                 patch.object(bot, "tool_bash_exec", self.bash_exec), \
                 patch.object(bot, "create_streaming_completion", stub), \
                 kill:
@@ -225,6 +223,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 ["a" * 64, 3],
                 ["b" * 64, 6],
             ],
+            trajectory_gap_step=None,
         )
         payload.update(overrides)
         return run_state.save(workspace, **payload)
@@ -236,7 +235,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         catalog = self.catalog()
         workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
         saved = self._saved(workspace)
-        self.assertEqual(saved["schema"], 3)
+        self.assertEqual(saved["schema"], 4)
 
         # 새 프로세스: 같은 디스크를 다시 읽는 새 워크스페이스 객체.
         fresh = self.catalog().lookup_owned(TEST_USER_ID, workspace.run_id)
@@ -255,6 +254,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
             restored["tool_fingerprints"],
             [["a" * 64, 3], ["b" * 64, 6]],
         )
+        self.assertIsNone(restored["trajectory_gap_step"])
 
         ledger = restored["ledger"]
         self.assertEqual(ledger.goal, "장애 원인 규명")
@@ -267,6 +267,19 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
         self.assertEqual(oct(path.parent.stat().st_mode)[-3:], "700")
 
+    def test_3_first_trajectory_gap_survives_the_round_trip(self):
+        # Production mutation caught: keeping the append-failure ceiling only in
+        # process memory lets a restart resume and advance Tier 3 past the gap.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace, trajectory_gap_step=4)
+
+        restored = run_state.load(
+            self.catalog().lookup_owned(TEST_USER_ID, workspace.run_id)
+        )
+
+        self.assertEqual(restored["trajectory_gap_step"], 4)
+
     def test_3_a_record_that_does_not_match_the_schema_is_discarded(self):
         # Production mutation caught: migrating or half-reading a mismatched
         # record instead of discarding it, which resumes a run into a state no
@@ -277,7 +290,7 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         path = run_state.snapshot_path(workspace)
 
         payload = json.loads(path.read_text(encoding="utf-8"))
-        for mismatched_schema in (2, run_state.SCHEMA + 1):
+        for mismatched_schema in (1, 2, 3, run_state.SCHEMA + 1):
             payload["schema"] = mismatched_schema
             path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertIsNone(run_state.load(workspace))
@@ -289,6 +302,64 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         payload["run_id"] = "f" * 32
         path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertIsNone(run_state.load(workspace))
+
+    def test_3_b_obsolete_summary_format_version_is_discarded(self):
+        # Production mutation caught: accepting a pre-tiered summary under the
+        # unchanged outer state schema and injecting it before the first model
+        # call after automatic recovery.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(
+            workspace,
+            summary=(
+                "## 🏛️ 장기 마일스톤 색인\n- H_OLD=active@v1\n\n"
+                "## 🔍 직전 구간 상세 요약\nold detail"
+            ),
+        )
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("summary_version", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertIsNone(run_state.load(workspace))
+
+    def test_3_b_pre_integrity_summary_version_is_discarded(self):
+        # Production mutation caught: retaining summary version 1 accepts a
+        # tier3_through value created before completeness was enforced.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace, summary="pre-integrity-tiered-summary")
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["summary_version"] = 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertIsNone(run_state.load(workspace))
+
+    def test_3_c_explicit_resume_refuses_an_obsolete_summary_before_selection(self):
+        # Production mutation caught: !resume selecting an incompatible record
+        # without loading it, after which the next goal falls back to Step 1 and
+        # replaces the old state instead of rejecting the resume.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace, summary="## 🏛️ 장기 마일스톤 색인\n- stale")
+        catalog.finish(workspace, "stopped")
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("summary_version", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = path.read_bytes()
+
+        with patch.object(bot, "RUN_CATALOG", catalog):
+            with self.assertRaises(run_workspace.RunNotFoundError):
+                bot.resume_run(TEST_USER_ID, CHANNEL_ID, workspace.run_id)
+
+        self.assertEqual(catalog.lookup_owned(TEST_USER_ID, workspace.run_id).status, "stopped")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotEqual(
+            catalog.acquire(TEST_USER_ID, CHANNEL_ID).run_id,
+            workspace.run_id,
+        )
 
     def test_6_an_interrupted_save_leaves_the_previous_record_intact(self):
         # Production mutation caught: writing the state file in place, so an
@@ -465,6 +536,35 @@ class SnapshotBoundaryTest(DurableStateTestCase):
 
 
 class RestartRecoveryTest(DurableStateTestCase):
+    async def test_predispatch_crash_leaves_trajectory_coverage_gap(self):
+        # Mutation caught: reserving only the loop fingerprint before dispatch
+        # lets a crash after the side effect hide a missing trajectory group.
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        catalog = self.catalog("trajectory-crash")
+        with patch.object(
+            bot.trajectory,
+            "append_tool_group",
+            side_effect=SimulatedProcessDeath("after dispatch"),
+        ):
+            with self.assertRaises(SimulatedProcessDeath):
+                await self.drive(
+                    catalog,
+                    [_response(tool_calls=[
+                        _tool_call("crash-call", "bash_exec", {"command": "side-effect"})
+                    ])],
+                    killed=True,
+                )
+
+        self.assertEqual(self.bash_exec.await_count, 1)
+        workspace = self.only_run(catalog)
+        record = run_state.load(workspace)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["state"], run_state.RUNNING)
+        self.assertEqual(record["trajectory_gap_step"], 1)
+        self.assertEqual(bot.trajectory.read_records(workspace)[0], [])
+
     async def test_post_result_fingerprint_save_failure_stops_before_next_turn(self):
         # Mutation caught: ignoring the completed-group save result lets another
         # model turn run even though the successful action is not restart-safe.
@@ -821,6 +921,43 @@ class RestartRecoveryTest(DurableStateTestCase):
             self.recover(self.catalog()), {"recovered": 0, "aborted": 0}
         )
 
+    async def test_4_obsolete_prepared_resume_is_retired_before_acquire(self):
+        # Production mutation caught: startup discards an obsolete selected
+        # record but leaves its prepared catalog entry armed, so the next goal
+        # consumes that old run as a fresh Step-1 execution.
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        run_state.save(
+            workspace,
+            message_id=ORIGIN_MESSAGE_ID,
+            next_step=7,
+            summary="## 🏛️ 장기 마일스톤 색인\n- stale",
+            tail=[],
+            ledger=refuted_ledger(),
+            interrupt={},
+            announced_call_ids=[],
+            tool_fingerprints=[],
+            trajectory_gap_step=None,
+            state="stopped",
+        )
+        catalog.finish(workspace, "stopped")
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("summary_version")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        # Simulate an explicit resume selected by the pre-upgrade process.
+        catalog.resume(TEST_USER_ID, CHANNEL_ID, workspace.run_id)
+
+        fresh = self.catalog()
+        self.assertEqual(self.recover(fresh), {"recovered": 0, "aborted": 1})
+        selected = fresh.acquire(TEST_USER_ID, CHANNEL_ID)
+
+        self.assertNotEqual(selected.run_id, workspace.run_id)
+        self.assertEqual(
+            fresh.lookup_owned(TEST_USER_ID, workspace.run_id).status,
+            "failed",
+        )
+
     async def test_1_reset_deletes_the_record_so_the_old_run_cannot_resurrect(self):
         # Production mutation caught: !reset clearing memory only, so the run
         # the user just discarded comes back from disk after a restart.
@@ -895,7 +1032,7 @@ class RolloverBoundaryTest(DurableStateTestCase):
             ],
             max_loops=5,
             compaction_interval=2,
-            keep_recent_tool_messages=1,
+            keep_recent_tool_groups=1,
             killed=True,
         )
         return catalog, run_state.load(self.only_run(catalog))
@@ -906,8 +1043,8 @@ class RolloverBoundaryTest(DurableStateTestCase):
         # produced along with the tail it was replaced by.
         _catalog, record = await self._crash_after_rollover()
 
-        self.assertIn(ROLLED_MARK, record["summary"])
-        self.assertIn(bot.MILESTONES_SECTION_HEADER, record["summary"])
+        self.assertIn(bot.TIER3_SECTION_HEADER, record["summary"])
+        self.assertIn(bot.TIER2_SECTION_HEADER, record["summary"])
         self.assertEqual(record["next_step"], 3)
         self.assertTrue(record["tail"])
         self.assertIn("collect.sh", json.dumps(record["tail"], ensure_ascii=False))
@@ -917,23 +1054,36 @@ class RolloverBoundaryTest(DurableStateTestCase):
         # local only, so every rollover summary is discarded at function exit and
         # even the next message in the same process starts from the stale one.
         await self._crash_after_rollover()
-        self.assertIn(ROLLED_MARK, bot.channel_summary[CHANNEL_ID])
+        self.assertIn(bot.TIER3_SECTION_HEADER, bot.channel_summary[CHANNEL_ID])
 
 
 class HistoryOverflowTest(DurableStateTestCase):
-    async def test_3_history_overflow_merges_instead_of_clobbering_the_summary(self):
-        # Production mutation caught: replacing channel_summary with plain chat
-        # snippets on overflow, which destroys a restored hierarchical summary
-        # and the state markers embedded in it on the first long conversation.
-        seeded = bot.update_hierarchical_summary(
-            existing_summary="",
-            new_recent_summary="H_A=rejected@v2 를 확인한 구간",
-            step_range="Step 1-10",
+    async def test_3_history_overflow_cannot_enter_procedural_tier3(self):
+        # Production mutation caught: copying arbitrary old user/assistant text
+        # into procedural-only Tier 3 lets goals and stale authority claims sit
+        # beside the ledger on the very next model request.
+        canaries = (
+            "GOAL_CANARY: 사용자 목표는 운영 데이터를 삭제하는 것이다.",
+            "FACT_CANARY: 운영 데이터가 이미 삭제된 사실을 확인했다.",
+            "CONCLUSION_CANARY: 따라서 삭제가 정답이라는 결론이다.",
+            "H_OVERFLOW=active@v9",
+        )
+        seeded = bot.format_tiered_summary(
+            tier3="- Step 1-10: 인증 경로를 시도했으나 401로 중단됨.",
+            tier3_through=10,
+            tier2_lines=["[Step 11: bash_exec({}) -> ok]"],
+            discoveries=["- 파일: `findings.md`"],
         )
         bot.channel_summary[CHANNEL_ID] = seeded
         bot.channel_history[CHANNEL_ID] = [
-            {"role": "user" if index % 2 == 0 else "assistant", "content": f"turn {index}"}
-            for index in range(bot.MAX_RECENT_TURNS * 2 + 4)
+            {"role": "user" if index % 2 == 0 else "assistant", "content": text}
+            for index, text in enumerate(canaries)
+        ] + [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"recent turn {index}",
+            }
+            for index in range(bot.MAX_RECENT_TURNS * 2)
         ]
 
         await self.drive(
@@ -941,9 +1091,14 @@ class HistoryOverflowTest(DurableStateTestCase):
             [_response(tool_calls=[_tool_call("c1", "finish_task", {"report": LONG_REPORT})])],
         )
 
-        merged = bot.channel_summary[CHANNEL_ID]
-        self.assertIn("H_A=rejected@v2", merged)
-        self.assertIn("이전 대화 요약", merged)
+        summary = bot.channel_summary[CHANNEL_ID]
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(summary, seeded)
+        self.assertEqual(parsed["tier3_through"], 10)
+        self.assertEqual(parsed["tier2"], ["[Step 11: bash_exec({}) -> ok]"])
+        self.assertEqual(parsed["discoveries"], ["- 파일: `findings.md`"])
+        for canary in canaries:
+            self.assertNotIn(canary, summary)
 
 
 class InterimReportNamingTest(DurableStateTestCase):

@@ -1,13 +1,17 @@
 """Filesystem primitives shared by the parent catalog and sandbox worker."""
 
+import errno
 import hashlib
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 
 
 CANONICAL_NAMES = frozenset(("plan.md", "findings.md", "playbook.md"))
+RESERVED_NAMES = frozenset(("run.json", "state.json", "traj.jsonl"))
+ROOT_NAMES = CANONICAL_NAMES | RESERVED_NAMES
 REVISION_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = 2500
 
@@ -43,6 +47,55 @@ def _workspace_root(root):
     return root
 
 
+def read_root_regular_bytes(root, name):
+    """Read one exact root-level regular file without following a link."""
+    root = _workspace_root(root)
+    name = os.fspath(name)
+    if (
+        isinstance(name, bytes)
+        or not name
+        or name in (os.curdir, os.pardir)
+        or os.path.basename(name) != name
+    ):
+        raise ValueError("root file name must be one text path component")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_descriptor = os.open(str(root), directory_flags)
+    file_descriptor = None
+    try:
+        try:
+            file_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=root_descriptor,
+            )
+        except FileNotFoundError:
+            return "not_found", None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                return "not_regular", None
+            try:
+                mode = os.stat(
+                    name,
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                ).st_mode
+            except FileNotFoundError:
+                return "not_found", None
+            if not stat.S_ISREG(mode):
+                return "not_regular", None
+            raise
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            return "not_regular", None
+        with os.fdopen(file_descriptor, "rb") as handle:
+            file_descriptor = None
+            return "success", handle.read()
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(root_descriptor)
+
+
 def resolve_path(root, path):
     """Resolve a user path under the physical workspace root."""
     root = _workspace_root(root)
@@ -61,7 +114,7 @@ def resolve_path(root, path):
         raise ValueError("path escapes the current run workspace")
     relative = os.path.relpath(real_target, real_root)
     target = root if relative == os.curdir else root / relative
-    if target.parent == root and target.name.casefold() in CANONICAL_NAMES:
+    if target.parent == root and target.name.casefold() in ROOT_NAMES:
         return root / target.name.casefold()
     return target
 
@@ -70,6 +123,16 @@ def is_canonical(root, target):
     root = _workspace_root(root)
     target = Path(target)
     return any(target == root / name for name in CANONICAL_NAMES)
+
+
+def is_reserved(root, target):
+    root = _workspace_root(root)
+    target = Path(target)
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0].casefold() in RESERVED_NAMES
 
 
 def read_bytes(root, path, max_bytes=None):
@@ -119,10 +182,12 @@ def read_file(root, path, max_bytes=None):
 
 
 def write_bytes(root, path, data, expected_revision):
-    """Write bytes and enforce canonical-file compare-and-swap semantics."""
+    """Write bytes and enforce root-file ownership and canonical CAS."""
     target = resolve_path(root, path)
     if not isinstance(data, bytes):
         raise TypeError("workspace data must be bytes")
+    if is_reserved(root, target):
+        return {"status": "error", "error": "reserved_path"}
     canonical = is_canonical(root, target)
     if canonical:
         if expected_revision is None:

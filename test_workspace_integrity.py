@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -473,6 +475,45 @@ class ToolIntegrationTest(WorkspaceTestCase):
         self.assertEqual(run_worker.await_args_list[2].args[1]["operation"], "write_file")
         self.assertEqual(run_worker.await_args_list[3].args[1]["operation"], "web_search")
 
+    async def test_write_file_cannot_replace_supervisor_owned_root_files(self):
+        # Production mutation caught: the model-facing ordinary-file path can
+        # atomically replace trajectory, durable state, or run metadata bytes.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+        protected = {
+            "run.json": (workspace.root / "run.json").read_bytes(),
+            "state.json": b"state-sentinel",
+            "traj.jsonl": b"trajectory-sentinel\n",
+        }
+        for name, content in protected.items():
+            path = workspace.root / name
+            if name != "run.json":
+                path.write_bytes(content)
+            before = path.read_bytes()
+
+            result = json.loads(
+                await bot.tool_write_file(workspace, name, "model-overwrite", None)
+            )
+
+            self.assertEqual(result["status"], "error", (name, result))
+            self.assertEqual(result["error"], "reserved_path", (name, result))
+            self.assertEqual(path.read_bytes(), before)
+
+    async def test_write_file_cannot_create_below_supervisor_owned_root_namespaces(self):
+        # Production mutation caught: checking only exact reserved paths lets
+        # atomic_write create traj.jsonl/child.txt as a model-owned directory.
+        workspace = self.catalog().acquire(TEST_USER_ID, CHANNEL_A)
+
+        for namespace in ("run.json", "state.json", "traj.jsonl"):
+            relative = f"{namespace}/child.txt"
+            with self.subTest(path=relative):
+                result = json.loads(
+                    await bot.tool_write_file(workspace, relative, "model-bytes", None)
+                )
+
+                self.assertEqual(result["status"], "error", result)
+                self.assertEqual(result["error"], "reserved_path", result)
+                self.assertFalse((workspace.root / relative).exists())
+
     async def test_relative_paths_and_bash_use_the_run_root_without_broadening_scope(self):
         # Production mutation caught: retaining the global cwd/path join permits
         # run overlap, while accepting any absolute path lets one line of model
@@ -554,6 +595,46 @@ class ToolIntegrationTest(WorkspaceTestCase):
         self.assertNotIn(
             "절대경로", write_schema["parameters"]["properties"]["path"]["description"]
         )
+
+    async def test_bash_planted_playbook_symlink_is_not_inherited(self):
+        catalog = self.catalog()
+        prior = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        outside = Path(self.temp_dir.name) / "outside-playbook.md"
+        canary = "OUTSIDE_PLAYBOOK_CANARY_7d91"
+        outside.write_text(canary, encoding="utf-8")
+
+        result = await bot.tool_bash_exec(
+            prior,
+            "ln -s {0} playbook.md".format(shlex.quote(os.fspath(outside))),
+            "playbook-link",
+        )
+        self.assertIn("[exit code: 0]", result)
+        self.assertTrue((prior.root / "playbook.md").is_symlink())
+
+        catalog.finish(prior, "completed")
+        successor = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+
+        self.assertFalse(os.path.lexists(successor.root / "playbook.md"))
+        self.assertEqual(outside.read_text(encoding="utf-8"), canary)
+
+    async def test_playbook_socket_is_not_inherited(self):
+        catalog = self.catalog()
+        prior = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(prior.root)
+                listener.bind("playbook.md")
+            finally:
+                os.chdir(original_cwd)
+            catalog.finish(prior, "completed")
+            try:
+                successor = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+            except OSError as error:
+                self.fail("unsafe playbook type must be skipped: {0}".format(error))
+
+        self.assertFalse(os.path.lexists(successor.root / "playbook.md"))
 
     async def test_session_log_bytes_are_unreachable_from_the_file_tools(self):
         # Production mutation caught: putting the session log back under the run
@@ -653,8 +734,20 @@ class ToolIntegrationTest(WorkspaceTestCase):
         self.assertEqual(result, ["ok"])
         bash.assert_awaited_once_with(workspace, "true", "ctx-1")
 
+        bot.trajectory.append_tool_group(
+            workspace,
+            1,
+            [{
+                "id": "rollover-source",
+                "name": "bash_exec",
+                "arguments": {"command": "python3 skills/run_only.py"},
+                "failed": True,
+            }],
+            ["[stderr]\nprobe blocked\n[exit code: 1]"],
+            {"rollover-source"},
+        )
         messages = [{"role": "system", "content": prompt}]
-        for index in range(10):
+        for index in range(11):
             messages.extend([
                 {
                     "role": "assistant",
@@ -673,7 +766,7 @@ class ToolIntegrationTest(WorkspaceTestCase):
                 },
             ])
         summary_response = SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(content="rolled summary")
+            message=SimpleNamespace(content="- Step 1-1: rolled summary")
         )])
         with patch.object(
             bot, "run_completion_stage", AsyncMock(return_value=summary_response)
@@ -682,10 +775,10 @@ class ToolIntegrationTest(WorkspaceTestCase):
                 workspace,
                 messages,
                 "",
-                10,
+                40,
             )
-        self.assertIn(bot.MILESTONES_SECTION_HEADER, summary)
-        self.assertIn(bot.RECENT_PHASE_SECTION_HEADER, summary)
+        self.assertIn(bot.TIER3_SECTION_HEADER, summary)
+        self.assertIn(bot.TIER2_SECTION_HEADER, summary)
         self.assertIn("rolled summary", summary)
         self.assertIn("skills/run_only.py", summary)
         self.assertIn(str(workspace.root), bot._msg_content(rolled[0]))
@@ -823,20 +916,38 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             self.assertEqual((retained.root / "notes.txt").read_text(), "retained")
             catalog.finish(selected, "completed")
 
+            # A valid explicit-resume target must carry a current durable record.
+            # reset/new deliberately deleted the older channel-A records.
+            resumable = catalog.acquire(TEST_USER_ID, CHANNEL_B)
+            bot.run_state.save(
+                resumable,
+                message_id=None,
+                next_step=1,
+                summary="",
+                tail=[],
+                ledger=bot.ResearchLedger(),
+                interrupt={},
+                announced_call_ids=[],
+                tool_fingerprints=[],
+                trajectory_gap_step=None,
+                state="stopped",
+            )
+            catalog.finish(resumable, "stopped")
+
             cross_owner = FakeMessage(
-                f"!resume {retained.run_id}", CHANNEL_A,
+                f"!resume {resumable.run_id}", CHANNEL_A,
                 author=FakeAuthor(TEST_ADMIN_ID, "admin"),
             )
             await bot.on_message(cross_owner)
             self.assertIn("not found", cross_owner.replies[-1].lower())
 
             resume = FakeMessage(
-                f"!resume {retained.run_id}", CHANNEL_B,
+                f"!resume {resumable.run_id}", CHANNEL_B,
                 author=FakeAuthor(TEST_USER_ID),
             )
             await bot.on_message(resume)
             resumed = catalog.acquire(TEST_USER_ID, CHANNEL_B)
-            self.assertEqual(resumed.run_id, retained.run_id)
+            self.assertEqual(resumed.run_id, resumable.run_id)
             catalog.finish(resumed, "completed")
 
             failed_clear = FakeMessage(
@@ -867,11 +978,11 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             catalog.finish(cleared, "completed")
 
             delete = FakeMessage(
-                f"!delete {retained.run_id}", CHANNEL_B,
+                f"!delete {resumable.run_id}", CHANNEL_B,
                 author=FakeAuthor(TEST_USER_ID),
             )
             await bot.on_message(delete)
-            self.assertFalse(retained.root.exists())
+            self.assertFalse(resumable.root.exists())
 
     async def test_clear_reserves_admission_across_text_and_slash_purge(self):
         # Production mutation caught: a goal admitted while clear awaits purge
@@ -1166,15 +1277,21 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             catalog.finish(prior, "completed")
             source = prior.root / "playbook.md"
 
-            original_read_bytes = Path.read_bytes
+            original_read_root_regular_bytes = (
+                run_workspace.read_root_regular_bytes
+            )
             original_atomic_write = run_workspace.atomic_write
             if operation == "read":
-                def fail_copy_read(path):
-                    if path == source:
+                def fail_copy_read(root, name):
+                    if root == prior.root:
                         raise OSError("injected canonical copy read failure")
-                    return original_read_bytes(path)
+                    return original_read_root_regular_bytes(root, name)
 
-                copy_failure = patch.object(Path, "read_bytes", new=fail_copy_read)
+                copy_failure = patch.object(
+                    run_workspace,
+                    "read_root_regular_bytes",
+                    new=fail_copy_read,
+                )
             else:
                 def fail_copy_write(path, data):
                     if Path(path).name == "playbook.md":
@@ -1211,7 +1328,7 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
                 self.assertEqual(source.read_text(encoding="utf-8"), payload)
                 self.assertEqual(retry.read("playbook.md").get("content"), payload)
 
-    async def test_acquire_inherits_canonical_files_from_prior_run_of_same_owner_and_channel(self):
+    async def test_acquire_inherits_only_playbook_from_prior_run_of_same_owner_and_channel(self):
         catalog = self.catalog()
         run1 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
         await run1.write("plan.md", "# Plan 1\n- [x] Step 1", "absent")
@@ -1222,12 +1339,8 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
 
         run2 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
         self.assertNotEqual(run1.run_id, run2.run_id)
-        read_plan = run2.read("plan.md")
-        self.assertEqual(read_plan["status"], "success")
-        self.assertEqual(read_plan["content"], "# Plan 1\n- [x] Step 1")
-        read_findings = run2.read("findings.md")
-        self.assertEqual(read_findings["status"], "success")
-        self.assertEqual(read_findings["content"], "# Findings\nDiscovered secret")
+        self.assertEqual(run2.read("plan.md")["status"], "error")
+        self.assertEqual(run2.read("findings.md")["status"], "error")
         read_playbook = run2.read("playbook.md")
         self.assertEqual(read_playbook["status"], "success")
         self.assertEqual(read_playbook["content"], "- Mac grep은 -P를 지원하지 않는다")

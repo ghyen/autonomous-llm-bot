@@ -32,6 +32,13 @@ DEFAULT_MODEL_STAGE_TIMEOUT = 3600.0
 DEFAULT_TOOL_STAGE_TIMEOUT = 120.0
 DEFAULT_BASH_TIMEOUT = 60.0
 
+# Long-run agent budgets. They remain module-level aliases in bot.py for test
+# seams, but this is the single source of defaults and validation.
+DEFAULT_MAX_AGENT_LOOPS = 2000
+DEFAULT_CHECKPOINT_INTERVAL = 50
+DEFAULT_MAX_TOOL_EXECUTIONS_PER_RUN = 2000
+DEFAULT_AGENT_STEP_MAX_TOKENS = 2048
+
 # Tool workers are disposable and deny-by-default. These are ceilings, not
 # tuning hints: lowering them is safe, while removing them is refused.
 DEFAULT_TOOL_CPU_SECONDS = 30.0
@@ -78,6 +85,10 @@ class BotConfig:
     model_stage_timeout: float
     tool_stage_timeout: float
     bash_timeout: float
+    max_agent_loops: int
+    checkpoint_interval: int
+    max_tool_executions_per_run: int
+    agent_step_max_tokens: int
     tool_cpu_seconds: float
     tool_memory_bytes: int
     tool_process_limit: int
@@ -337,6 +348,24 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         bash_timeout=parse_positive_float(
             get("BASH_TIMEOUT_SECONDS"), "BASH_TIMEOUT_SECONDS", DEFAULT_BASH_TIMEOUT
         ),
+        max_agent_loops=parse_positive_int(
+            get("MAX_AGENT_LOOPS"), "MAX_AGENT_LOOPS", DEFAULT_MAX_AGENT_LOOPS
+        ),
+        checkpoint_interval=parse_positive_int(
+            get("CHECKPOINT_INTERVAL"),
+            "CHECKPOINT_INTERVAL",
+            DEFAULT_CHECKPOINT_INTERVAL,
+        ),
+        max_tool_executions_per_run=parse_positive_int(
+            get("MAX_TOOL_EXECUTIONS_PER_RUN"),
+            "MAX_TOOL_EXECUTIONS_PER_RUN",
+            DEFAULT_MAX_TOOL_EXECUTIONS_PER_RUN,
+        ),
+        agent_step_max_tokens=parse_positive_int(
+            get("AGENT_STEP_MAX_TOKENS"),
+            "AGENT_STEP_MAX_TOKENS",
+            DEFAULT_AGENT_STEP_MAX_TOKENS,
+        ),
         tool_cpu_seconds=parse_positive_float(
             get("TOOL_CPU_SECONDS"), "TOOL_CPU_SECONDS", DEFAULT_TOOL_CPU_SECONDS
         ),
@@ -411,6 +440,12 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             config.model_stage_timeout,
             config.tool_stage_timeout,
             config.bash_timeout,
+        ),
+        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3}".format(
+            config.max_agent_loops,
+            config.checkpoint_interval,
+            config.max_tool_executions_per_run,
+            config.agent_step_max_tokens,
         ),
         "tool sandbox: cpu={0}s memory={1} processes={2} threads={3} open_files={4} file_bytes={5} output_bytes={6} disk_bytes={7} network_origins={8}".format(
             config.tool_cpu_seconds,

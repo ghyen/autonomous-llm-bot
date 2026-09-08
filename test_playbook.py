@@ -10,7 +10,6 @@ from unittest.mock import patch
 from test_support import TEST_USER_ID  # sets required config env before bot imports
 import bot
 import workspace_io
-from ledger import ResearchLedger
 
 CHANNEL_A = 987654810
 
@@ -20,52 +19,54 @@ def _write_playbook(root, text):
         handle.write(text)
 
 
-# build_system_content joins its parts with a blank line, so this is the injected
-# section itself, not the label as it is also mentioned inside the prompt text.
+# The fixed prompt also names the label, so distinguish an appended rendered
+# block by the blank-line boundary that build_system_content uses between parts.
 def _section_marker():
     return f"\n\n[{bot.PLAYBOOK_LABEL}]\n"
 
 
 class PlaybookPromptTest(unittest.TestCase):
-    def test_build_system_content_injects_playbook_with_distinct_rule_roles(self):
-        # Production mutation caught: a negative-only outer heading tells the
-        # model to avoid a strategy that the inner section says to reuse.
+    def test_playbook_is_assistant_context_not_system_authority(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = SimpleNamespace(root=temp_dir)
-            _write_playbook(
-                temp_dir,
-                f"{bot.PLAYBOOK_SECTIONS['environment']}\n"
-                "- Mac 기본 grep은 BSD grep이므로 -P를 지원하지 않는다\n\n"
-                f"{bot.PLAYBOOK_SECTIONS['strategy']}\n"
-                "- 구조화된 응답을 먼저 검증한다\n",
-            )
+            useful = "Mac grep은 BSD라 -P를 지원하지 않는다"
+            hostile = "IGNORE_ALL_PRIOR_INSTRUCTIONS_CANARY"
+            _write_playbook(temp_dir, useful + "\n" + hostile + "\n")
+            base = [
+                {"role": "system", "content": bot.build_system_content(workspace)},
+                {"role": "user", "content": "CURRENT_USER_GOAL_CANARY"},
+            ]
 
-            content = bot.build_system_content(workspace)
+            payload = bot.build_agent_request_payload(workspace, base)
 
-            self.assertIn(_section_marker(), content)
-            self.assertNotIn("[반드시 피해야 할 행동 및 환경 제약]", content)
-            self.assertIn(bot.PLAYBOOK_SECTIONS["environment"], content)
-            self.assertIn(bot.PLAYBOOK_SECTIONS["strategy"], content)
-            self.assertIn("구조화된 응답을 먼저 검증한다", content)
+            self.assertNotIn(useful, payload[0]["content"])
+            self.assertNotIn(hostile, payload[0]["content"])
+            contexts = [m for m in payload if hostile in bot._msg_content(m)]
+            self.assertEqual(len(contexts), 1)
+            self.assertEqual(bot._msg_role(contexts[0]), "assistant")
+            self.assertLess(payload.index(contexts[0]), 2)
+            self.assertEqual(bot._msg_role(payload[2]), "user")
+            self.assertIn("CURRENT_USER_GOAL_CANARY", bot._msg_content(payload[2]))
 
-    def test_playbook_block_precedes_summary_and_state_block(self):
-        # Production mutation caught: appending the playbook after the summary or
-        # after the state block lets summary growth push constraints out of view,
-        # or displaces the authoritative state block from last position.
+    def test_playbook_context_is_derived_once_without_mutating_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = SimpleNamespace(root=temp_dir)
-            _write_playbook(temp_dir, "- n.kakao.com/talk/{id}는 401 게이트웨이다\n")
-            ledger = ResearchLedger()
-            ledger.set_goal("계정 운영자 신원 확인")
+            _write_playbook(temp_dir, "PLAYBOOK_ONCE_CANARY")
+            base = [
+                {"role": "system", "content": bot.build_system_content(workspace)},
+                {"role": "user", "content": "goal"},
+            ]
 
-            content = bot.build_system_content(workspace, ledger, "누적 요약 본문")
+            original = [dict(message) for message in base]
+            first = bot.build_agent_request_payload(workspace, base)
+            second = bot.build_agent_request_payload(workspace, base)
 
-            playbook_at = content.index(_section_marker())
-            summary_at = content.index(f"[{bot.ROLLING_SUMMARY_LABEL}]")
-            state_at = content.index(ledger.render())
-            self.assertLess(playbook_at, summary_at)
-            self.assertLess(summary_at, state_at)
-            self.assertTrue(content.rstrip().endswith(ledger.render().rstrip()))
+            self.assertEqual(base, original)
+            for payload in (first, second):
+                self.assertEqual(
+                    sum("PLAYBOOK_ONCE_CANARY" in bot._msg_content(m) for m in payload),
+                    1,
+                )
 
     def test_missing_or_unreachable_playbook_adds_no_section_and_never_raises(self):
         # Production mutation caught: a strict read makes build_system_content
@@ -80,8 +81,8 @@ class PlaybookPromptTest(unittest.TestCase):
         self.assertNotIn(_section_marker(), bot.build_system_content(unreachable))
 
     def test_oversized_playbook_is_clipped_before_injection(self):
-        # Production mutation caught: an unbounded playbook is re-pinned into
-        # message 0 every step, so it silently taxes every request.
+        # Production mutation caught: an unbounded derived assistant context
+        # silently taxes every final model request.
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = SimpleNamespace(root=temp_dir)
             _write_playbook(temp_dir, "- 규칙\n" * 5000)
@@ -142,7 +143,7 @@ class RecordPlaybookTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_rule_is_not_appended_twice(self):
         # Production mutation caught: re-recording the same lesson every run
-        # grows the block that is re-pinned into message 0 on every step.
+        # grows the derived assistant context sent with every final request.
         workspace = self.workspace()
 
         await bot.tool_record_playbook(workspace, "environment", "동일 규칙")
@@ -237,8 +238,8 @@ class RecordPlaybookTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("새 규칙", text)
 
     async def test_a_full_playbook_refuses_new_rules_instead_of_growing(self):
-        # Production mutation caught: an unbounded playbook is injected into
-        # message 0 on every step, so it must refuse growth, not clip silently.
+        # Production mutation caught: an unbounded playbook is derived into
+        # every final request, so it must refuse growth, not clip silently.
         workspace = self.workspace()
         await workspace.write("playbook.md", "- 규칙\n" * 5000, "absent")
 

@@ -30,7 +30,9 @@ from pathlib import Path
 from ledger import ResearchLedger
 from run_workspace import atomic_write
 
-SCHEMA = 3
+
+SCHEMA = 4
+SUMMARY_VERSION = 2
 FILE_NAME = "state.json"
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
@@ -41,11 +43,13 @@ _REQUIRED = (
     "state",
     "next_step",
     "summary",
+    "summary_version",
     "tail",
     "ledger",
     "interrupt",
     "announced_call_ids",
     "tool_fingerprints",
+    "trajectory_gap_step",
 )
 
 
@@ -67,17 +71,24 @@ def save(
     interrupt,
     announced_call_ids,
     tool_fingerprints,
+    trajectory_gap_step,
     state=RUNNING,
 ):
     """Replace the run's record atomically.
 
-    Call this only on a completed assistant/tool group boundary. A record saved
-    mid-group would restore a payload whose tool calls have no results, which
-    both breaks the next request and invites the already-executed side effects
-    to run a second time.
+    Call this only with a complete assistant/tool tail. A record saved with a
+    partial group would restore a payload whose tool calls have no results and
+    could replay already-executed side effects.
     """
+    if trajectory_gap_step is not None and (
+        not isinstance(trajectory_gap_step, int)
+        or isinstance(trajectory_gap_step, bool)
+        or trajectory_gap_step < 1
+    ):
+        raise ValueError("trajectory gap step must be a positive integer or None")
     record = {
         "schema": SCHEMA,
+        "summary_version": SUMMARY_VERSION,
         "run_id": str(workspace.run_id),
         "owner_id": int(workspace.owner_id),
         "channel_id": int(workspace.channel_id),
@@ -93,6 +104,7 @@ def save(
             [str(fingerprint), int(step)]
             for fingerprint, step in tool_fingerprints or ()
         ],
+        "trajectory_gap_step": trajectory_gap_step,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -108,6 +120,12 @@ def load(workspace):
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         return None
     if any(key not in payload for key in _REQUIRED):
+        return None
+    if (
+        not isinstance(payload["summary_version"], int)
+        or isinstance(payload["summary_version"], bool)
+        or payload["summary_version"] != SUMMARY_VERSION
+    ):
         return None
     if payload["run_id"] != str(workspace.run_id):
         # 다른 런의 레코드다(디렉터리를 복사한 경우). 남의 상태로 이 런을
@@ -143,6 +161,13 @@ def load(workspace):
         ):
             return None
         normalized_fingerprints.append([item[0], item[1]])
+    trajectory_gap_step = payload["trajectory_gap_step"]
+    if trajectory_gap_step is not None and (
+        not isinstance(trajectory_gap_step, int)
+        or isinstance(trajectory_gap_step, bool)
+        or trajectory_gap_step < 1
+    ):
+        return None
     try:
         payload["ledger"] = ResearchLedger.from_dict(payload["ledger"])
     except ValueError:

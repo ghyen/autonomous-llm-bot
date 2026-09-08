@@ -244,6 +244,24 @@ class RobustJSONParsingTest(unittest.TestCase):
             text = "<tool_call>" + json.dumps({"name": "finish_task", "arguments": args}) + "</tool_call>"
             self.assertEqual(bot.extract_tool_calls_from_text(text)[0]["arguments"], args)
 
+    def test_json_tool_argument_markup_is_not_a_second_tool_call(self):
+        nested_example = (
+            "<function=bash_exec>"
+            "<parameter=command>printf nested</parameter>"
+            "</function>"
+            "</tool_call>"
+        )
+        expected = {
+            "name": "write_file",
+            "arguments": {
+                "path": "example.md",
+                "content": nested_example,
+            },
+        }
+        text = "<tool_call>" + json.dumps(expected) + "</tool_call>"
+
+        self.assertEqual(bot.extract_tool_calls_from_text(text), [expected])
+
     def test_robust_json_loads_markdown_fences(self):
         text = "```json\n{\"name\": \"bash_exec\", \"arguments\": {\"command\": \"ls\"}}\n```"
         parsed = bot._robust_json_loads(text)

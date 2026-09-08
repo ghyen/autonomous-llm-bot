@@ -152,21 +152,6 @@ class ImmutableContextTest(unittest.TestCase):
             self.assertIn(marker, text)
 
 
-class RollupSourceBudgetTest(unittest.TestCase):
-    def test_newest_refutation_survives_a_tight_budget(self):
-        messages = [
-            {"role": "tool", "name": "bash_exec", "content": f"오래된 결과 {i} " + ("가" * 400)}
-            for i in range(20)
-        ]
-        messages.append({"role": "tool", "name": "bash_exec", "content": BASH_RESULT})
-
-        source = bot.build_rollup_source(messages, max_chars=1500)
-
-        self.assertIn("E_NEG", source)
-        # Chronological order is restored after the newest-first budget pass.
-        self.assertLess(source.index("오래된 결과"), source.index("E_NEG"))
-
-
 class RolloverValidationTest(unittest.IsolatedAsyncioTestCase):
     def _payload(self):
         ledger = refuted_ledger()
@@ -186,7 +171,7 @@ class RolloverValidationTest(unittest.IsolatedAsyncioTestCase):
             })
         return ledger, payload
 
-    async def test_echoed_summary_is_rejected_and_markers_are_restored(self):
+    async def test_summary_excludes_authoritative_markers_but_system_keeps_them(self):
         ledger, payload = self._payload()
         stub = ModelStub([])
 
@@ -195,27 +180,14 @@ class RolloverValidationTest(unittest.IsolatedAsyncioTestCase):
                 TEST_WORKSPACE, payload, SEED_SUMMARY, 10, ledger=ledger
             )
 
-        # The echoed summary was refused, so the new summary is not the old one.
         self.assertNotEqual(summary.strip(), SEED_SUMMARY)
         for marker in ("H_A=rejected@v2", "C_A=무효", "E_NEG"):
-            self.assertIn(marker, summary)
+            self.assertNotIn(marker, summary)
             self.assertIn(marker, serialize(rolled))
         self.assertEqual(bot._msg_role(rolled[0]), "system")
-
-    async def test_rollover_is_a_no_op_when_the_source_adds_nothing(self):
-        ledger, payload = self._payload()
-        old_messages, _ = bot.split_recent_agent_context(payload)
-        already_summarized = bot.build_rollup_source(old_messages)
-        stub = ModelStub([])
-
-        with patch.object(bot, "create_streaming_completion", stub):
-            rolled, summary = await bot.rollover_agent_context(
-                TEST_WORKSPACE, payload, already_summarized, 10, ledger=ledger
-            )
-
-        self.assertEqual(stub.calls, [])
-        self.assertIs(rolled, payload)
-        self.assertEqual(summary, already_summarized)
+        self.assertTrue(
+            bot._msg_content(rolled[0]).rstrip().endswith(ledger.render().rstrip())
+        )
 
 
 class StateUpdateBlockTest(unittest.TestCase):
@@ -293,7 +265,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "MAX_AGENT_LOOPS", 4), \
                 patch.object(bot, "CHECKPOINT_INTERVAL", 2), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 2), \
-                patch.object(bot, "KEEP_RECENT_TOOL_MESSAGES", 2), \
+                patch.object(bot, "KEEP_RECENT_TOOL_GROUPS", 1), \
                 patch.object(bot, "tool_bash_exec", AsyncMock(return_value=BASH_RESULT)), \
                 patch.object(bot, "create_streaming_completion", stub):
             await bot.on_message(FakeMessage("장애 원인을 조사해줘", self.CHANNEL_ID))
@@ -302,15 +274,17 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=rejected@v2")
         self.assertFalse(ledger.conclusion_is_valid("C_A"))
 
-        # Criterion 4: the checkpoint's correction reached the ledger, and it
-        # did so before the rollover that runs in the same step.
+        # Criterion 4: the checkpoint's correction reached the ledger before
+        # the same-step rollover. No Tier 3 model call is eligible this early;
+        # the next agent payload proves the rolled system message kept authority.
         self.assertEqual(ledger.hypothesis_marker("H_B"), "H_B=rejected@v2")
-        rollover_payloads = stub.payloads("rollover")
-        self.assertEqual(len(rollover_payloads), 1)
-        self.assertIn("H_B=rejected@v2", serialize(rollover_payloads[0]))
+        self.assertEqual(stub.payloads("rollover"), [])
+        post_rollover_agent = serialize(stub.payloads("agent")[-1])
+        self.assertIn(bot.TIER3_SECTION_HEADER, post_rollover_agent)
+        self.assertIn("H_B=rejected@v2", post_rollover_agent)
 
-        # Criterion 3: every downstream transformation carries the markers.
-        for kind in ("checkpoint", "rollover", "synthesis"):
+        # Criterion 3: user-facing downstream transformations carry the markers.
+        for kind in ("checkpoint", "synthesis"):
             payloads = stub.payloads(kind)
             self.assertTrue(payloads, f"{kind} 호출이 없습니다")
             for messages in payloads:
@@ -319,7 +293,7 @@ class MarkerSurvivalThroughTheRunTest(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(marker, text, f"{kind} payload에 {marker}가 없습니다")
 
         # The last agent step of the run sees the refutation too.
-        self.assertIn("H_A=rejected@v2", serialize(stub.payloads("agent")[-1]))
+        self.assertIn("H_A=rejected@v2", post_rollover_agent)
 
         # Criterion 6: final synthesis gets the cumulative summary and the tail.
         synthesis_text = serialize(stub.payloads("synthesis")[0])
