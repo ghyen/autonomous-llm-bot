@@ -127,7 +127,9 @@ DISCORD_FREE_RESPONSE_CHANNELS=123456789012345678
 MAX_AGENT_LOOPS=2000
 CHECKPOINT_INTERVAL=50
 MAX_TOOL_EXECUTIONS_PER_RUN=2000
-AGENT_STEP_MAX_TOKENS=2048
+AGENT_STEP_MAX_TOKENS=4096
+REASONING_MAX_TOKENS=1536
+DEFAULT_REASONING_EFFORT=high
 LLM_CONNECT_TIMEOUT_SECONDS=15
 LLM_IDLE_TIMEOUT_SECONDS=3600
 MODEL_STAGE_TIMEOUT_SECONDS=3600
@@ -148,10 +150,11 @@ LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 ```
 
 The autonomous loop defaults to 2,000 model iterations, checkpoints every 50
-steps, allows at most 2,000 actual tool executions per run, and limits each
-agent step to 2,048 output tokens. Override those limits with
-`MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`, `MAX_TOOL_EXECUTIONS_PER_RUN`, and
-`AGENT_STEP_MAX_TOKENS`.
+steps, allows at most 2,000 actual tool executions per run, limits each
+agent step to 4,096 output tokens, and caps internal reasoning to 1,536
+tokens. Override those limits with `MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`,
+`MAX_TOOL_EXECUTIONS_PER_RUN`, `AGENT_STEP_MAX_TOKENS`, `REASONING_MAX_TOKENS`,
+and `DEFAULT_REASONING_EFFORT`.
 
 Network is deny-by-default. Enable `web_search` only when the operator wants
 the worker to use DuckDuckGo:
@@ -200,8 +203,31 @@ effective policy line.
 
 ### 4. Running the Bot
 
+You can run the bot and the backend server easily using `make` or the helper scripts in `scripts/`:
+
 ```bash
-python bot.py
+# Run both rapid-mlx server and bot (starts server, waits for health check, then runs bot)
+make run
+
+# Or run components individually:
+make run-rapid  # Starts rapid-mlx server standalone (port 18080)
+make run-bot    # Starts autonomous-llm-bot standalone
+
+# Run test suite:
+make test
+```
+
+Direct script execution is also supported:
+
+```bash
+# All-in-one launcher with graceful shutdown (Ctrl+C terminates both cleanly)
+./scripts/run_all.sh
+
+# Standalone server with customizable model path
+MODEL_PATH="/path/to/model" ./scripts/run_rapid.sh
+
+# Standalone bot
+./scripts/run_bot.sh
 ```
 
 ---

@@ -423,7 +423,7 @@ bot = CustomBot(command_prefix="!", intents=intents)
 
 channel_history = defaultdict(list)
 channel_summary = defaultdict(str)
-channel_reasoning = defaultdict(lambda: "none")
+channel_reasoning = defaultdict(lambda: CONFIG.default_reasoning_effort)
 # A run marks its lease active before its first await, so the admission check and
 # the mailbox it publishes are decided in one event-loop turn: a message arriving
 # during a live run is always steering, never a second run. The list keeps every
@@ -539,6 +539,7 @@ TOOL_LOOP_GUARD_WINDOW = 8
 # 두 번째 동일 쓰기를 conflict로 돌려세운다.
 TOOL_LOOP_GUARD_TOOLS = ("bash_exec", "read_file", "web_search")
 AGENT_STEP_MAX_TOKENS = CONFIG.agent_step_max_tokens
+REASONING_MAX_TOKENS = CONFIG.reasoning_max_tokens
 MAX_CONSECUTIVE_INTERNAL_THOUGHTS = 3
 REASONING_CUTOFF_MARKER = "[truncated — reasoning incomplete"
 
@@ -3777,7 +3778,12 @@ async def on_message(message: discord.Message):
             elif current_effort:
                 extra_params["reasoning_effort"] = current_effort
             else:
-                extra_params["reasoning_effort"] = "none"
+                extra_params["reasoning_effort"] = CONFIG.default_reasoning_effort
+
+            if extra_params.get("reasoning_effort") != "none":
+                extra_params["extra_body"] = {
+                    "reasoning_max_tokens": CONFIG.reasoning_max_tokens
+                }
 
             # 권위 있는 조사 상태를 매 스텝 0번 메시지에 재고정한다.
             if messages_payload and _msg_role(messages_payload[0]) == "system":
@@ -3806,7 +3812,7 @@ async def on_message(message: discord.Message):
             model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
             model_stage_started = time.monotonic()
             step_max_tokens = (
-                min(1024, AGENT_STEP_MAX_TOKENS)
+                min(2048, AGENT_STEP_MAX_TOKENS)
                 if iteration == 0
                 else AGENT_STEP_MAX_TOKENS
             )

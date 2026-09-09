@@ -35,7 +35,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             completion_args = completion.await_args.kwargs
             self.assertEqual(completion_args["tool_choice"], "auto")
             self.assertEqual(completion_args["reasoning_effort"], "none")
-            self.assertEqual(completion_args["max_tokens"], 1024)
+            self.assertEqual(completion_args["max_tokens"], min(2048, bot.AGENT_STEP_MAX_TOKENS))
             self.assertEqual(
                 message.replies[-1],
                 "인증된 상태는 본인 확인이 끝난 상태입니다.",
@@ -138,6 +138,11 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(completion.await_count, 3)
             execute_tools.assert_awaited_once()
             self.assertEqual(completion.await_args_list[1].kwargs["max_tokens"], bot.AGENT_STEP_MAX_TOKENS)
+            self.assertEqual(completion.await_args_list[1].kwargs["reasoning_effort"], bot.CONFIG.default_reasoning_effort)
+            self.assertEqual(
+                completion.await_args_list[1].kwargs.get("extra_body"),
+                {"reasoning_max_tokens": bot.CONFIG.reasoning_max_tokens},
+            )
             self.assertIn("조사 완료", message.replies[-1])
         finally:
             bot.FREE_RESPONSE_CHANNEL_IDS.discard(channel_id)
