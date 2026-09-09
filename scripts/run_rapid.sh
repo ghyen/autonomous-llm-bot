@@ -5,7 +5,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-/Users/edwin/qwen38-mlx/models/Qwen3.8-27B-Huihui-Abliterated-oQ4e-MTP-MLX}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-18080}"
-CACHE_MEMORY_MB="${CACHE_MEMORY_MB:-8192}"
+CACHE_MEMORY_MB="${CACHE_MEMORY_MB:-4096}"
 RAPID_BIN="${RAPID_BIN:-$(command -v rapid-mlx || echo "/opt/homebrew/bin/rapid-mlx")}"
 
 if [ ! -x "$RAPID_BIN" ]; then

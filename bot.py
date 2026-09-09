@@ -1507,10 +1507,6 @@ def resolve_adaptive_reasoning_effort(
     if not adaptive_enabled:
         return configured_effort, reasoning_max_tokens
 
-    if has_recent_tool_error(messages_payload):
-        low_cap = min(reasoning_max_tokens, 512)
-        return "low", low_cap
-
     return "none", None
 
 
@@ -3967,8 +3963,6 @@ async def on_message(message: discord.Message):
             model_stage_started = time.monotonic()
             if is_think_step:
                 step_max_tokens = min(AGENT_STEP_MAX_TOKENS, (effort_tokens or 512) + 512)
-            elif consecutive_internal_thoughts > 0:
-                step_max_tokens = min(1024, AGENT_STEP_MAX_TOKENS)
             elif iteration == 0:
                 step_max_tokens = min(2048, AGENT_STEP_MAX_TOKENS)
             else:
