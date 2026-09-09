@@ -7,30 +7,34 @@ PORT="${PORT:-18080}"
 HEALTH_URL="http://${HOST}:${PORT}/v1/models"
 TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-120}"
 
-RAPID_PID=""
+SERVER_PID=""
 
 cleanup() {
     echo ""
     echo "🛑 Shutting down services..."
-    if [ -n "$RAPID_PID" ] && kill -0 "$RAPID_PID" 2>/dev/null; then
-        echo "   Stopping rapid-mlx (PID $RAPID_PID)..."
-        kill -TERM "$RAPID_PID" 2>/dev/null || true
-        wait "$RAPID_PID" 2>/dev/null || true
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "   Stopping LLM server (PID $SERVER_PID)..."
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
     fi
     echo "✅ All services stopped."
 }
 
 trap cleanup EXIT INT TERM
 
-# Check if rapid-mlx is already running
+# Check if LLM server is already running
 if curl -s -f "$HEALTH_URL" >/dev/null 2>&1; then
-    echo "ℹ️ rapid-mlx is already active at $HEALTH_URL. Using existing instance."
+    echo "ℹ️ LLM server is already active at $HEALTH_URL. Using existing instance."
 else
-    echo "🚀 [1/2] Launching rapid-mlx server in background..."
-    "$SCRIPT_DIR/run_rapid.sh" &
-    RAPID_PID=$!
+    echo "🚀 [1/2] Launching LLM server in background..."
+    if [ -x "$SCRIPT_DIR/run_omlx.sh" ] && (command -v omlx >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/omlx" ]); then
+        "$SCRIPT_DIR/run_omlx.sh" &
+    else
+        "$SCRIPT_DIR/run_rapid.sh" &
+    fi
+    SERVER_PID=$!
 
-    echo "⏳ Waiting for rapid-mlx to become ready at $HEALTH_URL (timeout: ${TIMEOUT_SECS}s)..."
+    echo "⏳ Waiting for LLM server to become ready at $HEALTH_URL (timeout: ${TIMEOUT_SECS}s)..."
     start_time=$(date +%s)
 
     while true; do
@@ -38,21 +42,21 @@ else
             break
         fi
 
-        if ! kill -0 "$RAPID_PID" 2>/dev/null; then
-            echo "❌ Error: rapid-mlx server exited unexpectedly." >&2
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "❌ Error: LLM server exited unexpectedly." >&2
             exit 1
         fi
 
         current_time=$(date +%s)
         elapsed=$((current_time - start_time))
         if [ "$elapsed" -ge "$TIMEOUT_SECS" ]; then
-            echo "❌ Error: Timed out waiting for rapid-mlx (${TIMEOUT_SECS}s)." >&2
+            echo "❌ Error: Timed out waiting for LLM server (${TIMEOUT_SECS}s)." >&2
             exit 1
         fi
 
         sleep 2
     done
-    echo "✅ rapid-mlx is healthy and ready!"
+    echo "✅ LLM server is healthy and ready!"
 fi
 
 echo "🤖 [2/2] Launching autonomous-llm-bot..."

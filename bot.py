@@ -61,7 +61,11 @@ except ConfigError as config_error:
 
 DISCORD_TOKEN = CONFIG.discord_token
 LLM_BASE_URL = CONFIG.llm_base_url
-MODEL_NAME = CONFIG.model_name
+MODEL_NAME = (
+    os.path.basename(CONFIG.model_name.rstrip("/"))
+    if (CONFIG.model_name.startswith("/") and not CONFIG.model_name.startswith("http"))
+    else CONFIG.model_name
+)
 FREE_RESPONSE_CHANNEL_IDS = set(CONFIG.free_response_channel_ids)
 ALLOWED_USER_IDS = set(CONFIG.allowed_user_ids)
 ADMIN_USER_IDS = set(CONFIG.admin_user_ids)
