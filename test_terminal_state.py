@@ -714,6 +714,33 @@ class DeliveryFailureLabelTest(TerminalStateTestCase):
         # Step 3: "none"
         self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
 
+    async def test_2h_adaptive_reasoning_downgrades_on_tool_error(self):
+        """When a tool in the prior turn returns an error, adaptive reasoning downgrades effort to 'low' with 512 token cap."""
+        captured_kwargs = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return await original_run(*args, **kwargs)
+
+        bot.channel_reasoning[CHANNEL_ID] = "high"
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "read_file", {"path": "non_existent_file.txt"})]),
+                    _response(tool_calls=[_tool_call("c2", "finish_task", {"report": "완료"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        # Step 1 (iteration 0): always "none"
+        self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
+        # Step 2 (iteration 1): tool error in read_file -> downgraded to "low" with 512 cap
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "low")
+        self.assertEqual(captured_kwargs[1].get("extra_body"), {"reasoning_max_tokens": 512})
+
     def test_2g_unclosed_xml_tool_call_extraction(self):
         """extract_tool_calls_from_text handles unclosed tags or xml tags without error."""
         text = "<tool_call>\n<function=bash_exec>\n<parameter=command>\nls -la</parameter>"

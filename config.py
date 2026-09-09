@@ -40,6 +40,7 @@ DEFAULT_MAX_TOOL_EXECUTIONS_PER_RUN = 2000
 DEFAULT_AGENT_STEP_MAX_TOKENS = 4096
 DEFAULT_REASONING_MAX_TOKENS = 1536
 DEFAULT_REASONING_EFFORT = "high"
+DEFAULT_ADAPTIVE_REASONING = True
 
 # Tool workers are disposable and deny-by-default. These are ceilings, not
 # tuning hints: lowering them is safe, while removing them is refused.
@@ -93,6 +94,7 @@ class BotConfig:
     agent_step_max_tokens: int
     reasoning_max_tokens: int
     default_reasoning_effort: str
+    adaptive_reasoning: bool
     tool_cpu_seconds: float
     tool_memory_bytes: int
     tool_process_limit: int
@@ -378,6 +380,9 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         default_reasoning_effort=get(
             "DEFAULT_REASONING_EFFORT", DEFAULT_REASONING_EFFORT
         ).lower().strip(),
+        adaptive_reasoning=parse_bool(
+            get("ADAPTIVE_REASONING"), "ADAPTIVE_REASONING", DEFAULT_ADAPTIVE_REASONING
+        ),
         tool_cpu_seconds=parse_positive_float(
             get("TOOL_CPU_SECONDS"), "TOOL_CPU_SECONDS", DEFAULT_TOOL_CPU_SECONDS
         ),
@@ -468,13 +473,14 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             config.tool_stage_timeout,
             config.bash_timeout,
         ),
-        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3} reasoning_tokens={4} effort={5}".format(
+        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3} reasoning_tokens={4} effort={5} adaptive={6}".format(
             config.max_agent_loops,
             config.checkpoint_interval,
             config.max_tool_executions_per_run,
             config.agent_step_max_tokens,
             config.reasoning_max_tokens,
             config.default_reasoning_effort,
+            "true" if config.adaptive_reasoning else "false",
         ),
         "tool sandbox: cpu={0}s memory={1} processes={2} threads={3} open_files={4} file_bytes={5} output_bytes={6} disk_bytes={7} network_origins={8}".format(
             config.tool_cpu_seconds,

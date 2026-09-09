@@ -245,8 +245,9 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.agent_step_max_tokens,
                 config.reasoning_max_tokens,
                 config.default_reasoning_effort,
+                config.adaptive_reasoning,
             ),
-            (2000, 50, 2000, 4096, 1536, "high"),
+            (2000, 50, 2000, 4096, 1536, "high", True),
         )
 
     def test_environment_overrides_are_applied(self):
@@ -258,6 +259,7 @@ class AgentLimitConfigTest(unittest.TestCase):
                 AGENT_STEP_MAX_TOKENS="5000",
                 REASONING_MAX_TOKENS="2000",
                 DEFAULT_REASONING_EFFORT="medium",
+                ADAPTIVE_REASONING="false",
             ),
             env_file=None,
         )
@@ -269,8 +271,9 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.agent_step_max_tokens,
                 config.reasoning_max_tokens,
                 config.default_reasoning_effort,
+                config.adaptive_reasoning,
             ),
-            (101, 11, 202, 5000, 2000, "medium"),
+            (101, 11, 202, 5000, 2000, "medium", False),
         )
 
     def test_env_file_overrides_are_applied(self):
@@ -286,6 +289,7 @@ class AgentLimitConfigTest(unittest.TestCase):
                     "AGENT_STEP_MAX_TOKENS=5001\n"
                     "REASONING_MAX_TOKENS=2001\n"
                     "DEFAULT_REASONING_EFFORT=low\n"
+                    "ADAPTIVE_REASONING=false\n"
                 )
             config = load_config(env={}, env_file=path)
 
@@ -297,8 +301,9 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.agent_step_max_tokens,
                 config.reasoning_max_tokens,
                 config.default_reasoning_effort,
+                config.adaptive_reasoning,
             ),
-            (102, 12, 203, 5001, 2001, "low"),
+            (102, 12, 203, 5001, 2001, "low", False),
         )
 
     def test_invalid_or_nonpositive_values_fail_with_the_field_name(self):
@@ -344,7 +349,7 @@ class AgentLimitConfigTest(unittest.TestCase):
     def test_diagnostics_report_effective_agent_limits(self):
         text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))
         self.assertIn(
-            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 effort=high",
+            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 effort=high adaptive=true",
             text,
         )
 

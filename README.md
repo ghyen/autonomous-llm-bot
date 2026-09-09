@@ -130,6 +130,7 @@ MAX_TOOL_EXECUTIONS_PER_RUN=2000
 AGENT_STEP_MAX_TOKENS=4096
 REASONING_MAX_TOKENS=1536
 DEFAULT_REASONING_EFFORT=high
+ADAPTIVE_REASONING=true
 LLM_CONNECT_TIMEOUT_SECONDS=15
 LLM_IDLE_TIMEOUT_SECONDS=3600
 MODEL_STAGE_TIMEOUT_SECONDS=3600
@@ -151,10 +152,11 @@ LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 
 The autonomous loop defaults to 2,000 model iterations, checkpoints every 50
 steps, allows at most 2,000 actual tool executions per run, limits each
-agent step to 4,096 output tokens, and caps internal reasoning to 1,536
-tokens. Override those limits with `MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`,
+agent step to 4,096 output tokens, caps internal reasoning to 1,536
+tokens, and dynamically adapts reasoning effort during tool execution.
+Override those limits with `MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`,
 `MAX_TOOL_EXECUTIONS_PER_RUN`, `AGENT_STEP_MAX_TOKENS`, `REASONING_MAX_TOKENS`,
-and `DEFAULT_REASONING_EFFORT`.
+`DEFAULT_REASONING_EFFORT`, and `ADAPTIVE_REASONING`.
 
 Network is deny-by-default. Enable `web_search` only when the operator wants
 the worker to use DuckDuckGo:
