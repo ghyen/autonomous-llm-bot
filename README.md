@@ -203,8 +203,31 @@ effective policy line.
 
 ### 4. Running the Bot
 
+You can run the bot and the backend server easily using `make` or the helper scripts in `scripts/`:
+
 ```bash
-python bot.py
+# Run both rapid-mlx server and bot (starts server, waits for health check, then runs bot)
+make run
+
+# Or run components individually:
+make run-rapid  # Starts rapid-mlx server standalone (port 18080)
+make run-bot    # Starts autonomous-llm-bot standalone
+
+# Run test suite:
+make test
+```
+
+Direct script execution is also supported:
+
+```bash
+# All-in-one launcher with graceful shutdown (Ctrl+C terminates both cleanly)
+./scripts/run_all.sh
+
+# Standalone server with customizable model path
+MODEL_PATH="/path/to/model" ./scripts/run_rapid.sh
+
+# Standalone bot
+./scripts/run_bot.sh
 ```
 
 ---
