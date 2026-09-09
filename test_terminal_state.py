@@ -222,7 +222,8 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
 
         bot.channel_reasoning[CHANNEL_ID] = "medium"
 
-        with patch("bot.run_completion_stage", side_effect=capture_stage):
+        with patch.object(bot, "ADAPTIVE_REASONING", False), \
+             patch("bot.run_completion_stage", side_effect=capture_stage):
             await self.drive(
                 [
                     _response(tool_calls=[_tool_call("c1", "bash_exec", {"command": "probe"})]),
@@ -235,10 +236,42 @@ class ExactlyOneReasonTest(TerminalStateTestCase):
         self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
         # Step 1 (iteration 0): always "none"
         self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
-        # Step 2 (iteration 1): normal configured effort ("medium")
+        # Step 2 (iteration 1): non-adaptive preserves configured effort ("medium")
         self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "medium")
         # Step 3 (iteration 2): consecutive_internal_thoughts > 0 -> forced fallback to "none"
         self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
+
+    async def test_2f_think_tool_schedules_isolated_deep_thinking_step(self):
+        """think tool schedules a think step with requested effort, omitting tools to prevent engine hang."""
+        captured_kwargs = []
+        original_run = bot.run_completion_stage
+
+        async def capture_stage(*args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return await original_run(*args, **kwargs)
+
+        with patch("bot.run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                [
+                    _response(tool_calls=[_tool_call("c1", "think", {"focus": "복잡한 에러 분석", "effort": "medium"})]),
+                    _response(content="<think>에러 원인을 철저히 분석함</think>원인 규명 완료, 이제 패치를 적용합니다."),
+                    _response(tool_calls=[_tool_call("c2", "finish_task", {"report": "완료"})]),
+                ],
+                max_loops=6,
+            )
+
+        self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
+        # Step 1 (iteration 0): action turn with effort='none', tools present
+        self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
+        self.assertIn("tools", captured_kwargs[0])
+
+        # Step 2 (iteration 1): think turn with effort='medium', tools omitted for budget enforcement
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "medium")
+        self.assertEqual(captured_kwargs[1].get("tools"), None)
+
+        # Step 3 (iteration 2): returns to action turn with effort='none', tools restored
+        self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
+        self.assertIn("tools", captured_kwargs[2])
 
     async def test_2_completion_text_after_tools_does_not_stall_and_continues_until_budget(self):
         """Completion text without finish_task continues autonomously without stall until step budget."""

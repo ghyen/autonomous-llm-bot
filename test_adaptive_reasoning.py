@@ -8,6 +8,9 @@ import bot
 from bot import (
     has_recent_tool_error,
     resolve_adaptive_reasoning_effort,
+    resolve_think_tokens,
+    tool_think,
+    TOOLS_SCHEMA,
 )
 
 
@@ -73,6 +76,19 @@ class HasRecentToolErrorTest(unittest.TestCase):
         self.assertFalse(has_recent_tool_error(payload))
 
 
+class ResolveThinkTokensTest(unittest.TestCase):
+    def test_tiers(self):
+        self.assertEqual(resolve_think_tokens("minimal"), 256)
+        self.assertEqual(resolve_think_tokens("low"), 512)
+        self.assertEqual(resolve_think_tokens("medium"), 1536)
+        self.assertEqual(resolve_think_tokens("high"), 4096)
+
+    def test_defaults_and_fallback(self):
+        self.assertEqual(resolve_think_tokens("unknown"), 512)
+        self.assertEqual(resolve_think_tokens(""), 512)
+        self.assertEqual(resolve_think_tokens(None), 512)
+
+
 class ResolveAdaptiveReasoningEffortTest(unittest.TestCase):
     def test_step_zero_is_always_none(self):
         effort, tokens = resolve_adaptive_reasoning_effort(
@@ -120,33 +136,28 @@ class ResolveAdaptiveReasoningEffortTest(unittest.TestCase):
         )
         self.assertEqual((effort, tokens), ("high", 1536))
 
-    def test_tool_error_triggers_low_effort_with_512_cap(self):
-        payload = [{"role": "tool", "name": "read_file", "content": '{"status":"error","error":"not_found"}'}]
-        effort, tokens = resolve_adaptive_reasoning_effort(
-            iteration=1,
-            consecutive_internal_thoughts=0,
-            configured_effort="high",
-            adaptive_enabled=True,
-            messages_payload=payload,
-            reasoning_max_tokens=1536,
-        )
-        self.assertEqual((effort, tokens), ("low", 512))
-
-    def test_tool_error_respects_smaller_reasoning_token_ceiling(self):
-        payload = [{"role": "tool", "name": "read_file", "content": '{"status":"error","error":"not_found"}'}]
-        effort, tokens = resolve_adaptive_reasoning_effort(
-            iteration=1,
-            consecutive_internal_thoughts=0,
-            configured_effort="high",
-            adaptive_enabled=True,
-            messages_payload=payload,
-            reasoning_max_tokens=256,
-        )
-        self.assertEqual((effort, tokens), ("low", 256))
-
-    def test_successful_tool_uses_configured_effort(self):
+    def test_pending_think_effort_overrides_to_requested_effort_and_tokens(self):
         payload = [{"role": "tool", "name": "bash_exec", "content": "[stdout]\nok\n[exit code: 0]"}]
-        # configured high
+        for tier, expected_tokens in [
+            ("minimal", 256),
+            ("low", 512),
+            ("medium", 1536),
+            ("high", 4096),
+        ]:
+            effort, tokens = resolve_adaptive_reasoning_effort(
+                iteration=1,
+                consecutive_internal_thoughts=0,
+                configured_effort="high",
+                adaptive_enabled=True,
+                messages_payload=payload,
+                reasoning_max_tokens=1536,
+                pending_think_effort=tier,
+            )
+            self.assertEqual((effort, tokens), (tier, expected_tokens))
+
+    def test_normal_tool_execution_defaults_to_none_to_prevent_hang(self):
+        payload = [{"role": "tool", "name": "bash_exec", "content": "[stdout]\nok\n[exit code: 0]"}]
+        # Normal step without pending think effort defaults to 'none' for fast tool execution
         effort, tokens = resolve_adaptive_reasoning_effort(
             iteration=1,
             consecutive_internal_thoughts=0,
@@ -155,29 +166,29 @@ class ResolveAdaptiveReasoningEffortTest(unittest.TestCase):
             messages_payload=payload,
             reasoning_max_tokens=1536,
         )
-        self.assertEqual((effort, tokens), ("high", 1536))
+        self.assertEqual((effort, tokens), ("none", None))
 
-        # configured medium
-        effort, tokens = resolve_adaptive_reasoning_effort(
-            iteration=1,
-            consecutive_internal_thoughts=0,
-            configured_effort="medium",
-            adaptive_enabled=True,
-            messages_payload=payload,
-            reasoning_max_tokens=2000,
-        )
-        self.assertEqual((effort, tokens), ("medium", 1536))
 
-        # configured low
-        effort, tokens = resolve_adaptive_reasoning_effort(
-            iteration=1,
-            consecutive_internal_thoughts=0,
-            configured_effort="low",
-            adaptive_enabled=True,
-            messages_payload=payload,
-            reasoning_max_tokens=1536,
-        )
-        self.assertEqual((effort, tokens), ("low", 512))
+class ThinkToolSchemaAndExecutionTest(unittest.IsolatedAsyncioTestCase):
+    def test_think_tool_in_tools_schema(self):
+        think_tool = next((t for t in TOOLS_SCHEMA if t.get("function", {}).get("name") == "think"), None)
+        self.assertIsNotNone(think_tool)
+        func = think_tool["function"]
+        self.assertIn("focus", func["parameters"]["properties"])
+        self.assertIn("effort", func["parameters"]["properties"])
+        self.assertEqual(func["parameters"]["properties"]["effort"]["enum"], ["minimal", "low", "medium", "high"])
+        self.assertIn("focus", func["parameters"]["required"])
+
+    async def test_tool_think_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = await tool_think(td, focus="로그 에러 원인 규명", effort="medium")
+            self.assertIn("심층 사고 모드 예약 완료", res)
+            self.assertIn("로그 에러 원인 규명", res)
+            self.assertIn("medium", res)
+
+            # fallback to low on invalid effort
+            res_invalid = await tool_think(td, focus="가설 검토", effort="invalid_tier")
+            self.assertIn("low", res_invalid)
 
 
 if __name__ == "__main__":

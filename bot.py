@@ -110,6 +110,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `lookup_trajectory(step, call_id)`: 롤링 컨텍스트에서 빠진 과거 스텝의 도구·인자·결과 조회
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `record_playbook(rule_type, rule_content)`: 환경 제약·무효 경로·검증된 성공 패턴을 다음 런에도 남기는 전용 도구
+  - `think(focus, effort)`: 복잡한 데이터 분석, 가설 검증, 오류 원인 규명 등 심층 사고가 필요할 때 호출하는 전용 도구. 다음 스텝에서 외부 도구 없이 지정된 강도로 심층 사고 및 분석을 수행합니다. (쉬운 분석은 minimal/low, 복잡한 분석은 medium 권장)
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
 - `bash_exec`, `read_file`, `web_search`에서 최근 8스텝 안에 이미 성공한 동일 인자 호출은 Loop Guard가 실행 전에 차단합니다. 기존 결과를 가공하거나 다른 가설을 시도하세요. 백그라운드 작업 완료 확인처럼 의도적인 재시도일 때만 `force=true`를 추가하세요. `force`는 한 번의 재실행만 허용하며 호출의 동일성 자체를 바꾸지 않습니다.
 - 루트 `plan.md`, `findings.md`, `playbook.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`, `findings.md`, `playbook.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
@@ -142,6 +143,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 - 모델 내부 생각(<think>)은 도구 실행 전 짧고 구체적인 판단(1~3문장)에만 집중하세요.
 - 파일이 없거나(not_found), 명령어가 실패(exit code != 0)했거나 에러가 발생한 경우:
   원인을 머릿속으로 길게 추측하거나 상상 속에서 결론을 내리지 마세요. 디렉토리 구조 및 실제 환경을 확인하기 위한 탐색 도구(`bash_exec`로 `ls -la`, `find`, `zg query` 등)를 즉시 호출하세요.
+- 복잡한 데이터 분석, 가설 검증, 오류 원인 분석 등 긴 생각이 반드시 필요할 때는 섣부르게 도구를 연타하지 말고 `think(focus="...", effort="low"|"medium")` 도구를 명시적으로 호출하여 심층 사고를 진행하세요.
 - 도구 실행 중 긴 독백, 강의식 설명, 가상 시뮬레이션을 작성하지 마세요. 필요한 도구가 결정되면 즉시 생각을 마치고 도구를 호출하세요.
 """
 
@@ -392,6 +394,28 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["rule_type", "rule_content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "think",
+            "description": "복잡한 데이터 분석, 가설 검증, 오류 원인 규명 등 심층 사고가 필요할 때 호출합니다. 다음 스텝에서 외부 도구 없이 지정된 강도로 심층 사고 및 분석 턴을 진행합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "description": "깊이 생각하고 분석할 구체적 대상 또는 문제 (예: '로그 에러 원인 규명', '수집된 단서 간 모순 검토')"
+                    },
+                    "effort": {
+                        "type": "string",
+                        "enum": ["minimal", "low", "medium", "high"],
+                        "description": "심층 사고 강도 (minimal=256토큰/30초, low=512토큰/1분[기본권장], medium=1536토큰/3분, high=4096토큰/8분)"
+                    }
+                },
+                "required": ["focus"]
             }
         }
     },
@@ -1171,6 +1195,25 @@ async def tool_record_state(ledger, updates) -> str:
     except Exception as e:
         return f"[Error applying state update: {e}]"
 
+async def tool_think(workspace, focus: str, effort: str = "low", step_num: int = 0) -> str:
+    eff = (effort or "low").lower().strip()
+    if eff not in ("minimal", "low", "medium", "high"):
+        eff = "low"
+    focus_clean = str(focus or "").strip()
+    log_session_event(
+        workspace,
+        "tool_think",
+        step=step_num,
+        status="ok",
+        tool="think",
+        focus=focus_clean,
+        effort=eff,
+    )
+    return (
+        f"[심층 사고 모드 예약 완료] 분석 주제: '{focus_clean}', 추론 강도: '{eff}'. "
+        f"다음 스텝에서 외부 도구 없이 온전히 {eff} 강도의 심층 사고 및 분석을 수행합니다."
+    )
+
 async def tool_finish_task(workspace, report: str, step_num: int = 0) -> str:
     # 완료 신호는 stdout 한 줄이 아니라 런 로그의 레코드로 남는다. 종료 경로를
     # 사후에 구분하려면 이 호출이 어느 스텝에서 왔는지가 있어야 한다.
@@ -1218,6 +1261,10 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
             )
         elif name == "record_state":
             return await tool_record_state(ledger, args)
+        elif name == "think":
+            f = args.get("focus", "")
+            eff = args.get("effort", "low")
+            return await tool_think(workspace, f, eff, step_num)
         elif name == "finish_task":
             r = args.get("report", "")
             return await tool_finish_task(workspace, r, step_num)
@@ -1408,6 +1455,19 @@ def has_recent_tool_error(messages_payload: Optional[List[Dict[str, Any]]]) -> b
     return False
 
 
+def resolve_think_tokens(effort: str, default_max: int = 1536) -> int:
+    eff = (effort or "low").lower().strip()
+    if eff == "minimal":
+        return min(default_max, 256)
+    elif eff == "low":
+        return min(default_max, 512)
+    elif eff == "medium":
+        return min(default_max, 1536)
+    elif eff == "high":
+        return max(default_max, 4096)
+    return min(default_max, 512)
+
+
 def resolve_adaptive_reasoning_effort(
     *,
     iteration: int,
@@ -1416,19 +1476,28 @@ def resolve_adaptive_reasoning_effort(
     adaptive_enabled: bool = True,
     messages_payload: Optional[List[Dict[str, Any]]] = None,
     reasoning_max_tokens: int = 1536,
+    pending_think_effort: Optional[str] = None,
 ) -> Tuple[str, Optional[int]]:
     """Determine the reasoning effort and token cap for the current agent step.
 
     Applies step-level dynamic reasoning:
-    1. Step 0 (iteration == 0) or internal thought stall recovery
+    1. If the model explicitly requested a Think step via `think(effort=...)`:
+       grants that requested effort and token budget (minimal: 256, low: 512, medium: 1536, high: 4096).
+    2. Step 0 (iteration == 0) or internal thought stall recovery
        (consecutive_internal_thoughts > 0): always 'none' to avoid stalls and
        enable quick direct answers or immediate tool execution.
-    2. When adaptive is disabled: uses configured_effort with reasoning_max_tokens.
-    3. If recent tool execution had errors (not_found, exit code != 0):
-       downgrades to 'low' (capped at min(reasoning_max_tokens, 512)) to stop
-       the model from entering long reasoning contemplation loops on errors.
-    4. Normal tool execution: preserves configured_effort capped at reasoning_max_tokens.
+    3. If configured_effort == 'none': always 'none'.
+    4. When adaptive is disabled: uses configured_effort with reasoning_max_tokens.
+    5. If recent tool execution had errors (not_found, exit code != 0):
+       downgrades to 'low' (capped at min(reasoning_max_tokens, 512)) for rapid diagnostic think.
+    6. Normal tool execution: defaults to 'none' so Rapid-MLX can generate tool calls
+       immediately without entering an unbudgeted 4096-token thinking loop.
     """
+    if pending_think_effort:
+        eff = pending_think_effort.lower().strip()
+        tokens = resolve_think_tokens(eff, reasoning_max_tokens)
+        return eff, tokens
+
     if iteration == 0 or consecutive_internal_thoughts > 0:
         return "none", None
 
@@ -1439,16 +1508,10 @@ def resolve_adaptive_reasoning_effort(
         return configured_effort, reasoning_max_tokens
 
     if has_recent_tool_error(messages_payload):
-        # 도구 실패 직후에는 뇌내 망상/추론 루프에 빠지지 않도록 low (최대 512토큰)로 신속 복구 강제
         low_cap = min(reasoning_max_tokens, 512)
         return "low", low_cap
 
-    if configured_effort == "low":
-        return "low", min(reasoning_max_tokens, 512)
-    elif configured_effort == "medium":
-        return "medium", min(reasoning_max_tokens, 1536)
-    else:  # high
-        return "high", reasoning_max_tokens
+    return "none", None
 
 
 # --- Pre-Send Payload Validator (tool 상관관계 + chat template) ---
@@ -3779,6 +3842,8 @@ async def on_message(message: discord.Message):
     last_failed_signature = None
     consecutive_failed_tool_calls = 0
     consecutive_internal_thoughts = 0
+    pending_think_effort = None
+    pending_think_focus = None
 
     async def maybe_roll_context(step_num: int):
         nonlocal messages_payload, rolling_summary
@@ -3855,12 +3920,24 @@ async def on_message(message: discord.Message):
                 adaptive_enabled=ADAPTIVE_REASONING,
                 messages_payload=messages_payload,
                 reasoning_max_tokens=CONFIG.reasoning_max_tokens,
+                pending_think_effort=pending_think_effort,
             )
+            is_think_step = bool(pending_think_effort)
+            active_think_focus = pending_think_focus
+            pending_think_effort = None
+            pending_think_focus = None
+
             extra_params["reasoning_effort"] = effort
             if effort != "none" and effort_tokens is not None:
                 extra_params["extra_body"] = {
                     "reasoning_max_tokens": effort_tokens
                 }
+
+            if is_think_step:
+                # 심층 사고 스텝: Rapid-MLX 사고 예산 제어기 활성화를 위해 도구 전달 생략
+                step_tool_params = {}
+            else:
+                step_tool_params = agent_tool_params()
 
             # 권위 있는 조사 상태를 매 스텝 0번 메시지에 재고정한다.
             if messages_payload and _msg_role(messages_payload[0]) == "system":
@@ -3888,7 +3965,9 @@ async def on_message(message: discord.Message):
             )
             model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
             model_stage_started = time.monotonic()
-            if consecutive_internal_thoughts > 0:
+            if is_think_step:
+                step_max_tokens = min(AGENT_STEP_MAX_TOKENS, (effort_tokens or 512) + 512)
+            elif consecutive_internal_thoughts > 0:
                 step_max_tokens = min(1024, AGENT_STEP_MAX_TOKENS)
             elif iteration == 0:
                 step_max_tokens = min(2048, AGENT_STEP_MAX_TOKENS)
@@ -3898,13 +3977,13 @@ async def on_message(message: discord.Message):
             try:
                 resp = await run_completion_stage(
                     token=token,
-                    stage="agent",
+                    stage="agent:think" if is_think_step else "agent",
                     deadline=model_stage_deadline,
                     model=MODEL_NAME,
                     messages=compacted_payload,
                     max_tokens=step_max_tokens,
                     temperature=0.7,
-                    **agent_tool_params(),
+                    **step_tool_params,
                     **extra_params
                 )
             except (RunCancelled, StageTimeout) as stage_error:
@@ -4471,6 +4550,16 @@ async def on_message(message: discord.Message):
                         "content": tool_result
                     })
 
+                for tc in tool_calls_to_run:
+                    if tc["name"] == "think":
+                        tc_args = tc.get("arguments") or {}
+                        if isinstance(tc_args, dict):
+                            pending_think_effort = tc_args.get("effort", "low")
+                            pending_think_focus = tc_args.get("focus", "")
+                        else:
+                            pending_think_effort = "low"
+                            pending_think_focus = ""
+
                 trajectory_calls = [
                     {
                         "id": tc["id"],
@@ -4695,7 +4784,7 @@ async def on_message(message: discord.Message):
                     break
                 continue
 
-            # [도구 호출 없는 내부 추론 응답]
+            # [도구 호출 없는 응답 처리: 심층 사고 턴 vs 일반 텍스트 정체]
             if token.cancelled:
                 outcome.settle(outcome_mod.STOPPED, token.reason)
                 final_raw = full_raw_thought or content_text
@@ -4706,56 +4795,91 @@ async def on_message(message: discord.Message):
                 final_raw = full_raw_thought or content_text
                 break
 
-            # 모델이 도구 없이 내부 추론(thought/plan)만 진행한 경우:
-            consecutive_internal_thoughts += 1
-
             cleaned_thought = clean_internal_thought_content(content_text)
 
-            messages_payload.append({
-                "role": "assistant",
-                "content": cleaned_thought or "[자율 내부 추론]",
-            })
-            log_session_event(
-                workspace,
-                "internal_thought",
-                step=iteration + 1,
-                content_chars=len(cleaned_thought or ""),
-                consecutive=consecutive_internal_thoughts,
-                cutoff=is_length_cutoff,
-            )
-            try:
-                await status_msg.edit(content=f"🧠 **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 내부 추론 및 분석 진행 중... ▌")
-            except Exception:
-                pass
-
-            # 연속 도구 미호출 정체 방지 가드레일
-            if consecutive_internal_thoughts >= MAX_CONSECUTIVE_INTERNAL_THOUGHTS:
+            if is_think_step:
+                # 자율 요청된 심층 사고 턴 완료: 정체 카운터를 리셋하고 실제 행동 턴으로 유도
+                consecutive_internal_thoughts = 0
+                messages_payload.append({
+                    "role": "assistant",
+                    "content": cleaned_thought or "[심층 사고 분석 완료]",
+                })
                 log_session_event(
                     workspace,
-                    "internal_thought_stall",
+                    "think_step_completed",
                     step=iteration + 1,
-                    consecutive=consecutive_internal_thoughts,
+                    content_chars=len(cleaned_thought or ""),
+                    focus=active_think_focus or "",
+                    effort=effort,
+                    cutoff=is_length_cutoff,
                 )
-                outcome.settle(outcome_mod.EXHAUSTED, "내부 추론 반복 정체")
-                final_raw = full_raw_thought or content_text
-                break
+                try:
+                    await status_msg.edit(content=f"🧠 **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** 💡 심층 사고 완료, 도구 실행 준비 중... ▌")
+                except Exception:
+                    pass
 
-            # 추론 토큰 한도 초과 절단 또는 연속 정체 시 피드백(Nudge) 주입
-            if is_length_cutoff:
-                nudge_content = (
-                    "[🤖 시스템 안내: 직전 스텝의 내부 추론이 토큰 한도에 도달하여 중단되었습니다. "
-                    "더 이상 장문의 내부 추론(Thinking)을 반복하지 말고, 현재까지 수집된 단서를 바탕으로 "
-                    "필요한 도구(bash_exec, read_file, record_state 등)를 즉시 호출하거나 "
-                    "조사가 완료되었다면 finish_task를 호출하세요.]"
-                )
+                if is_length_cutoff:
+                    nudge_content = (
+                        "[🤖 시스템 안내: 요청하신 심층 사고 턴이 지정된 토큰 한도에 도달하여 마감되었습니다. "
+                        "현재까지 도출된 분석 결과와 단서를 바탕으로 필요한 실제 도구(bash_exec, read_file, record_state 등)를 즉시 호출하여 "
+                        "행동을 수행하거나 모든 조사가 끝났다면 finish_task를 호출하세요.]"
+                    )
+                else:
+                    nudge_content = (
+                        "[🤖 시스템 안내: 요청하신 심층 사고 턴이 완료되었습니다. "
+                        "분석된 가설과 계획을 바탕으로 실제 도구(bash_exec, read_file, record_state 등)를 즉시 호출하여 "
+                        "검증 및 실제 작업을 수행하세요. 모든 조사가 끝났다면 finish_task를 호출하세요.]"
+                    )
                 messages_payload.append({"role": "user", "content": nudge_content})
-            elif consecutive_internal_thoughts >= 1:
-                nudge_content = (
-                    f"[🤖 시스템 안내: {consecutive_internal_thoughts}스텝 연속으로 도구 호출 없이 내부 추론/텍스트만 반환되었습니다. "
-                    "혼자 생각하거나 설명하는 것을 멈추고 실제 행동(도구 실행)을 즉시 수행하세요. "
-                    "필요한 도구를 호출하거나 모든 조사가 끝났다면 finish_task로 결과를 보고하세요.]"
+            else:
+                # 모델이 도구 없이 내부 추론(thought/plan)만 진행한 경우 (비정상 정체):
+                consecutive_internal_thoughts += 1
+
+                messages_payload.append({
+                    "role": "assistant",
+                    "content": cleaned_thought or "[자율 내부 추론]",
+                })
+                log_session_event(
+                    workspace,
+                    "internal_thought",
+                    step=iteration + 1,
+                    content_chars=len(cleaned_thought or ""),
+                    consecutive=consecutive_internal_thoughts,
+                    cutoff=is_length_cutoff,
                 )
-                messages_payload.append({"role": "user", "content": nudge_content})
+                try:
+                    await status_msg.edit(content=f"🧠 **[Step {iteration+1}/{MAX_AGENT_LOOPS}]** ⚡ 자율 내부 추론 및 분석 진행 중... ▌")
+                except Exception:
+                    pass
+
+                # 연속 도구 미호출 정체 방지 가드레일
+                if consecutive_internal_thoughts >= MAX_CONSECUTIVE_INTERNAL_THOUGHTS:
+                    log_session_event(
+                        workspace,
+                        "internal_thought_stall",
+                        step=iteration + 1,
+                        consecutive=consecutive_internal_thoughts,
+                    )
+                    outcome.settle(outcome_mod.EXHAUSTED, "내부 추론 반복 정체")
+                    final_raw = full_raw_thought or content_text
+                    break
+
+                # 추론 토큰 한도 초과 절단 또는 연속 정체 시 피드백(Nudge) 주입
+                if is_length_cutoff:
+                    nudge_content = (
+                        "[🤖 시스템 안내: 직전 스텝의 내부 추론이 토큰 한도에 도달하여 중단되었습니다. "
+                        "더 이상 장문의 내부 추론(Thinking)을 반복하지 말고, 현재까지 수집된 단서를 바탕으로 "
+                        "필요한 도구(bash_exec, read_file, record_state 등)를 즉시 호출하거나 "
+                        "조사가 완료되었다면 finish_task를 호출하세요.]"
+                    )
+                    messages_payload.append({"role": "user", "content": nudge_content})
+                elif consecutive_internal_thoughts >= 1:
+                    nudge_content = (
+                        f"[🤖 시스템 안내: {consecutive_internal_thoughts}스텝 연속으로 도구 호출 없이 내부 추론/텍스트만 반환되었습니다. "
+                        "혼자 생각하거나 설명하는 것을 멈추고 실제 행동(도구 실행)을 즉시 수행하세요. "
+                        "필요한 도구를 호출하거나 모든 조사가 끝났다면 finish_task로 결과를 보고하세요.]"
+                    )
+                    messages_payload.append({"role": "user", "content": nudge_content})
 
             try:
                 await maybe_roll_context(iteration + 1)
