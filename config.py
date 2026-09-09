@@ -37,7 +37,9 @@ DEFAULT_BASH_TIMEOUT = 60.0
 DEFAULT_MAX_AGENT_LOOPS = 2000
 DEFAULT_CHECKPOINT_INTERVAL = 50
 DEFAULT_MAX_TOOL_EXECUTIONS_PER_RUN = 2000
-DEFAULT_AGENT_STEP_MAX_TOKENS = 2048
+DEFAULT_AGENT_STEP_MAX_TOKENS = 4096
+DEFAULT_REASONING_MAX_TOKENS = 1536
+DEFAULT_REASONING_EFFORT = "high"
 
 # Tool workers are disposable and deny-by-default. These are ceilings, not
 # tuning hints: lowering them is safe, while removing them is refused.
@@ -89,6 +91,8 @@ class BotConfig:
     checkpoint_interval: int
     max_tool_executions_per_run: int
     agent_step_max_tokens: int
+    reasoning_max_tokens: int
+    default_reasoning_effort: str
     tool_cpu_seconds: float
     tool_memory_bytes: int
     tool_process_limit: int
@@ -366,6 +370,14 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
             "AGENT_STEP_MAX_TOKENS",
             DEFAULT_AGENT_STEP_MAX_TOKENS,
         ),
+        reasoning_max_tokens=parse_positive_int(
+            get("REASONING_MAX_TOKENS"),
+            "REASONING_MAX_TOKENS",
+            DEFAULT_REASONING_MAX_TOKENS,
+        ),
+        default_reasoning_effort=get(
+            "DEFAULT_REASONING_EFFORT", DEFAULT_REASONING_EFFORT
+        ).lower().strip(),
         tool_cpu_seconds=parse_positive_float(
             get("TOOL_CPU_SECONDS"), "TOOL_CPU_SECONDS", DEFAULT_TOOL_CPU_SECONDS
         ),
@@ -419,6 +431,21 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
             )
         )
 
+    valid_efforts = frozenset({"none", "low", "medium", "high"})
+    if config.default_reasoning_effort not in valid_efforts:
+        raise ConfigError(
+            "DEFAULT_REASONING_EFFORT: '{0}'은 유효하지 않습니다. "
+            "(none, low, medium, high 중 하나여야 합니다)".format(config.default_reasoning_effort)
+        )
+
+    if config.agent_step_max_tokens <= config.reasoning_max_tokens:
+        raise ConfigError(
+            "AGENT_STEP_MAX_TOKENS({0})는 REASONING_MAX_TOKENS({1})보다 커야 합니다. "
+            "도구 호출 및 응답을 위한 최소한의 토큰 공간이 필요합니다.".format(
+                config.agent_step_max_tokens, config.reasoning_max_tokens
+            )
+        )
+
     return config
 
 
@@ -441,11 +468,13 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             config.tool_stage_timeout,
             config.bash_timeout,
         ),
-        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3}".format(
+        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3} reasoning_tokens={4} effort={5}".format(
             config.max_agent_loops,
             config.checkpoint_interval,
             config.max_tool_executions_per_run,
             config.agent_step_max_tokens,
+            config.reasoning_max_tokens,
+            config.default_reasoning_effort,
         ),
         "tool sandbox: cpu={0}s memory={1} processes={2} threads={3} open_files={4} file_bytes={5} output_bytes={6} disk_bytes={7} network_origins={8}".format(
             config.tool_cpu_seconds,

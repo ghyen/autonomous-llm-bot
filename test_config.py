@@ -232,6 +232,7 @@ class AgentLimitConfigTest(unittest.TestCase):
         "CHECKPOINT_INTERVAL": "checkpoint_interval",
         "MAX_TOOL_EXECUTIONS_PER_RUN": "max_tool_executions_per_run",
         "AGENT_STEP_MAX_TOKENS": "agent_step_max_tokens",
+        "REASONING_MAX_TOKENS": "reasoning_max_tokens",
     }
 
     def test_defaults_match_the_documented_limits(self):
@@ -242,8 +243,10 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.checkpoint_interval,
                 config.max_tool_executions_per_run,
                 config.agent_step_max_tokens,
+                config.reasoning_max_tokens,
+                config.default_reasoning_effort,
             ),
-            (2000, 50, 2000, 2048),
+            (2000, 50, 2000, 4096, 1536, "high"),
         )
 
     def test_environment_overrides_are_applied(self):
@@ -252,7 +255,9 @@ class AgentLimitConfigTest(unittest.TestCase):
                 MAX_AGENT_LOOPS="101",
                 CHECKPOINT_INTERVAL="11",
                 MAX_TOOL_EXECUTIONS_PER_RUN="202",
-                AGENT_STEP_MAX_TOKENS="303",
+                AGENT_STEP_MAX_TOKENS="5000",
+                REASONING_MAX_TOKENS="2000",
+                DEFAULT_REASONING_EFFORT="medium",
             ),
             env_file=None,
         )
@@ -262,8 +267,10 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.checkpoint_interval,
                 config.max_tool_executions_per_run,
                 config.agent_step_max_tokens,
+                config.reasoning_max_tokens,
+                config.default_reasoning_effort,
             ),
-            (101, 11, 202, 303),
+            (101, 11, 202, 5000, 2000, "medium"),
         )
 
     def test_env_file_overrides_are_applied(self):
@@ -276,7 +283,9 @@ class AgentLimitConfigTest(unittest.TestCase):
                     "MAX_AGENT_LOOPS=102\n"
                     "CHECKPOINT_INTERVAL=12\n"
                     "MAX_TOOL_EXECUTIONS_PER_RUN=203\n"
-                    "AGENT_STEP_MAX_TOKENS=304\n"
+                    "AGENT_STEP_MAX_TOKENS=5001\n"
+                    "REASONING_MAX_TOKENS=2001\n"
+                    "DEFAULT_REASONING_EFFORT=low\n"
                 )
             config = load_config(env={}, env_file=path)
 
@@ -286,8 +295,10 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.checkpoint_interval,
                 config.max_tool_executions_per_run,
                 config.agent_step_max_tokens,
+                config.reasoning_max_tokens,
+                config.default_reasoning_effort,
             ),
-            (102, 12, 203, 304),
+            (102, 12, 203, 5001, 2001, "low"),
         )
 
     def test_invalid_or_nonpositive_values_fail_with_the_field_name(self):
@@ -298,10 +309,42 @@ class AgentLimitConfigTest(unittest.TestCase):
                         load_config(env=env(**{field: bad}), env_file=None)
                     self.assertIn(field, str(caught.exception))
 
+    def test_reasoning_max_tokens_must_be_less_than_agent_step_max_tokens(self):
+        with self.assertRaises(ConfigError) as caught:
+            load_config(
+                env=env(
+                    AGENT_STEP_MAX_TOKENS="2000",
+                    REASONING_MAX_TOKENS="2000",
+                ),
+                env_file=None,
+            )
+        self.assertIn("AGENT_STEP_MAX_TOKENS", str(caught.exception))
+        self.assertIn("REASONING_MAX_TOKENS", str(caught.exception))
+
+        with self.assertRaises(ConfigError) as caught:
+            load_config(
+                env=env(
+                    AGENT_STEP_MAX_TOKENS="1000",
+                    REASONING_MAX_TOKENS="2000",
+                ),
+                env_file=None,
+            )
+        self.assertIn("AGENT_STEP_MAX_TOKENS", str(caught.exception))
+
+    def test_invalid_default_reasoning_effort_fails(self):
+        for bad in ("invalid", "extreme", "off", "1"):
+            with self.subTest(effort=bad):
+                with self.assertRaises(ConfigError) as caught:
+                    load_config(
+                        env=env(DEFAULT_REASONING_EFFORT=bad),
+                        env_file=None,
+                    )
+                self.assertIn("DEFAULT_REASONING_EFFORT", str(caught.exception))
+
     def test_diagnostics_report_effective_agent_limits(self):
         text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))
         self.assertIn(
-            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=2048",
+            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 effort=high",
             text,
         )
 
