@@ -27,7 +27,6 @@ exec "$RAPID_BIN" serve "$MODEL_PATH" \
     --port "$PORT" \
     --reasoning \
     --reasoning-parser qwen3 \
-    --disable-prefix-cache \
     --prefix-cache-index radix \
     --pin-system-prompt \
     --no-mllm \
