@@ -5,6 +5,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-/Users/edwin/qwen38-mlx/models/Qwen3.8-27B-Huihui-Abliterated-oQ4e-MTP-MLX}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-18080}"
+CACHE_MEMORY_MB="${CACHE_MEMORY_MB:-8192}"
 RAPID_BIN="${RAPID_BIN:-$(command -v rapid-mlx || echo "/opt/homebrew/bin/rapid-mlx")}"
 
 if [ ! -x "$RAPID_BIN" ]; then
@@ -21,6 +22,7 @@ fi
 echo "🚀 Starting rapid-mlx serve..."
 echo "   Model:    $MODEL_PATH"
 echo "   Endpoint: http://${HOST}:${PORT}"
+echo "   Cache:    ${CACHE_MEMORY_MB} MB"
 
 exec "$RAPID_BIN" serve "$MODEL_PATH" \
     --host "$HOST" \
@@ -31,6 +33,7 @@ exec "$RAPID_BIN" serve "$MODEL_PATH" \
     --pin-system-prompt \
     --no-mllm \
     --hybrid-cache-entries 50 \
+    --cache-memory-mb "$CACHE_MEMORY_MB" \
     --prefill-step-size 512 \
     --gpu-memory-utilization 0.85 \
     --kv-cache-dtype int8 \
