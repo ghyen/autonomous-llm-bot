@@ -705,9 +705,12 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
     return False
 
 
-ROLLING_COMPACTION_INTERVAL = 10
-KEEP_RECENT_TOOL_GROUPS = 10
+ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
+KEEP_RECENT_TOOL_GROUPS = int(os.environ.get("KEEP_RECENT_TOOL_GROUPS", "5"))
 ROLLING_SUMMARY_MAX_CHARS = 10000
+MAX_CONTEXT_CHARS_BEFORE_ROLLOVER = int(os.environ.get("MAX_CONTEXT_CHARS_BEFORE_ROLLOVER", "28000"))
+MAX_AGENT_PAYLOAD_CHARS = int(os.environ.get("MAX_AGENT_PAYLOAD_CHARS", "36000"))
+MIN_RETAINED_TOOL_GROUPS = 2
 # 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
 # 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = workspace_io.DEFAULT_TOOL_OUTPUT_MAX_CHARS
@@ -1721,17 +1724,66 @@ PLAYBOOK_CONTEXT_NOTICE = (
 )
 
 
+def bound_agent_payload(messages: list, max_chars: int = MAX_AGENT_PAYLOAD_CHARS) -> list:
+    """전송 직전 payload가 VRAM 안전 한계를 넘지 않도록 최근 도구 그룹을 보존하며 상한을 적용한다."""
+    if not messages:
+        return []
+    total_chars = sum(len(_msg_content(msg) or "") for msg in messages)
+    if total_chars <= max_chars:
+        return messages
+
+    group_indices = [
+        index
+        for index, msg in enumerate(messages)
+        if _msg_role(msg) == "assistant" and _msg_tool_calls(msg)
+    ]
+    if len(group_indices) <= MIN_RETAINED_TOOL_GROUPS:
+        return messages
+
+    prefix_end = group_indices[0]
+    prefix = messages[:prefix_end]
+
+    chosen_start = None
+    for k in range(min(len(group_indices), KEEP_RECENT_TOOL_GROUPS), MIN_RETAINED_TOOL_GROUPS - 1, -1):
+        cand_start = group_indices[-k]
+        candidate_tail = messages[cand_start:]
+        cand_chars = sum(len(_msg_content(msg) or "") for msg in prefix) + sum(
+            len(_msg_content(msg) or "") for msg in candidate_tail
+        )
+        if cand_chars <= max_chars or k == MIN_RETAINED_TOOL_GROUPS:
+            chosen_start = cand_start
+            break
+
+    if chosen_start is None:
+        chosen_start = group_indices[-MIN_RETAINED_TOOL_GROUPS]
+
+    dropped_count = sum(1 for idx in group_indices if idx < chosen_start)
+    if dropped_count == 0:
+        return messages
+
+    notice = {
+        "role": "user",
+        "content": (
+            f"[🤖 시스템 메모리 보호: 컨텍스트 메모리 한도 유지를 위해 이전 {dropped_count}개 "
+            f"도구 실행 세부 기록을 생략하고 최신 {len(group_indices) - dropped_count}개 도구 결과만 유지합니다. "
+            f"이전 작업 기록은 시스템 프롬프트의 절차 요약(Tier 2/3)을 참조하세요.]"
+        ),
+    }
+    bounded = [*prefix, notice, *messages[chosen_start:]]
+    return validate_chat_payload(bounded).messages
+
+
 def build_agent_request_payload(workspace, messages):
     payload = validate_chat_payload(messages).messages
     block = render_playbook_block(workspace)
-    if not block:
-        return payload
-    context = {
-        "role": "assistant",
-        "content": PLAYBOOK_CONTEXT_NOTICE + "\n\n" + block,
-    }
-    insert_at = 1 if payload and _msg_role(payload[0]) == "system" else 0
-    return [*payload[:insert_at], context, *payload[insert_at:]]
+    if block:
+        context = {
+            "role": "assistant",
+            "content": PLAYBOOK_CONTEXT_NOTICE + "\n\n" + block,
+        }
+        insert_at = 1 if payload and _msg_role(payload[0]) == "system" else 0
+        payload = [*payload[:insert_at], context, *payload[insert_at:]]
+    return bound_agent_payload(payload)
 
 
 def is_tool_correlation_error(error) -> bool:
@@ -3847,7 +3899,17 @@ async def on_message(message: discord.Message):
 
     async def maybe_roll_context(step_num: int):
         nonlocal messages_payload, rolling_summary
-        if step_num % ROLLING_COMPACTION_INTERVAL != 0:
+        group_indices = [
+            index
+            for index, message in enumerate(messages_payload)
+            if _msg_role(message) == "assistant" and _msg_tool_calls(message)
+        ]
+        total_chars = sum(len(_msg_content(msg) or "") for msg in messages_payload)
+        is_interval = (step_num % ROLLING_COMPACTION_INTERVAL == 0)
+        is_over_budget = (total_chars >= MAX_CONTEXT_CHARS_BEFORE_ROLLOVER) and (len(group_indices) > KEEP_RECENT_TOOL_GROUPS)
+        is_group_overflow = len(group_indices) >= (KEEP_RECENT_TOOL_GROUPS + 3)
+
+        if not (is_interval or is_over_budget or is_group_overflow):
             return
         messages_payload, rolling_summary = await rollover_agent_context(
             workspace,

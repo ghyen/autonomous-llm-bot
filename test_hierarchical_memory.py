@@ -103,7 +103,7 @@ class TieredMemoryFormatTest(unittest.TestCase):
                 for call in calls
             )
 
-        old, recent = bot.split_recent_agent_context(messages)
+        old, recent = bot.split_recent_agent_context(messages, keep_recent_tool_groups=10)
 
         recent_groups = [
             item for item in recent
@@ -207,7 +207,7 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("H_AUTH=active@v1", system)
         self.assertTrue(system.rstrip().endswith(ledger.render().rstrip()))
         recent_tools = [item for item in rolled if bot._msg_role(item) == "tool"]
-        self.assertEqual(len(recent_tools), 10)
+        self.assertEqual(len(recent_tools), bot.KEEP_RECENT_TOOL_GROUPS)
         self.assertEqual(bot._msg_content(recent_tools[-1]), "[stdout]\nStep 14 output\n[exit code: 0]")
 
     async def test_artifact_pointer_survives_tier1_to_tier2_discovery(self):
