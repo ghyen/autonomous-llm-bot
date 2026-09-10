@@ -470,6 +470,9 @@ channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
 channel_run_owner = {}
+# !resume --full 지정 시에만 옛 동작(요약 전체 복원)을 쓴다. 재개 메시지가
+# on_message에 닿을 때 1회성으로 소비한다.
+channel_resume_full = defaultdict(bool)
 
 
 def caller_can_manage_messages(channel, user) -> bool:
@@ -2887,6 +2890,33 @@ def compact_resume_summary(
     )
 
 
+# 재개는 ledger·목표·회피목록·contract를 계승하고, 절차 상세(Tier 3)는
+# 버린다. 오염된 루프 기록을 매 스텝 다시 읽게 하지 않기 위해서다. 원본은
+# traj.jsonl·state.json에 그대로 남아 lookup_trajectory로 꺼낼 수 있다.
+RESUME_COMPACT_TIER2_LINES = 6
+RESUME_COMPACT_DISCOVERIES = 4
+RESUME_COMPACT_LEGACY_CHARS = 2000
+
+
+def _parse_resume_args(parts):
+    """!resume <run-id> [--full]. 기본은 압축 재개다."""
+    args = list(parts or [])
+    full = "--full" in args[2:]
+    run_id = args[1] if len(args) > 1 else ""
+    return run_id, full
+
+
+def _compact_summary_for_resume(summary):
+    source = str(summary or "")
+    if not source.strip():
+        return ""
+    if not source.startswith(_TIERED_SUMMARY_VERSION_LINE):
+        return _clip_summary_text(source, RESUME_COMPACT_LEGACY_CHARS)
+    return compact_resume_summary(
+        source, RESUME_COMPACT_TIER2_LINES, 0, RESUME_COMPACT_DISCOVERIES
+    )
+
+
 def _deterministic_tier3_fallback(source: str, start_step: int, end_step: int) -> str:
     groups = {}
     for line in str(source or "").splitlines():
@@ -4160,17 +4190,19 @@ async def on_message(message: discord.Message):
         if not control:
             await message.reply(f"⛔ {control.reason}")
             return
-        if len(parts) != 2:
-            await message.reply("사용법: `!resume <run-id>`")
+        resume_run_id, resume_full = _parse_resume_args(parts)
+        if not resume_run_id or resume_run_id.startswith("--"):
+            await message.reply("사용법: `!resume <run-id> [--full]`")
             return
         try:
-            workspace = resume_run(caller_id, message.channel.id, parts[1])
+            workspace = resume_run(caller_id, message.channel.id, resume_run_id)
         except RunNotFoundError:
             await message.reply("run not found")
             return
         except RunActiveError:
             await message.reply("run is active")
             return
+        channel_resume_full[message.channel.id] = resume_full
         await message.reply(f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다.")
         return
 
@@ -4501,6 +4533,14 @@ async def on_message(message: discord.Message):
     if restored is not None:
         # 재개는 조용히 일어나지 않는다. 이 레코드가 없으면 Step 기록만으로는
         # 재시작 때문인지 새 요청 때문인지 구분할 수 없다.
+        resume_full = channel_resume_full.pop(message.channel.id, False)
+        resumed_summary = restored["summary"]
+        summary_compacted = False
+        if not same_origin and not resume_full:
+            compacted = _compact_summary_for_resume(resumed_summary)
+            if compacted != resumed_summary:
+                resumed_summary = compacted
+                summary_compacted = True
         log_session_event(
             workspace,
             "run_resumed",
@@ -4509,16 +4549,19 @@ async def on_message(message: discord.Message):
             same_origin=same_origin,
             tail_msgs=len(restored["tail"]),
             calls=len(announced_call_ids),
-            summary_chars=len(restored["summary"]),
+            summary_chars=len(resumed_summary),
+            summary_compacted=summary_compacted,
+            resume_full=resume_full,
             automatic=automatic_resume,
         )
         # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
-        channel_summary[message.channel.id] = restored["summary"]
+        channel_summary[message.channel.id] = resumed_summary
         channel_ledger[message.channel.id] = restored["ledger"]
         try:
             await message.channel.send(
                 f"▶️ **[중단된 실행 재개]** run `{workspace.run_id}`을 Step {resume_from}에서 "
                 f"이어갑니다. 이미 알린 도구 호출 {len(announced_call_ids)}건은 다시 받지 않습니다."
+                + (" 요약은 압축해서 이어갑니다." if summary_compacted else "")
             )
         except Exception:
             pass
