@@ -1024,8 +1024,8 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             "consecutive_failure_limit",
         )
 
-    # Mutation caught: ignoring a producer-owned read_file error envelope lets
-    # the unchanged third missing-file read reach the dispatcher.
+    # Deterministic not_found is remembered after the first failure, so the
+    # second and third identical missing-file reads never reach the dispatcher.
     async def test_missing_read_file_error_blocks_third_attempt_end_to_end(self):
         arguments = {"path": "missing-for-duplicate-policy.txt"}
         await self.run_agent([
@@ -1044,22 +1044,28 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [[call[0] for call in batch] for batch in self.dispatched_batches],
-            [["missing-read-1"], ["missing-read-2"]],
+            [["missing-read-1"]],
         )
-        for payload_index in (1, 2):
-            result = json.loads(
+        result = json.loads(
+            self._tool_messages(
+                self.model.agent_payloads[1]
+            )[-1]["content"]
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], "not_found")
+        for payload_index in (2, 3):
+            blocked_attempt = json.loads(
                 self._tool_messages(
                     self.model.agent_payloads[payload_index]
                 )[-1]["content"]
             )
-            self.assertEqual(result["status"], "error")
-            self.assertEqual(result["error"], "not_found")
+            self.assertTrue(blocked_attempt.get("blocked"))
+            self.assertEqual(blocked_attempt["reason"], "known_failure")
         blocked = json.loads(
             self._tool_messages(self.model.agent_payloads[3])[-1]["content"]
         )
-        self.assertEqual(blocked["reason"], "consecutive_failure_limit")
+        self.assertEqual(blocked["reason"], "known_failure")
         self.assertEqual(blocked["tool"], "read_file")
-        self.assertEqual(blocked["count"], 2)
 
     # Mutation caught: treating a producer-owned write_file conflict envelope as
     # success lets an unchanged third stale canonical write reach the dispatcher.
