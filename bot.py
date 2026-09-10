@@ -714,6 +714,9 @@ MAX_AGENT_PAYLOAD_CHARS = int(os.environ.get("MAX_AGENT_PAYLOAD_CHARS", "36000")
 AGENT_MAX_CONTEXT_TOKENS = CONFIG.agent_max_context_tokens
 AGENT_CONTEXT_TRANSIENT_RESERVE = 1024
 AGENT_CONTEXT_COUNT_HEADROOM = 256
+# ponytail: keep only a 512-token emergency response floor; raise it if the
+# model starts truncating valid tool-call payloads at this boundary.
+MIN_AGENT_OUTPUT_TOKENS = 512
 MIN_RETAINED_TOOL_GROUPS = 1
 # 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
 # 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
@@ -1970,6 +1973,7 @@ async def prepare_agent_request_payload(
     )
     live_messages = validate_chat_payload(messages).messages
     summary = existing_summary
+    output_max_tokens = step_max_tokens
     rollover_used = False
     trim_passes = 0
     summary_compactions = 0
@@ -2040,6 +2044,25 @@ async def prepare_agent_request_payload(
         payload = build_agent_request_payload(workspace, live_messages)
         input_tokens = await count(payload)
 
+        if input_tokens is not None and input_tokens > input_budget and resume_context:
+            compacted_summary = compact_resume_summary(
+                summary, tier2_limit=0, tier3_chars=400, discovery_limit=0
+            )
+            if compacted_summary != summary:
+                compacted_messages = list(live_messages)
+                if compacted_messages and _msg_role(compacted_messages[0]) == "system":
+                    compacted_messages[0] = {
+                        "role": "system",
+                        "content": build_system_content(
+                            workspace, ledger, compacted_summary
+                        ),
+                    }
+                    live_messages = validate_chat_payload(compacted_messages).messages
+                    summary = compacted_summary
+                    summary_compactions += 1
+                    payload = build_agent_request_payload(workspace, live_messages)
+                    input_tokens = await count(payload)
+
     if input_tokens is not None and input_tokens > input_budget:
         live_messages = bound_agent_payload(live_messages, max_chars=0)
         trim_passes += 1
@@ -2055,6 +2078,22 @@ async def prepare_agent_request_payload(
         input_tokens = await count(payload)
 
     if input_tokens > input_budget:
+        available_output_tokens = (
+            AGENT_MAX_CONTEXT_TOKENS
+            - AGENT_CONTEXT_TRANSIENT_RESERVE
+            - AGENT_CONTEXT_COUNT_HEADROOM
+            - input_tokens
+        )
+        if available_output_tokens >= MIN_AGENT_OUTPUT_TOKENS:
+            output_max_tokens = min(step_max_tokens, available_output_tokens)
+            input_budget = (
+                AGENT_MAX_CONTEXT_TOKENS
+                - AGENT_CONTEXT_TRANSIENT_RESERVE
+                - AGENT_CONTEXT_COUNT_HEADROOM
+                - output_max_tokens
+            )
+
+    if input_tokens > input_budget:
         log_session_event(
             workspace,
             "context_budget",
@@ -2064,6 +2103,7 @@ async def prepare_agent_request_payload(
             rollover=rollover_used,
             trim_passes=trim_passes,
             summary_compactions=summary_compactions,
+            output_max_tokens=output_max_tokens,
             count_fallback=count_fallback,
             rejected=True,
         )
@@ -2080,6 +2120,7 @@ async def prepare_agent_request_payload(
         rollover=rollover_used,
         trim_passes=trim_passes,
         summary_compactions=summary_compactions,
+        output_max_tokens=output_max_tokens,
         count_fallback=count_fallback,
         rejected=False,
     )
@@ -2092,6 +2133,7 @@ async def prepare_agent_request_payload(
         rollover_used=rollover_used,
         trim_passes=trim_passes,
         summary_compactions=summary_compactions,
+        output_max_tokens=output_max_tokens,
         count_fallback=count_fallback,
     )
 
@@ -4441,6 +4483,7 @@ async def on_message(message: discord.Message):
                 rolling_summary = prepared.summary
                 channel_summary[message.channel.id] = rolling_summary
                 compacted_payload = prepared.payload
+                step_max_tokens = prepared.output_max_tokens
                 if (
                     prepared.rollover_used
                     or prepared.trim_passes
