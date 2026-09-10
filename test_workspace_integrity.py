@@ -1225,12 +1225,12 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
             for item in metadata
         ))
 
-    async def test_slash_new_resume_delete_are_registered_and_use_same_catalog(self):
+    async def test_slash_new_resume_fork_delete_are_registered_and_use_same_catalog(self):
         # Production mutation caught: text-only handlers leave slash lifecycle
         # commands absent or wired to divergent authorization/storage behavior.
         catalog = self.catalog()
         commands = {command.name for command in bot.bot.tree.get_commands()}
-        self.assertTrue({"new", "resume", "delete"}.issubset(commands))
+        self.assertTrue({"new", "resume", "fork", "delete"}.issubset(commands))
 
         class Response:
             def __init__(self):

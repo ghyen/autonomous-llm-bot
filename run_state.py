@@ -40,6 +40,7 @@ TASK_CONTRACT_VERSION = 1
 ARTIFACT_MANIFEST_VERSION = 1
 ARTIFACT_MANIFEST_MAX_ITEMS = 24
 TASK_GOAL_MAX_CHARS = 4000
+SOURCE_RUN_ID_MAX_CHARS = 64
 
 
 def _has_unsafe_path_chars(value):
@@ -139,6 +140,21 @@ def _normalize_artifact_manifest(value):
     return {"version": ARTIFACT_MANIFEST_VERSION, "items": items}
 
 
+def _normalize_source_run_id(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > SOURCE_RUN_ID_MAX_CHARS or _has_unsafe_path_chars(value):
+        return None
+    return value
+
+
+def _normalize_source_step(value):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        return None
+    return value
+
+
 def save(
     workspace,
     message_id,
@@ -153,6 +169,8 @@ def save(
     state=RUNNING,
     task_contract=None,
     artifact_manifest=None,
+    source_run_id=None,
+    source_step=None,
 ):
     """Replace the run's record atomically.
 
@@ -187,6 +205,8 @@ def save(
         "trajectory_gap_step": trajectory_gap_step,
         "task_contract": _normalize_task_contract(task_contract),
         "artifact_manifest": _normalize_artifact_manifest(artifact_manifest),
+        "source_run_id": _normalize_source_run_id(source_run_id),
+        "source_step": _normalize_source_step(source_step),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -261,6 +281,8 @@ def load(workspace):
     payload["artifact_manifest"] = _normalize_artifact_manifest(
         payload.get("artifact_manifest")
     )
+    payload["source_run_id"] = _normalize_source_run_id(payload.get("source_run_id"))
+    payload["source_step"] = _normalize_source_step(payload.get("source_step"))
     return payload
 
 
