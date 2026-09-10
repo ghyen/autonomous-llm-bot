@@ -706,11 +706,13 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
 
 
 ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
-KEEP_RECENT_TOOL_GROUPS = int(os.environ.get("KEEP_RECENT_TOOL_GROUPS", "5"))
+KEEP_RECENT_TOOL_GROUPS = int(os.environ.get("KEEP_RECENT_TOOL_GROUPS", "2"))
 ROLLING_SUMMARY_MAX_CHARS = 10000
 MAX_CONTEXT_CHARS_BEFORE_ROLLOVER = int(os.environ.get("MAX_CONTEXT_CHARS_BEFORE_ROLLOVER", "28000"))
 MAX_AGENT_PAYLOAD_CHARS = int(os.environ.get("MAX_AGENT_PAYLOAD_CHARS", "36000"))
-MIN_RETAINED_TOOL_GROUPS = 2
+AGENT_MAX_CONTEXT_TOKENS = int(os.environ.get("AGENT_MAX_CONTEXT_TOKENS", "10240"))
+AGENT_CONTEXT_TRANSIENT_RESERVE = 1024
+MIN_RETAINED_TOOL_GROUPS = 1
 # 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
 # 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = workspace_io.DEFAULT_TOOL_OUTPUT_MAX_CHARS
@@ -1784,6 +1786,98 @@ def build_agent_request_payload(workspace, messages):
         insert_at = 1 if payload and _msg_role(payload[0]) == "system" else 0
         payload = [*payload[:insert_at], context, *payload[insert_at:]]
     return bound_agent_payload(payload)
+
+
+def build_token_count_payload(messages: list, tool_params: dict) -> dict:
+    """Convert the OpenAI payload to oMLX's Anthropic token-count shape."""
+    system_parts = []
+    converted = []
+    for message in messages:
+        role = _msg_role(message)
+        if role == "system":
+            content = _msg_content(message)
+            if content:
+                system_parts.append(str(content))
+            continue
+        if role == "tool":
+            converted.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": _tool_result_id(message) or "unknown-tool-call",
+                    "content": str(_msg_content(message)),
+                }],
+            })
+            continue
+        if role not in ("user", "assistant"):
+            continue
+
+        calls = _msg_tool_calls(message)
+        if role == "assistant" and calls:
+            blocks = []
+            content = _msg_content(message)
+            if content:
+                blocks.append({"type": "text", "text": str(content)})
+            for call in calls:
+                call_id, name, raw_arguments = _call_parts(call)
+                arguments = raw_arguments
+                if isinstance(arguments, str):
+                    arguments = _robust_json_loads(arguments)
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": call_id or "unknown-tool-call",
+                    "name": name or "tool",
+                    "input": arguments,
+                })
+            converted.append({"role": "assistant", "content": blocks})
+            continue
+
+        content = _msg_content(message)
+        if not isinstance(content, (str, list, dict)):
+            content = str(content)
+        converted.append({"role": role, "content": content})
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": converted,
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+
+    tools = []
+    for tool in (tool_params or {}).get("tools", []):
+        function = tool.get("function") or {}
+        tools.append({
+            "name": function.get("name", "tool"),
+            "description": function.get("description", ""),
+            "input_schema": function.get("parameters") or {"type": "object"},
+        })
+    if tools:
+        payload["tools"] = tools
+    return payload
+
+
+async def count_agent_input_tokens(messages: list, tool_params: dict):
+    """Return the serving model's input-token count, or None if unavailable."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=5.0)
+        ) as counter:
+            response = await counter.post(
+                LLM_BASE_URL.rstrip("/") + "/messages/count_tokens",
+                headers={"Authorization": f"Bearer {CONFIG.llm_api_key}"},
+                json=build_token_count_payload(messages, tool_params),
+            )
+            response.raise_for_status()
+            value = response.json().get("input_tokens")
+            if isinstance(value, bool):
+                return None
+            value = int(value)
+            return value if value >= 0 else None
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def is_tool_correlation_error(error) -> bool:
