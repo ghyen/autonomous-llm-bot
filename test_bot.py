@@ -11,6 +11,58 @@ import bot
 
 
 class RoutingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_completion_uses_prepared_output_budget(self):
+        channel_id = 987654320
+        message = FakeMessage("현재 시스템 상태를 조사해줘", channel_id)
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content="",
+            reasoning_content="",
+            reasoning="",
+            tool_calls=[SimpleNamespace(
+                id="finish-1",
+                function=SimpleNamespace(
+                    name="finish_task",
+                    arguments=json.dumps({"report": "완료"}),
+                ),
+            )],
+        ))])
+
+        async def prepared(_workspace, messages, summary, *_args, **_kwargs):
+            return SimpleNamespace(
+                messages=messages,
+                payload=messages,
+                summary=summary,
+                input_tokens=100,
+                input_budget=1000,
+                rollover_used=False,
+                trim_passes=0,
+                summary_compactions=0,
+                count_fallback=False,
+                output_max_tokens=1234,
+                fallback_mode="adaptive_output",
+            )
+
+        bot.FREE_RESPONSE_CHANNEL_IDS.add(channel_id)
+        try:
+            with tempfile.TemporaryDirectory() as log_dir, \
+                    run_catalog_patch(bot, log_dir), \
+                    patch.object(bot, "MAX_AGENT_LOOPS", 1), \
+                    patch.object(bot, "prepare_agent_request_payload", prepared), \
+                    patch.object(bot, "create_streaming_completion", AsyncMock(return_value=response)) as completion:
+                await bot.on_message(message)
+        finally:
+            bot.FREE_RESPONSE_CHANNEL_IDS.discard(channel_id)
+            for state in (
+                bot.channel_history,
+                bot.channel_summary,
+                bot.channel_reasoning,
+                bot.channel_cancel_token,
+                bot.channel_active_runs,
+            ):
+                state.pop(channel_id, None)
+
+        self.assertEqual(completion.await_args.kwargs["max_tokens"], 1234)
+
     async def test_tool_free_answer_finishes_after_one_model_call(self):
         channel_id = 987654321
         message = FakeMessage("인증된 상태라는 게 뭐야?", channel_id)

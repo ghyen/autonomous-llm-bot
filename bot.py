@@ -2035,6 +2035,46 @@ def _clip_tool_result_messages(messages: list, max_chars: int) -> list:
     return validate_chat_payload(clipped).messages
 
 
+def _emergency_agent_context(workspace, messages, summary, ledger=None):
+    """Rebase a request onto state plus the latest complete tool group."""
+    group_indices = [
+        index
+        for index, message in enumerate(messages)
+        if _msg_role(message) == "assistant" and _msg_tool_calls(message)
+    ]
+    if group_indices:
+        start = group_indices[-1]
+        end = start + 1
+        while end < len(messages) and _msg_role(messages[end]) == "tool":
+            end += 1
+        tail = [
+            *messages[start:end],
+            *messages[end:][-SNAPSHOT_TAIL_MESSAGES:],
+        ]
+    else:
+        tail = [
+            message for message in messages
+            if _msg_role(message) != "system"
+        ][-1:]
+    tail = [_snapshot_message(message) for message in tail]
+    tail = _clip_tool_result_messages(tail, 160)
+    rebased = [
+        {
+            "role": "system",
+            "content": build_system_content(workspace, ledger, summary),
+        },
+        {
+            "role": "user",
+            "content": (
+                "[긴급 컨텍스트 재기반화] 권위 있는 조사 상태와 누적 요약을 기준으로 "
+                "최신 도구 결과를 반영하고 다음 조사 단계를 계속하세요."
+            ),
+        },
+        *tail,
+    ]
+    return validate_chat_payload(rebased).messages
+
+
 async def prepare_agent_request_payload(
     workspace,
     messages: list,
@@ -2050,13 +2090,16 @@ async def prepare_agent_request_payload(
     artifact_manifest=None,
 ):
     """Prepare a bounded agent request using the serving tokenizer when available."""
-    input_budget = max(
-        1024,
-        AGENT_MAX_CONTEXT_TOKENS
-        - step_max_tokens
-        - AGENT_CONTEXT_TRANSIENT_RESERVE
-        - AGENT_CONTEXT_COUNT_HEADROOM,
-    )
+    def budget_for(output_tokens):
+        return max(
+            1024,
+            AGENT_MAX_CONTEXT_TOKENS
+            - output_tokens
+            - AGENT_CONTEXT_TRANSIENT_RESERVE
+            - AGENT_CONTEXT_COUNT_HEADROOM,
+        )
+
+    input_budget = budget_for(step_max_tokens)
     live_messages = validate_chat_payload(messages).messages
     summary = existing_summary
     output_max_tokens = step_max_tokens
@@ -2065,6 +2108,7 @@ async def prepare_agent_request_payload(
     summary_compactions = 0
     count_fallback = False
     counter_unavailable = False
+    fallback_mode = None
 
     if live_messages and _msg_role(live_messages[0]) == "system":
         live_messages[0] = {
@@ -2195,12 +2239,28 @@ async def prepare_agent_request_payload(
         )
         if available_output_tokens >= MIN_AGENT_OUTPUT_TOKENS:
             output_max_tokens = min(step_max_tokens, available_output_tokens)
-            input_budget = (
+            input_budget = budget_for(output_max_tokens)
+            fallback_mode = "adaptive_output"
+        else:
+            fallback_mode = "emergency_rebase"
+            live_messages = _emergency_agent_context(
+                workspace,
+                live_messages,
+                summary,
+                ledger=ledger,
+            )
+            trim_passes += 1
+            payload = build_agent_request_payload(workspace, live_messages)
+            input_tokens = await count(payload)
+            available_output_tokens = (
                 AGENT_MAX_CONTEXT_TOKENS
                 - AGENT_CONTEXT_TRANSIENT_RESERVE
                 - AGENT_CONTEXT_COUNT_HEADROOM
-                - output_max_tokens
+                - input_tokens
             )
+            if available_output_tokens >= MIN_AGENT_OUTPUT_TOKENS:
+                output_max_tokens = min(step_max_tokens, available_output_tokens)
+                input_budget = budget_for(output_max_tokens)
 
     if input_tokens > input_budget:
         log_session_event(
@@ -2212,8 +2272,9 @@ async def prepare_agent_request_payload(
             rollover=rollover_used,
             trim_passes=trim_passes,
             summary_compactions=summary_compactions,
-            output_max_tokens=output_max_tokens,
             count_fallback=count_fallback,
+            output_max_tokens=output_max_tokens,
+            fallback_mode=fallback_mode,
             rejected=True,
         )
         raise AgentContextBudgetExceeded(input_tokens, input_budget)
@@ -2229,8 +2290,9 @@ async def prepare_agent_request_payload(
         rollover=rollover_used,
         trim_passes=trim_passes,
         summary_compactions=summary_compactions,
-        output_max_tokens=output_max_tokens,
         count_fallback=count_fallback,
+        output_max_tokens=output_max_tokens,
+        fallback_mode=fallback_mode,
         rejected=False,
     )
     return SimpleNamespace(
@@ -2242,8 +2304,9 @@ async def prepare_agent_request_payload(
         rollover_used=rollover_used,
         trim_passes=trim_passes,
         summary_compactions=summary_compactions,
-        output_max_tokens=output_max_tokens,
         count_fallback=count_fallback,
+        output_max_tokens=output_max_tokens,
+        fallback_mode=fallback_mode,
     )
 
 
@@ -4740,6 +4803,14 @@ async def on_message(message: discord.Message):
                 channel_summary[message.channel.id] = rolling_summary
                 compacted_payload = prepared.payload
                 step_max_tokens = prepared.output_max_tokens
+                request_extra_params = dict(extra_params)
+                if "extra_body" in request_extra_params:
+                    extra_body = dict(request_extra_params["extra_body"])
+                    extra_body["reasoning_max_tokens"] = min(
+                        extra_body["reasoning_max_tokens"],
+                        prepared.output_max_tokens,
+                    )
+                    request_extra_params["extra_body"] = extra_body
                 if (
                     prepared.rollover_used
                     or prepared.trim_passes
@@ -4753,10 +4824,10 @@ async def on_message(message: discord.Message):
                     deadline=model_stage_deadline,
                     model=MODEL_NAME,
                     messages=compacted_payload,
-                    max_tokens=step_max_tokens,
+                    max_tokens=prepared.output_max_tokens,
                     temperature=0.7,
                     **step_tool_params,
-                    **extra_params
+                    **request_extra_params
                 )
             except (RunCancelled, StageTimeout) as stage_error:
                 settle_stage_failure(stage_error)
@@ -4802,9 +4873,9 @@ async def on_message(message: discord.Message):
                         deadline=model_stage_deadline,
                         model=MODEL_NAME,
                         messages=retry_payload,
-                        max_tokens=step_max_tokens,
+                        max_tokens=prepared.output_max_tokens,
                         temperature=0.7,
-                        **extra_params
+                        **request_extra_params
                     )
                 except (RunCancelled, StageTimeout) as stage_error:
                     settle_stage_failure(stage_error)

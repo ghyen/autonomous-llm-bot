@@ -405,6 +405,67 @@ class ContextPreflightTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.output_max_tokens, 1412)
         self.assertEqual(result.input_budget, 7548)
 
+    async def test_over_budget_adapts_output_limit_before_rejecting(self):
+        messages = _messages(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000, 9000, 9000, 9000, 9000, 5200]),
+            ), patch.object(
+                bot,
+                "rollover_agent_context",
+                AsyncMock(return_value=(messages, "summary")),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    "",
+                    12,
+                    4096,
+                    {"tools": TOOLS},
+                )
+
+        self.assertEqual(result.input_tokens, 5200)
+        self.assertEqual(result.input_budget, 5200)
+        self.assertEqual(result.output_max_tokens, 3760)
+        self.assertEqual(result.fallback_mode, "adaptive_output")
+        self.assertTrue(bot.validate_chat_payload(result.messages).ok)
+
+    async def test_over_budget_rebases_to_latest_complete_group(self):
+        messages = _messages(3)
+        messages.append({"role": "user", "content": "keep this steering"})
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000, 9000, 9000, 9000, 9000, 9000, 5000]),
+            ), patch.object(
+                bot,
+                "rollover_agent_context",
+                AsyncMock(return_value=(messages, "summary")),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    "",
+                    12,
+                    4096,
+                    {"tools": TOOLS},
+                )
+
+        self.assertEqual(result.input_tokens, 5000)
+        self.assertEqual(result.input_budget, 5000)
+        self.assertEqual(result.output_max_tokens, 3960)
+        self.assertEqual(result.fallback_mode, "emergency_rebase")
+        self.assertTrue(bot.validate_chat_payload(result.messages).ok)
+        self.assertIn("call-3", json.dumps(result.messages, ensure_ascii=False))
+        self.assertNotIn("call-1", json.dumps(result.messages, ensure_ascii=False))
+        self.assertNotIn("call-2", json.dumps(result.messages, ensure_ascii=False))
+        self.assertIn("keep this steering", json.dumps(result.messages, ensure_ascii=False))
+
     async def test_unavailable_counter_uses_conservative_fallback(self):
         messages = _messages(1)
         with tempfile.TemporaryDirectory() as tmp:
