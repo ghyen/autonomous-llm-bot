@@ -19,6 +19,7 @@ import time
 import asyncio
 import contextvars
 import tempfile
+import unicodedata
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -1957,6 +1958,7 @@ async def prepare_agent_request_payload(
     ledger=None,
     token=None,
     trajectory_gap_step=None,
+    resume_context=False,
 ):
     """Prepare a bounded agent request using the serving tokenizer when available."""
     input_budget = max(
@@ -1970,6 +1972,7 @@ async def prepare_agent_request_payload(
     summary = existing_summary
     rollover_used = False
     trim_passes = 0
+    summary_compactions = 0
     count_fallback = False
     counter_unavailable = False
 
@@ -1991,6 +1994,37 @@ async def prepare_agent_request_payload(
 
     payload = build_agent_request_payload(workspace, live_messages)
     input_tokens = await count(payload)
+
+    if input_tokens is not None and input_tokens > input_budget and resume_context:
+        for tier2_limit, tier3_chars, discovery_limit in (
+            (6, 1200, 4),
+            (3, 800, 2),
+            (0, 400, 0),
+        ):
+            compacted_summary = compact_resume_summary(
+                existing_summary,
+                tier2_limit,
+                tier3_chars,
+                discovery_limit,
+            )
+            if compacted_summary == summary:
+                continue
+            if not live_messages or _msg_role(live_messages[0]) != "system":
+                break
+            compacted_messages = list(live_messages)
+            compacted_messages[0] = {
+                "role": "system",
+                "content": build_system_content(
+                    workspace, ledger, compacted_summary
+                ),
+            }
+            live_messages = validate_chat_payload(compacted_messages).messages
+            summary = compacted_summary
+            summary_compactions += 1
+            payload = build_agent_request_payload(workspace, live_messages)
+            input_tokens = await count(payload)
+            if input_tokens <= input_budget:
+                break
 
     if input_tokens is not None and input_tokens > input_budget:
         live_messages, summary = await rollover_agent_context(
@@ -2029,6 +2063,7 @@ async def prepare_agent_request_payload(
             input_budget=input_budget,
             rollover=rollover_used,
             trim_passes=trim_passes,
+            summary_compactions=summary_compactions,
             count_fallback=count_fallback,
             rejected=True,
         )
@@ -2044,6 +2079,7 @@ async def prepare_agent_request_payload(
         input_budget=input_budget,
         rollover=rollover_used,
         trim_passes=trim_passes,
+        summary_compactions=summary_compactions,
         count_fallback=count_fallback,
         rejected=False,
     )
@@ -2055,6 +2091,7 @@ async def prepare_agent_request_payload(
         input_budget=input_budget,
         rollover_used=rollover_used,
         trim_passes=trim_passes,
+        summary_compactions=summary_compactions,
         count_fallback=count_fallback,
     )
 
@@ -2479,6 +2516,37 @@ def parse_tiered_summary(text: str) -> dict:
         "tier2": sections["tier2"],
         "discoveries": sections["discoveries"],
     }
+
+
+def compact_resume_summary(
+    summary: str, tier2_limit: int, tier3_chars: int, discovery_limit: int
+) -> str:
+    source = str(summary or "").strip()
+    parsed = parse_tiered_summary(source)
+    is_canonical_empty = source == format_tiered_summary()
+    is_tiered = (
+        source.startswith(_TIERED_SUMMARY_VERSION_LINE)
+        and (any(parsed.values()) or is_canonical_empty)
+    )
+    if not is_tiered:
+        return _clip_summary_text(source, max(0, int(tier3_chars)))
+
+    tier2_limit = max(0, int(tier2_limit))
+    tier3_chars = max(0, int(tier3_chars))
+    discovery_limit = max(0, int(discovery_limit))
+    tier2 = parsed["tier2"][-tier2_limit:] if tier2_limit else []
+    discoveries = (
+        parsed["discoveries"][-discovery_limit:] if discovery_limit else []
+    )
+    tier3 = parsed["tier3"]
+    if len(tier3) > tier3_chars:
+        tier3 = tier3[-tier3_chars:] if tier3_chars else ""
+    return format_tiered_summary(
+        tier3=tier3,
+        tier3_through=parsed["tier3_through"],
+        tier2_lines=tier2,
+        discoveries=discoveries,
+    )
 
 
 def _deterministic_tier3_fallback(source: str, start_step: int, end_step: int) -> str:
@@ -3372,6 +3440,33 @@ def prepare_new_run(owner_id, channel_id):
     return workspace
 
 
+_AUTO_RESUME_KOREAN_MARKERS = (
+    "이전",
+    "계속",
+    "이어",
+    "재개",
+    "나머지",
+)
+_AUTO_RESUME_ENGLISH_MARKER = re.compile(r"\b(?:resume|continue)\b")
+
+
+def wants_auto_resume(content: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(content or "")).casefold().strip()
+    if not normalized or normalized.startswith(("!", "/")):
+        return False
+    return (
+        any(marker in normalized for marker in _AUTO_RESUME_KOREAN_MARKERS)
+        or _AUTO_RESUME_ENGLISH_MARKER.search(normalized) is not None
+    )
+
+
+def find_auto_resume_run(owner_id, channel_id):
+    for workspace in RUN_CATALOG.resumable_workspaces(owner_id, channel_id):
+        if run_state.load(workspace) is not None:
+            return workspace
+    return None
+
+
 def resume_run(owner_id, channel_id, run_id):
     workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
     if run_state.load(workspace) is None:
@@ -3758,8 +3853,21 @@ async def on_message(message: discord.Message):
 
     start_time = time.time()
     token = CancelToken()
+    auto_resume_candidate = (
+        find_auto_resume_run(caller_id, message.channel.id)
+        if wants_auto_resume(content)
+        else None
+    )
     try:
-        workspace = RUN_CATALOG.acquire(caller_id, message.channel.id)
+        workspace = RUN_CATALOG.acquire(
+            caller_id,
+            message.channel.id,
+            resume_run_id=(
+                auto_resume_candidate.run_id
+                if auto_resume_candidate is not None
+                else None
+            ),
+        )
     except RunActiveError:
         await message.reply(
             "A reset/clear operation is in progress; retry this goal."
@@ -3772,6 +3880,11 @@ async def on_message(message: discord.Message):
     same_origin = (
         restored is not None
         and restored.get("message_id") == getattr(message, "id", None)
+    )
+    automatic_resume = (
+        auto_resume_candidate is not None
+        and workspace.run_id == auto_resume_candidate.run_id
+        and restored is not None
     )
     # 승인과 메일박스를 한 턴에 함께 소유한다. 이 지점부터 첫 await까지 사이가
     # 없으므로 같은 채널의 다음 메시지는 언제나 steering으로 판정된다. 실패 시
@@ -3917,6 +4030,7 @@ async def on_message(message: discord.Message):
             tail_msgs=len(restored["tail"]),
             calls=len(announced_call_ids),
             summary_chars=len(restored["summary"]),
+            automatic=automatic_resume,
         )
         # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
         channel_summary[message.channel.id] = restored["summary"]
@@ -4321,12 +4435,17 @@ async def on_message(message: discord.Message):
                     ledger=ledger,
                     token=token,
                     trajectory_gap_step=trajectory_gap_step,
+                    resume_context=restored is not None,
                 )
                 messages_payload = prepared.messages
                 rolling_summary = prepared.summary
                 channel_summary[message.channel.id] = rolling_summary
                 compacted_payload = prepared.payload
-                if prepared.rollover_used or prepared.trim_passes:
+                if (
+                    prepared.rollover_used
+                    or prepared.trim_passes
+                    or prepared.summary_compactions
+                ):
                     save_snapshot(iteration + 1, "context_budget")
 
                 resp = await run_completion_stage(
