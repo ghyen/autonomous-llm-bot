@@ -19,6 +19,7 @@ import time
 import asyncio
 import contextvars
 import tempfile
+import unicodedata
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -3372,6 +3373,31 @@ def prepare_new_run(owner_id, channel_id):
     return workspace
 
 
+_AUTO_RESUME_MARKERS = (
+    "이전",
+    "계속",
+    "이어",
+    "재개",
+    "나머지",
+    "resume",
+    "continue",
+)
+
+
+def wants_auto_resume(content: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(content or "")).casefold().strip()
+    if not normalized or normalized.startswith(("!", "/")):
+        return False
+    return any(marker in normalized for marker in _AUTO_RESUME_MARKERS)
+
+
+def find_auto_resume_run(owner_id, channel_id):
+    for workspace in RUN_CATALOG.resumable_workspaces(owner_id, channel_id):
+        if run_state.load(workspace) is not None:
+            return workspace
+    return None
+
+
 def resume_run(owner_id, channel_id, run_id):
     workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
     if run_state.load(workspace) is None:
@@ -3758,8 +3784,21 @@ async def on_message(message: discord.Message):
 
     start_time = time.time()
     token = CancelToken()
+    auto_resume_candidate = (
+        find_auto_resume_run(caller_id, message.channel.id)
+        if wants_auto_resume(content)
+        else None
+    )
     try:
-        workspace = RUN_CATALOG.acquire(caller_id, message.channel.id)
+        workspace = RUN_CATALOG.acquire(
+            caller_id,
+            message.channel.id,
+            resume_run_id=(
+                auto_resume_candidate.run_id
+                if auto_resume_candidate is not None
+                else None
+            ),
+        )
     except RunActiveError:
         await message.reply(
             "A reset/clear operation is in progress; retry this goal."
@@ -3772,6 +3811,11 @@ async def on_message(message: discord.Message):
     same_origin = (
         restored is not None
         and restored.get("message_id") == getattr(message, "id", None)
+    )
+    automatic_resume = (
+        auto_resume_candidate is not None
+        and workspace.run_id == auto_resume_candidate.run_id
+        and restored is not None
     )
     # 승인과 메일박스를 한 턴에 함께 소유한다. 이 지점부터 첫 await까지 사이가
     # 없으므로 같은 채널의 다음 메시지는 언제나 steering으로 판정된다. 실패 시
@@ -3917,6 +3961,7 @@ async def on_message(message: discord.Message):
             tail_msgs=len(restored["tail"]),
             calls=len(announced_call_ids),
             summary_chars=len(restored["summary"]),
+            automatic=automatic_resume,
         )
         # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
         channel_summary[message.channel.id] = restored["summary"]

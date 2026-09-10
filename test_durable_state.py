@@ -266,6 +266,69 @@ class RunCatalogResumeSelectionTest(DurableStateTestCase):
         self.assertEqual(selected.status, "active")
 
 
+class NaturalLanguageResumeTest(DurableStateTestCase):
+    def test_continue_intent_is_not_a_new_goal(self):
+        self.assertTrue(bot.wants_auto_resume("이전 데이터 참고해서 계속해줘"))
+        self.assertTrue(bot.wants_auto_resume("resume the remaining work"))
+        self.assertFalse(bot.wants_auto_resume("새로운 서버 장애를 분석해줘"))
+        self.assertFalse(bot.wants_auto_resume("!resume deadbeef"))
+
+    async def test_natural_language_continue_reuses_failed_run(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(
+            failed, next_step=7, summary="이전 실행 요약", state="failed"
+        )
+        catalog.finish(failed, "failed")
+        self.restart()
+
+        await self.drive(
+            catalog,
+            [_response(content="재개 결과")],
+            request="이전 데이터 참고해서 계속해줘",
+            max_loops=7,
+        )
+
+        self.assertEqual(self.only_run(catalog).run_id, failed.run_id)
+        resumed = [
+            item for item in self.records(failed)
+            if item["kind"] == "run_resumed"
+        ]
+        self.assertEqual(resumed[0]["next_step"], 7)
+        self.assertTrue(resumed[0]["automatic"])
+
+    async def test_new_goal_does_not_auto_resume_incomplete_run(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(failed, state="failed")
+        catalog.finish(failed, "failed")
+
+        await self.drive(
+            catalog,
+            [_response(content="새 조사 결과")],
+            request="새로운 서버 장애를 분석해줘",
+            max_loops=1,
+        )
+
+        runs = catalog.workspaces(CHANNEL_ID)
+        self.assertEqual(len(runs), 2)
+        self.assertNotIn(failed.run_id, [run.run_id for run in runs if run.status == "active"])
+
+    def test_auto_resume_skips_corrupt_newest_candidate(self):
+        catalog = self.catalog()
+        older = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(older, next_step=3, state="failed")
+        catalog.finish(older, "failed")
+
+        corrupt = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        catalog.finish(corrupt, "failed")
+        run_state.snapshot_path(corrupt).write_text("{ truncated", encoding="utf-8")
+
+        with patch.object(bot, "RUN_CATALOG", catalog):
+            candidate = bot.find_auto_resume_run(TEST_USER_ID, CHANNEL_ID)
+        self.assertEqual(candidate.run_id, older.run_id)
+
+
 class SnapshotRoundTripTest(DurableStateTestCase):
     def _saved(self, workspace, **overrides):
         payload = dict(
