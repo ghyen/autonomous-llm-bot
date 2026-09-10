@@ -1960,7 +1960,7 @@ async def prepare_agent_request_payload(
     if count_fallback:
         live_messages = bound_agent_payload(
             live_messages,
-            max_chars=min(MAX_AGENT_PAYLOAD_CHARS, input_budget),
+            max_chars=min(MAX_AGENT_PAYLOAD_CHARS, max(12000, input_budget * 4)),
         )
         payload = build_agent_request_payload(workspace, live_messages)
 

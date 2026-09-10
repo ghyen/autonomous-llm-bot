@@ -105,7 +105,7 @@ Expected: FAIL because the preflight function and token-budget constants do not 
 
 Use `10240 - max_tokens - 1024` as the input budget, with a floor of `1024`. Count the derived payload; when over budget, call `rollover_agent_context` once and recount. If still over, run `bound_agent_payload(..., max_chars=0)` against persistent history (with minimum retention `1`), rebuild, and recount. If one group remains over, clip only tool-result content in caps `1000`, `400`, and `160` characters, recounting after each cap. Preserve system/current-goal messages, run `validate_chat_payload`, and log only counts, budgets, rollover use, trim passes, and fallback status.
 
-When the count endpoint returns `None`, use the existing character bound with a conservative `max_chars=min(MAX_AGENT_PAYLOAD_CHARS, input_budget)` and log the fallback; do not raise any memory limit.
+When the count endpoint returns `None`, use the existing character bound with a conservative `max_chars=min(MAX_AGENT_PAYLOAD_CHARS, max(12000, input_budget * 4))` and log the fallback; do not raise any memory limit.
 
 - [ ] **Step 4: Wire the preflight before every normal agent completion**
 
