@@ -210,6 +210,48 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(recent_tools), bot.KEEP_RECENT_TOOL_GROUPS)
         self.assertEqual(bot._msg_content(recent_tools[-1]), "[stdout]\nStep 14 output\n[exit code: 0]")
 
+    async def test_task_contract_survives_rollover_without_the_original_user_tail(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(
+                root=temp_dir,
+                run_id="run-contract-1",
+            )
+            ledger, payload = self._make_payload(workspace)
+            task_contract = {
+                "version": 1,
+                "origin_message_id": 101,
+                "goal": "원래 장애 조사",
+            }
+            artifact_manifest = {
+                "version": 1,
+                "items": [{
+                    "path": "plan.md",
+                    "kind": "workspace_file",
+                    "step": 7,
+                    "revision": "sha256:" + "a" * 64,
+                }],
+            }
+            with patch.object(
+                bot,
+                "run_completion_stage",
+                AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
+            ):
+                rolled, _summary = await bot.rollover_agent_context(
+                    workspace,
+                    payload,
+                    existing_summary="",
+                    step_num=40,
+                    ledger=ledger,
+                    task_contract=task_contract,
+                    artifact_manifest=artifact_manifest,
+                )
+
+        system = bot._msg_content(rolled[0])
+        self.assertIn("[이 런의 불변 작업 계약]", system)
+        self.assertIn("원래 장애 조사", system)
+        self.assertIn("run-contract-1", system)
+        self.assertIn("plan.md", system)
+
     async def test_artifact_pointer_survives_tier1_to_tier2_discovery(self):
         # Mutation caught: clipping a Tier 2 preview before discovery drops the
         # only path to a full tool artifact once its live result leaves Tier 1.

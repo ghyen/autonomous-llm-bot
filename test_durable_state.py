@@ -274,6 +274,24 @@ class NaturalLanguageResumeTest(DurableStateTestCase):
         self.assertFalse(bot.wants_auto_resume("!resume deadbeef"))
         self.assertFalse(bot.wants_auto_resume("discontinued 기능을 분석해줘"))
 
+    async def test_new_run_snapshot_persists_the_original_goal_contract(self):
+        catalog = self.catalog()
+
+        await self.drive(
+            catalog,
+            [_response(content="조사 결과")],
+            request="원래 장애 조사",
+            max_loops=1,
+        )
+
+        workspace = self.only_run(catalog)
+        state = run_state.load(workspace)
+        self.assertEqual(state["task_contract"]["goal"], "원래 장애 조사")
+        self.assertIn(
+            "원래 장애 조사",
+            self.stub.payloads("agent")[0][0]["content"],
+        )
+
     async def test_natural_language_continue_reuses_failed_run(self):
         catalog = self.catalog()
         failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
@@ -364,6 +382,60 @@ class NaturalLanguageResumeTest(DurableStateTestCase):
             candidate = bot.find_auto_resume_run(TEST_USER_ID, CHANNEL_ID)
         self.assertEqual(candidate.run_id, older.run_id)
 
+
+class TaskContractResolutionTest(unittest.TestCase):
+    def test_new_run_uses_the_first_request_as_the_contract(self):
+        contract = bot.resolve_task_contract(
+            None, ORIGIN_MESSAGE_ID, "원래 장애 조사", False
+        )
+
+        self.assertEqual(contract["version"], 1)
+        self.assertEqual(contract["origin_message_id"], ORIGIN_MESSAGE_ID)
+        self.assertEqual(contract["goal"], "원래 장애 조사")
+
+    def test_resume_keeps_an_existing_contract_instead_of_current_request(self):
+        saved_contract = {
+            "version": 1,
+            "origin_message_id": 11,
+            "goal": "첫 번째 주제",
+        }
+
+        contract = bot.resolve_task_contract(
+            {"task_contract": saved_contract, "tail": []},
+            22,
+            "두 번째 주제 계속",
+            False,
+        )
+
+        self.assertEqual(contract, saved_contract)
+
+    def test_legacy_recovery_uses_a_clear_tail_goal_but_not_resume_text(self):
+        legacy = {
+            "task_contract": None,
+            "message_id": 11,
+            "tail": [{"role": "user", "content": "첫 번째 주제"}],
+        }
+
+        recovered = bot.resolve_task_contract(
+            legacy, 22, "이전 데이터 참고해서 계속해줘", False
+        )
+        self.assertEqual(recovered["goal"], "첫 번째 주제")
+
+        self.assertIsNone(
+            bot.resolve_task_contract(
+                {
+                    "task_contract": None,
+                    "message_id": 11,
+                    "tail": [{
+                        "role": "user",
+                        "content": "이전 데이터 참고해서 계속해줘",
+                    }],
+                },
+                22,
+                "이전 데이터 참고해서 계속해줘",
+                False,
+            )
+        )
 
 class SnapshotRoundTripTest(DurableStateTestCase):
     def _saved(self, workspace, **overrides):
