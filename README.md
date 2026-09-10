@@ -13,7 +13,7 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 - 💾 **Durable Run State**: Each run keeps one atomic record (`runs/<run-id>/state.json`) carrying its run id, originating message id, state, next step cursor, bounded summary and tail, interrupt state, ledger, every announced tool-call id, replay-guard fingerprints, and the earliest trajectory coverage gap. It is written before the first model call, before uncertain dispatches, and after every completed assistant/tool group, never with a partial group in its tail. A restart resumes the same run id at its next step or records exactly one explicit abort.
 - 📁 **Owner-Bound Run Workspaces**: Every accepted top-level request receives an opaque `runs/<run-id>/` directory and opaque per-run log. Runs never derive paths from Discord IDs; exact owners can resume or delete inactive runs, while admins receive no implicit workspace access.
 - 🔄 **Canonical File Revisions**: Root `plan.md`, `findings.md`, and `playbook.md` use exact-byte `sha256:` revisions, compare-and-swap writes, and atomic replacement. `playbook.md` is inherited only by an automatic successor created when no prepared or resumed run is selected for that owner and channel; explicit `!new` and `!reset` prepared runs start blank. `run.json`, `state.json`, and `traj.jsonl` remain run-local reserved state. Per-execution read hashes return bounded references for unchanged content.
-- 🗺️ **Tiered Trajectory Compaction**: Every 10 steps, Tier 1 keeps the latest 10 complete assistant/tool groups verbatim, Tier 2 renders a deterministic one-line index for steps `S-29` through `S-10`, and Tier 3 summarizes only procedural attempts, blockers, and alternatives through `S-30`. Every completed tool group also appends bounded arguments and results to the run-local mode-`0600` `traj.jsonl`; the model can recover an exact old step with `lookup_trajectory`. Goals, facts, conclusions, and hypothesis status remain exclusively in the authoritative ledger, which is always the final section of the system message. Artifact pointers may enter rollover discovery only when they were host-recorded for the current run and still validate as regular files.
+- 🗺️ **Token-aware Tiered Trajectory Compaction**: Before each normal agent request, the bot counts the complete payload (including tools) with the serving tokenizer. It keeps the latest 2 complete assistant/tool groups by default, rolls the older history into Tier 2/3 trajectory summaries when the input budget is exceeded, and trims only complete groups as an emergency guard. Every completed tool group also appends bounded arguments and results to the run-local mode-`0600` `traj.jsonl`; the model can recover an exact old step with `lookup_trajectory`. Goals, facts, conclusions, and hypothesis status remain exclusively in the authoritative ledger, which is always the final section of the system message. Artifact pointers may enter rollover discovery only when they were host-recorded for the current run and still validate as regular files.
 - 🧩 **Run-Local Workspace Skills**: Reusable Python (`.py`), Shell (`.sh`/`.bash`), and Markdown (`.md`) skills are discovered from the current run's `skills/` directory and rendered into its system prompt. They are isolated from other runs and retained only when that exact run is resumed.
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
@@ -71,8 +71,8 @@ User Prompt (Discord) ────────┐
                    every payload and report
                               │
                ┌──────────────▼──────────────┐
-               │  10-Step Rolling Compaction │
-               │  & Interim Report Briefing  │
+               │ Token-aware Request Guard   │
+               │ & Tiered Compaction         │
                └──────────────┬──────────────┘
                               │
                               ▼
@@ -128,6 +128,7 @@ MAX_AGENT_LOOPS=2000
 CHECKPOINT_INTERVAL=50
 MAX_TOOL_EXECUTIONS_PER_RUN=2000
 AGENT_STEP_MAX_TOKENS=4096
+AGENT_MAX_CONTEXT_TOKENS=10240
 REASONING_MAX_TOKENS=1536
 DEFAULT_REASONING_EFFORT=high
 ADAPTIVE_REASONING=true
@@ -153,10 +154,16 @@ LOG_CONTENT_DEBUG_RETENTION_HOURS=24
 The autonomous loop defaults to 2,000 model iterations, checkpoints every 50
 steps, allows at most 2,000 actual tool executions per run, limits each
 agent step to 4,096 output tokens, caps internal reasoning to 1,536
-tokens, and dynamically adapts reasoning effort during tool execution.
+tokens, and dynamically adapts reasoning effort during tool execution. Before
+each normal agent request it targets a conservative 10,240-token total context,
+reserving the configured output budget plus 1,024 transient tokens; older
+complete tool groups are summarized or trimmed when needed. The 32 GiB macOS
+deployment therefore stays within the model's memory headroom without raising
+the kernel iogpu wired limit.
 Override those limits with `MAX_AGENT_LOOPS`, `CHECKPOINT_INTERVAL`,
-`MAX_TOOL_EXECUTIONS_PER_RUN`, `AGENT_STEP_MAX_TOKENS`, `REASONING_MAX_TOKENS`,
-`DEFAULT_REASONING_EFFORT`, and `ADAPTIVE_REASONING`.
+`MAX_TOOL_EXECUTIONS_PER_RUN`, `AGENT_STEP_MAX_TOKENS`,
+`AGENT_MAX_CONTEXT_TOKENS`, `REASONING_MAX_TOKENS`, `DEFAULT_REASONING_EFFORT`,
+and `ADAPTIVE_REASONING`.
 
 Network is deny-by-default. Enable `web_search` only when the operator wants
 the worker to use DuckDuckGo:
