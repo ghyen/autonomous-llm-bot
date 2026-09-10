@@ -145,6 +145,23 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
         """같은 이름으로 다시 만들면 같은 디스크를 재스캔하는 새 프로세스가 된다."""
         return RunCatalog(self.root / name / "workspace", self.root / name / "logs")
 
+    def _save_valid_record(
+        self, workspace, next_step=1, state="running", summary=""
+    ):
+        return run_state.save(
+            workspace,
+            message_id=ORIGIN_MESSAGE_ID,
+            next_step=next_step,
+            summary=summary,
+            tail=[],
+            ledger=ResearchLedger(),
+            interrupt={},
+            announced_call_ids=[],
+            tool_fingerprints=[],
+            trajectory_gap_step=None,
+            state=state,
+        )
+
     async def drive(
         self,
         catalog,
@@ -201,6 +218,52 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
     def recover(self, catalog):
         with redirect_stdout(StringIO()), patch.object(bot, "RUN_CATALOG", catalog):
             return bot.recover_interrupted_runs()
+
+
+class RunCatalogResumeSelectionTest(DurableStateTestCase):
+    def test_resumable_workspaces_filters_scope_and_status(self):
+        catalog = self.catalog()
+        older = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(older, next_step=3, state="failed")
+        catalog.finish(older, "failed")
+        older.updated_at = "2026-09-10T01:00:00+00:00"
+        older.persist()
+
+        newest = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(newest, next_step=8, state="exhausted")
+        catalog.finish(newest, "exhausted")
+        newest.updated_at = "2026-09-10T02:00:00+00:00"
+        newest.persist()
+
+        other_channel = catalog.acquire(TEST_USER_ID, CHANNEL_ID + 1)
+        self._save_valid_record(other_channel, state="stopped")
+        catalog.finish(other_channel, "stopped")
+
+        completed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(completed, state="completed")
+        catalog.finish(completed, "completed")
+
+        self.assertEqual(
+            [
+                item.run_id
+                for item in catalog.resumable_workspaces(TEST_USER_ID, CHANNEL_ID)
+            ],
+            [newest.run_id, older.run_id],
+        )
+
+    def test_acquire_prefers_prepared_over_auto_resume_id(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(failed, next_step=7, state="failed")
+        catalog.finish(failed, "failed")
+        prepared = catalog.prepare(TEST_USER_ID, CHANNEL_ID)
+
+        selected = catalog.acquire(
+            TEST_USER_ID, CHANNEL_ID, resume_run_id=failed.run_id
+        )
+
+        self.assertEqual(selected.run_id, prepared.run_id)
+        self.assertEqual(selected.status, "active")
 
 
 class SnapshotRoundTripTest(DurableStateTestCase):
