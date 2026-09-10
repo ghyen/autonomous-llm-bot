@@ -10,7 +10,7 @@ All identifiers below are synthetic. No production ids or tokens.
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from run_workspace import RunCatalog
 
@@ -26,10 +26,16 @@ os.environ.setdefault("DISCORD_ADMIN_USER_IDS", str(TEST_ADMIN_ID))
 os.environ.setdefault("LLM_BASE_URL", "http://127.0.0.1:18080/v1")
 
 
-def run_catalog_patch(bot_module, root):
-    """Patch the bot with a real isolated catalog rooted in a test temp dir."""
+def run_catalog_patch(bot_module, root, patch_context_counter=True):
+    """Patch test state and keep integration tests off the local model API."""
     root = Path(root)
     catalog = RunCatalog(root / "workspace", root / "logs")
+    if patch_context_counter:
+        return patch.multiple(
+            bot_module,
+            RUN_CATALOG=catalog,
+            count_agent_input_tokens=AsyncMock(return_value=0),
+        )
     return patch.object(bot_module, "RUN_CATALOG", catalog)
 
 

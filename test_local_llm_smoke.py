@@ -31,7 +31,9 @@ class LocalLLMSmokeTest(unittest.IsolatedAsyncioTestCase):
         bot.FREE_RESPONSE_CHANNEL_IDS.add(channel)
         bot.channel_reasoning[channel] = "none"
         try:
-            with tempfile.TemporaryDirectory() as root, run_catalog_patch(bot, root), \
+            with tempfile.TemporaryDirectory() as root, run_catalog_patch(
+                    bot, root, patch_context_counter=False
+            ), \
                     recorder.install(), patch.object(bot, "MAX_AGENT_LOOPS", 6), \
                     patch.object(bot, "log_session_event", wraps=bot.log_session_event) as events:
                 await asyncio.wait_for(bot.on_message(message), timeout=600)

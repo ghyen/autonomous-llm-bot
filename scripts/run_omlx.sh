@@ -27,5 +27,5 @@ exec "$OMLX_BIN" serve \
     --port "$PORT" \
     --log-level info \
     --memory-guard balanced \
-    --max-concurrent-requests 4 \
+    --max-concurrent-requests 1 \
     "$@"

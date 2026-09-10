@@ -178,6 +178,7 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
                 patch.object(bot, "CHECKPOINT_INTERVAL", checkpoint_interval), \
                 patch.object(bot, "ROLLING_COMPACTION_INTERVAL", compaction_interval), \
                 patch.object(bot, "KEEP_RECENT_TOOL_GROUPS", keep_recent_tool_groups), \
+                patch.object(bot, "count_agent_input_tokens", AsyncMock(return_value=0)), \
                 patch.object(bot, "tool_bash_exec", self.bash_exec), \
                 patch.object(bot, "create_streaming_completion", stub), \
                 kill:

@@ -706,11 +706,14 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
 
 
 ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
-KEEP_RECENT_TOOL_GROUPS = int(os.environ.get("KEEP_RECENT_TOOL_GROUPS", "5"))
+KEEP_RECENT_TOOL_GROUPS = int(os.environ.get("KEEP_RECENT_TOOL_GROUPS", "2"))
 ROLLING_SUMMARY_MAX_CHARS = 10000
 MAX_CONTEXT_CHARS_BEFORE_ROLLOVER = int(os.environ.get("MAX_CONTEXT_CHARS_BEFORE_ROLLOVER", "28000"))
 MAX_AGENT_PAYLOAD_CHARS = int(os.environ.get("MAX_AGENT_PAYLOAD_CHARS", "36000"))
-MIN_RETAINED_TOOL_GROUPS = 2
+AGENT_MAX_CONTEXT_TOKENS = CONFIG.agent_max_context_tokens
+AGENT_CONTEXT_TRANSIENT_RESERVE = 1024
+AGENT_CONTEXT_COUNT_HEADROOM = 256
+MIN_RETAINED_TOOL_GROUPS = 1
 # 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
 # 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
 DEFAULT_TOOL_OUTPUT_MAX_CHARS = workspace_io.DEFAULT_TOOL_OUTPUT_MAX_CHARS
@@ -1784,6 +1787,276 @@ def build_agent_request_payload(workspace, messages):
         insert_at = 1 if payload and _msg_role(payload[0]) == "system" else 0
         payload = [*payload[:insert_at], context, *payload[insert_at:]]
     return bound_agent_payload(payload)
+
+
+class AgentContextBudgetExceeded(RuntimeError):
+    """The request is still too large after every safe compaction pass."""
+
+    def __init__(self, input_tokens: int, input_budget: int):
+        self.input_tokens = input_tokens
+        self.input_budget = input_budget
+        super().__init__(
+            f"컨텍스트 입력 토큰이 예산을 초과했습니다: {input_tokens}>{input_budget}"
+        )
+
+
+def build_token_count_payload(messages: list, tool_params: dict) -> dict:
+    """Convert the OpenAI payload to oMLX's Anthropic token-count shape."""
+    system_parts = []
+    converted = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = _msg_role(message)
+        if role == "system":
+            content = _msg_content(message)
+            if content:
+                system_parts.append(str(content))
+            index += 1
+            continue
+        if role == "tool":
+            blocks = []
+            while index < len(messages) and _msg_role(messages[index]) == "tool":
+                tool_message = messages[index]
+                blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": _tool_result_id(tool_message) or "unknown-tool-call",
+                    "content": str(_msg_content(tool_message)),
+                })
+                index += 1
+            converted.append({"role": "user", "content": blocks})
+            continue
+        if role not in ("user", "assistant"):
+            index += 1
+            continue
+
+        calls = _msg_tool_calls(message)
+        if role == "assistant" and calls:
+            blocks = []
+            content = _msg_content(message)
+            if content:
+                blocks.append({"type": "text", "text": str(content)})
+            for call in calls:
+                call_id, name, raw_arguments = _call_parts(call)
+                arguments = raw_arguments
+                if isinstance(arguments, str):
+                    arguments = _robust_json_loads(arguments)
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": call_id or "unknown-tool-call",
+                    "name": name or "tool",
+                    "input": arguments,
+                })
+            converted.append({"role": "assistant", "content": blocks})
+            index += 1
+            continue
+
+        content = _msg_content(message)
+        if not isinstance(content, (str, list, dict)):
+            content = str(content)
+        converted.append({"role": role, "content": content})
+        index += 1
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": converted,
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+
+    tools = []
+    for tool in (tool_params or {}).get("tools", []):
+        function = tool.get("function") or {}
+        tools.append({
+            "name": function.get("name", "tool"),
+            "description": function.get("description", ""),
+            "input_schema": function.get("parameters") or {"type": "object"},
+        })
+    if tools:
+        payload["tools"] = tools
+    return payload
+
+
+def approximate_agent_input_tokens(messages: list, tool_params: dict) -> int:
+    """Estimate input conservatively when the serving tokenizer is unavailable."""
+    serialized = json.dumps(
+        build_token_count_payload(messages, tool_params),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    ascii_text = 0
+    ascii_other = 0
+    non_ascii = 0
+    non_ascii_bytes = 0
+    for char in serialized:
+        if ord(char) < 128:
+            if char.isalnum() or char.isspace():
+                ascii_text += 1
+            else:
+                ascii_other += 1
+        else:
+            non_ascii += 1
+            non_ascii_bytes += len(char.encode("utf-8"))
+    # The compact JSON includes tool schemas and serialized arguments. Weight
+    # ASCII prose at 3.5 chars/token, punctuation at two, and non-ASCII text at
+    # the larger of 0.75 codepoints/token or four UTF-8 bytes/token; the
+    # allowance covers chat-template framing.
+    return (
+        (ascii_text * 2 + 6) // 7
+        + (ascii_other + 1) // 2
+        + max((non_ascii * 3 + 3) // 4, (non_ascii_bytes + 3) // 4)
+        + 32
+    )
+
+
+async def count_agent_input_tokens(messages: list, tool_params: dict):
+    """Return the serving model's input-token count, or None if unavailable."""
+    if not CONFIG.llm_is_local:
+        return None
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=5.0)
+        ) as counter:
+            response = await counter.post(
+                LLM_BASE_URL.rstrip("/") + "/messages/count_tokens",
+                headers={"Authorization": f"Bearer {CONFIG.llm_api_key}"},
+                json=build_token_count_payload(messages, tool_params),
+            )
+            response.raise_for_status()
+            value = response.json().get("input_tokens")
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value if value >= 0 else None
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _clip_tool_result_messages(messages: list, max_chars: int) -> list:
+    clipped = []
+    for message in messages:
+        if _msg_role(message) != "tool" or len(_msg_content(message)) <= max_chars:
+            clipped.append(message)
+            continue
+        clipped.append({
+            **message,
+            "content": _clip_summary_text(_msg_content(message), max_chars),
+        })
+    return validate_chat_payload(clipped).messages
+
+
+async def prepare_agent_request_payload(
+    workspace,
+    messages: list,
+    existing_summary: str,
+    step_num: int,
+    step_max_tokens: int,
+    tool_params: dict,
+    ledger=None,
+    token=None,
+    trajectory_gap_step=None,
+):
+    """Prepare a bounded agent request using the serving tokenizer when available."""
+    input_budget = max(
+        1024,
+        AGENT_MAX_CONTEXT_TOKENS
+        - step_max_tokens
+        - AGENT_CONTEXT_TRANSIENT_RESERVE
+        - AGENT_CONTEXT_COUNT_HEADROOM,
+    )
+    live_messages = validate_chat_payload(messages).messages
+    summary = existing_summary
+    rollover_used = False
+    trim_passes = 0
+    count_fallback = False
+    counter_unavailable = False
+
+    async def count(payload):
+        nonlocal count_fallback, counter_unavailable
+        if token is not None:
+            token.raise_if_cancelled()
+        if counter_unavailable:
+            result = approximate_agent_input_tokens(payload, tool_params)
+        else:
+            result = await count_agent_input_tokens(payload, tool_params)
+            if result is None:
+                counter_unavailable = True
+                count_fallback = True
+                result = approximate_agent_input_tokens(payload, tool_params)
+        if token is not None:
+            token.raise_if_cancelled()
+        return result
+
+    payload = build_agent_request_payload(workspace, live_messages)
+    input_tokens = await count(payload)
+
+    if input_tokens is not None and input_tokens > input_budget:
+        live_messages, summary = await rollover_agent_context(
+            workspace,
+            live_messages,
+            summary,
+            step_num,
+            ledger=ledger,
+            token=token,
+            trajectory_gap_step=trajectory_gap_step,
+        )
+        rollover_used = True
+        payload = build_agent_request_payload(workspace, live_messages)
+        input_tokens = await count(payload)
+
+    if input_tokens is not None and input_tokens > input_budget:
+        live_messages = bound_agent_payload(live_messages, max_chars=0)
+        trim_passes += 1
+        payload = build_agent_request_payload(workspace, live_messages)
+        input_tokens = await count(payload)
+
+    for max_chars in (1000, 400, 160):
+        if input_tokens is None or input_tokens <= input_budget:
+            break
+        live_messages = _clip_tool_result_messages(live_messages, max_chars)
+        trim_passes += 1
+        payload = build_agent_request_payload(workspace, live_messages)
+        input_tokens = await count(payload)
+
+    if input_tokens > input_budget:
+        log_session_event(
+            workspace,
+            "context_budget",
+            step=step_num,
+            input_tokens=input_tokens,
+            input_budget=input_budget,
+            rollover=rollover_used,
+            trim_passes=trim_passes,
+            count_fallback=count_fallback,
+            rejected=True,
+        )
+        raise AgentContextBudgetExceeded(input_tokens, input_budget)
+
+    live_messages = validate_chat_payload(live_messages).messages
+    payload = validate_chat_payload(payload).messages
+    log_session_event(
+        workspace,
+        "context_budget",
+        step=step_num,
+        input_tokens=input_tokens,
+        input_budget=input_budget,
+        rollover=rollover_used,
+        trim_passes=trim_passes,
+        count_fallback=count_fallback,
+        rejected=False,
+    )
+    return SimpleNamespace(
+        messages=live_messages,
+        payload=payload,
+        summary=summary,
+        input_tokens=input_tokens,
+        input_budget=input_budget,
+        rollover_used=rollover_used,
+        trim_passes=trim_passes,
+        count_fallback=count_fallback,
+    )
 
 
 def is_tool_correlation_error(error) -> bool:
@@ -3945,6 +4218,9 @@ async def on_message(message: discord.Message):
                 outcome_mod.FAILED,
                 f"마감 초과: {error.stage} {error.seconds:g}s",
             )
+        elif isinstance(error, AgentContextBudgetExceeded):
+            stage_failure_note = str(error)
+            outcome.settle(outcome_mod.FAILED, "컨텍스트 예산 초과")
         else:
             stage_failure_note = _clip_summary_text(
                 f"{type(error).__name__}: {error}", 500
@@ -4021,12 +4297,6 @@ async def on_message(message: discord.Message):
                     fingerprint=_payload_fingerprint(messages_payload),
                 )
 
-            # 불변(Append-only) 컨텍스트 보존: 중간 텍스트를 변조하지 않아 Prefix Cache(KV Cache) HIT를 극대화한다.
-            compacted_payload = build_agent_request_payload(
-                workspace, messages_payload
-            )
-            model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
-            model_stage_started = time.monotonic()
             if is_think_step:
                 step_max_tokens = min(AGENT_STEP_MAX_TOKENS, (effort_tokens or 512) + 512)
             elif iteration == 0:
@@ -4034,7 +4304,31 @@ async def on_message(message: discord.Message):
             else:
                 step_max_tokens = AGENT_STEP_MAX_TOKENS
 
+            # 불변(Append-only) 컨텍스트 보존: 중간 텍스트를 변조하지 않아 Prefix Cache(KV Cache) HIT를 극대화한다.
+            # 단, serving tokenizer가 입력 예산을 넘겼다고 판정하면 완결 그룹 단위로만
+            # persistent history를 줄인다.
+            compacted_payload = messages_payload
+            model_stage_deadline = time.monotonic() + CONFIG.model_stage_timeout
+            model_stage_started = time.monotonic()
             try:
+                prepared = await prepare_agent_request_payload(
+                    workspace,
+                    messages_payload,
+                    rolling_summary,
+                    iteration + 1,
+                    step_max_tokens,
+                    step_tool_params,
+                    ledger=ledger,
+                    token=token,
+                    trajectory_gap_step=trajectory_gap_step,
+                )
+                messages_payload = prepared.messages
+                rolling_summary = prepared.summary
+                channel_summary[message.channel.id] = rolling_summary
+                compacted_payload = prepared.payload
+                if prepared.rollover_used or prepared.trim_passes:
+                    save_snapshot(iteration + 1, "context_budget")
+
                 resp = await run_completion_stage(
                     token=token,
                     stage="agent:think" if is_think_step else "agent",
@@ -4047,6 +4341,9 @@ async def on_message(message: discord.Message):
                     **extra_params
                 )
             except (RunCancelled, StageTimeout) as stage_error:
+                settle_stage_failure(stage_error)
+                break
+            except AgentContextBudgetExceeded as stage_error:
                 settle_stage_failure(stage_error)
                 break
             except Exception as api_err:
