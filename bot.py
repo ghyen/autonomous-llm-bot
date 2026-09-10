@@ -798,6 +798,7 @@ def _manifest_workspace_item(workspace, envelope, step_num):
         not isinstance(path, str)
         or not path
         or Path(path).is_absolute()
+        or run_state._has_unsafe_path_chars(path)
         or not isinstance(revision, str)
         or not workspace_io.REVISION_PATTERN.fullmatch(revision)
     ):
@@ -2745,6 +2746,7 @@ def extract_discovered_artifacts(text: str, workspace) -> list:
 ROLLING_SUMMARY_LABEL = "누적 작업 요약 및 이전 대화 컨텍스트"
 STATE_UPDATE_BLOCK_PATTERN = re.compile(r"```state_update\s*(.*?)(?:```|$)", re.DOTALL)
 TASK_CONTRACT_MAX_CHARS = 4000
+RUN_ID_MARKER_PATTERN = re.compile(r"> 🧾 \*\*run ID\*\*: `[^`\r\n]*`")
 
 
 def resolve_task_contract(restored, message_id, content, same_origin):
@@ -2769,7 +2771,14 @@ def resolve_task_contract(restored, message_id, content, same_origin):
 
     for item in restored.get("tail", []):
         candidate = _msg_content(item).strip()
-        if _msg_role(item) == "user" and candidate and not wants_auto_resume(candidate):
+        if (
+            _msg_role(item) == "user"
+            and candidate
+            and not wants_auto_resume(candidate)
+            and not candidate.startswith(
+                ("💬 [사용자(", "[🤖 시스템", "[롤링 컨텍스트 재개]")
+            )
+        ):
             return {
                 "version": run_state.TASK_CONTRACT_VERSION,
                 "origin_message_id": restored.get("message_id"),
@@ -3585,9 +3594,8 @@ def run_id_marker(workspace) -> str:
 
 
 def ensure_run_id_marker(text: str, workspace) -> str:
-    text = str(text or "").rstrip()
-    marker = run_id_marker(workspace)
-    return text if marker in text else (text + "\n\n" + marker).strip()
+    text = RUN_ID_MARKER_PATTERN.sub("", str(text or "")).rstrip()
+    return (text + "\n\n" + run_id_marker(workspace)).strip()
 
 
 def build_incomplete_report(

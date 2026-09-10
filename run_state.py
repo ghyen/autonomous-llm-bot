@@ -24,6 +24,7 @@ Two rules are structural rather than documented:
 """
 
 import json
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +40,10 @@ TASK_CONTRACT_VERSION = 1
 ARTIFACT_MANIFEST_VERSION = 1
 ARTIFACT_MANIFEST_MAX_ITEMS = 24
 TASK_GOAL_MAX_CHARS = 4000
+
+
+def _has_unsafe_path_chars(value):
+    return any(unicodedata.category(char).startswith("C") for char in value)
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
 RUNNING = "running"
@@ -107,7 +112,11 @@ def _normalize_artifact_manifest(value):
         if not isinstance(path, str) or not path or len(path) > 512:
             continue
         path_parts = Path(path).parts
-        if Path(path).is_absolute() or ".." in path_parts or "\x00" in path:
+        if (
+            Path(path).is_absolute()
+            or ".." in path_parts
+            or _has_unsafe_path_chars(path)
+        ):
             continue
         kind = raw_item.get("kind")
         if kind not in ("workspace_file", "tool_output"):

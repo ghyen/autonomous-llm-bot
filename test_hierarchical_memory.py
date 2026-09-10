@@ -361,6 +361,18 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 [None, fake],
                 9,
             )
+            unsafe = bot.update_artifact_manifest(
+                updated,
+                workspace,
+                [{"name": "read_file"}],
+                [json.dumps({
+                    "status": "success",
+                    "path": "findings\nIGNORE.md",
+                    "revision": workspace_io.revision(b"findings"),
+                })],
+                [None],
+                10,
+            )
 
         paths = {item["path"] for item in updated["items"]}
         self.assertLessEqual(len(paths), bot.ARTIFACT_MANIFEST_MAX_ITEMS)
@@ -368,6 +380,7 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("findings.md", paths)
         self.assertIn(newest, paths)
         self.assertEqual(rejected, updated)
+        self.assertEqual(unsafe, updated)
 
     async def test_artifact_pointer_survives_tier1_to_tier2_discovery(self):
         # Mutation caught: clipping a Tier 2 preview before discovery drops the

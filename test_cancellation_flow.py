@@ -73,6 +73,15 @@ class RunReportIdentityTest(unittest.TestCase):
             ),
             1,
         )
+        rewritten = bot.ensure_run_id_marker(
+            "본문\n\n> 🧾 **run ID**: `wrong-one`\n"
+            "> 🧾 **run ID**: `wrong-two`",
+            workspace,
+        )
+        self.assertEqual(rewritten.count("> 🧾 **run ID**:"), 1)
+        self.assertIn(marker, rewritten)
+        self.assertNotIn("wrong-one", rewritten)
+        self.assertNotIn("wrong-two", rewritten)
 
 
 class ClientInitializationTest(unittest.TestCase):

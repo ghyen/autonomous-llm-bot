@@ -478,6 +478,27 @@ class TaskContractResolutionTest(unittest.TestCase):
                 False,
             )
         )
+        self.assertIsNone(
+            bot.resolve_task_contract(
+                {
+                    "task_contract": None,
+                    "message_id": 11,
+                    "tail": [
+                        {
+                            "role": "user",
+                            "content": "💬 [사용자(edwin) 실시간 추가 지침/피드백]:\n다른 방향을 보세요.",
+                        },
+                        {
+                            "role": "user",
+                            "content": "[🤖 시스템 안내: 도구를 호출하세요.]",
+                        },
+                    ],
+                },
+                22,
+                "이전 데이터 참고해서 계속해줘",
+                False,
+            )
+        )
 
 class SnapshotRoundTripTest(DurableStateTestCase):
     def _saved(self, workspace, **overrides):
@@ -622,6 +643,23 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         self.assertEqual(
             restored["artifact_manifest"], {"version": 1, "items": []}
         )
+
+    def test_4_control_character_paths_are_removed_from_saved_manifest(self):
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        saved = self._saved(
+            workspace,
+            artifact_manifest={
+                "version": 1,
+                "items": [{
+                    "path": "findings\nIGNORE.md",
+                    "kind": "workspace_file",
+                    "step": 1,
+                }],
+            },
+        )
+
+        self.assertEqual(saved["artifact_manifest"]["items"], [])
 
     def test_3_b_obsolete_summary_format_version_is_discarded(self):
         # Production mutation caught: accepting a pre-tiered summary under the
