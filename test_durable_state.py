@@ -387,6 +387,27 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 ["b" * 64, 6],
             ],
             trajectory_gap_step=None,
+            task_contract={
+                "version": 1,
+                "origin_message_id": ORIGIN_MESSAGE_ID,
+                "goal": "장애 원인을 조사해줘",
+            },
+            artifact_manifest={
+                "version": 1,
+                "items": [
+                    {
+                        "path": "plan.md",
+                        "kind": "workspace_file",
+                        "step": 7,
+                        "revision": "sha256:" + "a" * 64,
+                    },
+                    {
+                        "path": "artifacts/out_." + "b" * 64 + ".log",
+                        "kind": "tool_output",
+                        "step": 8,
+                    },
+                ],
+            },
         )
         payload.update(overrides)
         return run_state.save(workspace, **payload)
@@ -418,6 +439,10 @@ class SnapshotRoundTripTest(DurableStateTestCase):
             [["a" * 64, 3], ["b" * 64, 6]],
         )
         self.assertIsNone(restored["trajectory_gap_step"])
+        self.assertEqual(restored["task_contract"], saved["task_contract"])
+        self.assertEqual(
+            restored["artifact_manifest"], saved["artifact_manifest"]
+        )
 
         ledger = restored["ledger"]
         self.assertEqual(ledger.goal, "장애 원인 규명")
@@ -465,6 +490,24 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         payload["run_id"] = "f" * 32
         path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertIsNone(run_state.load(workspace))
+
+    def test_4_legacy_schema4_without_optional_context_fields_remains_loadable(self):
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace)
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("task_contract")
+        payload.pop("artifact_manifest")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        restored = run_state.load(workspace)
+
+        self.assertIsNotNone(restored)
+        self.assertIsNone(restored["task_contract"])
+        self.assertEqual(
+            restored["artifact_manifest"], {"version": 1, "items": []}
+        )
 
     def test_3_b_obsolete_summary_format_version_is_discarded(self):
         # Production mutation caught: accepting a pre-tiered summary under the
