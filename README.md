@@ -13,7 +13,7 @@ Designed for long-horizon autonomous exploration, terminal execution, research, 
 - 💾 **Durable Run State**: Each run keeps one atomic record (`runs/<run-id>/state.json`) carrying its run id, originating message id, state, next step cursor, bounded summary and tail, interrupt state, ledger, every announced tool-call id, replay-guard fingerprints, and the earliest trajectory coverage gap. It is written before the first model call, before uncertain dispatches, and after every completed assistant/tool group, never with a partial group in its tail. A restart resumes the same run id at its next step or records exactly one explicit abort.
 - 📁 **Owner-Bound Run Workspaces**: Every accepted top-level request receives an opaque `runs/<run-id>/` directory and opaque per-run log. Runs never derive paths from Discord IDs; exact owners can resume or delete inactive runs, while admins receive no implicit workspace access.
 - 🔄 **Canonical File Revisions**: Root `plan.md`, `findings.md`, and `playbook.md` use exact-byte `sha256:` revisions, compare-and-swap writes, and atomic replacement. `playbook.md` is inherited only by an automatic successor created when no prepared or resumed run is selected for that owner and channel; explicit `!new` and `!reset` prepared runs start blank. `run.json`, `state.json`, and `traj.jsonl` remain run-local reserved state. Per-execution read hashes return bounded references for unchanged content.
-- 🗺️ **Token-aware Tiered Trajectory Compaction**: Before each normal agent request, the bot counts the complete payload (including tools) with the serving tokenizer. It keeps the latest 2 complete assistant/tool groups by default, rolls the older history into Tier 2/3 trajectory summaries when the input budget is exceeded, and trims complete groups before clipping only tool-result bodies as an emergency guard. Every completed tool group also appends bounded arguments and results to the run-local mode-`0600` `traj.jsonl`; the model can recover an exact old step with `lookup_trajectory`. Goals, facts, conclusions, and hypothesis status remain exclusively in the authoritative ledger, which is always the final section of the system message. Artifact pointers may enter rollover discovery only when they were host-recorded for the current run and still validate as regular files.
+- 🗺️ **Token-aware Tiered Trajectory Compaction**: Before each normal agent request, the bot counts the complete payload (including tools) with the serving tokenizer. It keeps the latest 2 complete assistant/tool groups by default, rolls the older history into Tier 2/3 trajectory summaries when the input budget is exceeded, and trims complete groups before clipping only tool-result bodies as an emergency guard. A restored run first applies deterministic summary compaction (latest Tier 2 lines, bounded Tier 3/discovery lines) and recounts before removing any complete groups. Every completed tool group also appends bounded arguments and results to the run-local mode-`0600` `traj.jsonl`; the model can recover an exact old step with `lookup_trajectory`. Goals, facts, conclusions, and hypothesis status remain exclusively in the authoritative ledger, which is always the final section of the system message. Artifact pointers may enter rollover discovery only when they were host-recorded for the current run and still validate as regular files.
 - 🧩 **Run-Local Workspace Skills**: Reusable Python (`.py`), Shell (`.sh`/`.bash`), and Markdown (`.md`) skills are discovered from the current run's `skills/` directory and rendered into its system prompt. They are isolated from other runs and retained only when that exact run is resumed.
 - ⌨️ **Keep-Alive Continuous Typing Heartbeat**: A background 7-second heartbeat maintains Discord's typing state continuously so the user always knows the agent is active.
 - 📱 **Real-Time Live Dashboard Card (`message.edit`)**: Continuously updates a single status card in Discord with elapsed time, step progress, real-time thought snippet, and current tool execution.
@@ -304,10 +304,13 @@ from a new request. A resumed run announces itself in the channel and logs a
 announced is refused with a deterministic `already_announced` result before
 dispatch.
 
-A run that ends normally marks its record ended, so startup leaves it alone
-while `!resume <run-id>` can still pick it up. `!reset`, `!new`, `!clear` and
-`!delete` delete the record, so a discarded run cannot come back after a
-restart.
+A run that ends normally marks its record ended, so startup leaves it alone.
+`!resume <run-id>` remains the exact inactive-run selector. A non-command
+message with explicit continuation intent such as “이전 데이터 참고해서
+계속해줘” automatically selects the newest valid incomplete run for the same
+owner and channel; an ordinary new goal always starts a fresh run. `!reset`,
+`!new`, `!clear` and `!delete` delete the record, so a discarded run cannot
+come back after a restart.
 
 ---
 
@@ -385,6 +388,11 @@ with an empty read cache; and `!delete <run-id>` removes an inactive owned
 workspace and log, including rotated log generations. `!clear` purges Discord
 first and performs the same reset only on success. `!reset`, `!new`, `!clear`
 and `!delete` also delete the run's durable state record. A selected run is consumed once, and one run cannot be active twice.
+Continuation-intent natural language requests select the newest valid
+stopped, exhausted, failed, or interrupted run for the same owner and channel;
+generic new requests do not. Summary compaction during this automatic or
+explicit resume only shortens procedural context—the ledger remains the
+authoritative source for facts, conclusions, and hypothesis state.
 There is no list/share surface, and admin control authority is not workspace
 read/delete authority: cross-owner IDs return `run not found`.
 
@@ -472,6 +480,7 @@ leaves your history intact and is reported as a failure.
 | `!reset` / `/reset` | Clears channel memory and prepares a blank run for the next goal; rejects while the caller/channel owns an active run. |
 | `!new` / `/new` | Alias of reset with the same authorization and active-run preflight. |
 | `!resume <run-id>` / `/resume` | Selects the exact inactive run for its owner; the next accepted goal consumes it with an empty read cache. |
+| Continuation-intent message | A message such as “이전 데이터 참고해서 계속해줘” resumes the newest valid incomplete run in the same owner/channel; an ordinary new goal starts a new run. |
 | `!delete <run-id>` / `/delete` | Deletes an exact-owner inactive workspace and its run log. Active runs are rejected; cross-owner IDs are not disclosed. |
 | `!clear [count]` / `/clear` | Preflights active state, purges recent Discord messages, then prepares a blank run and clears channel memory. Failure changes nothing. |
 | `/reasoning [level]` | Changes reasoning effort (`none`, `low`, `medium`, `high`). Any allowed caller. |
