@@ -298,6 +298,41 @@ class NaturalLanguageResumeTest(DurableStateTestCase):
         self.assertEqual(resumed[0]["next_step"], 7)
         self.assertTrue(resumed[0]["automatic"])
 
+    async def test_resumed_request_uses_prepared_output_cap(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(
+            failed, next_step=7, summary="이전 실행 요약", state="failed"
+        )
+        catalog.finish(failed, "failed")
+        self.restart()
+
+        captured_max_tokens = []
+        original_prepare = bot.prepare_agent_request_payload
+        original_stage = bot.run_completion_stage
+
+        async def prepare_with_cap(*args, **kwargs):
+            prepared = await original_prepare(*args, **kwargs)
+            prepared.output_max_tokens = 1412
+            return prepared
+
+        async def capture_stage(*args, **kwargs):
+            if kwargs.get("stage") == "agent":
+                captured_max_tokens.append(kwargs["max_tokens"])
+            return await original_stage(*args, **kwargs)
+
+        with patch.object(
+            bot, "prepare_agent_request_payload", side_effect=prepare_with_cap
+        ), patch.object(bot, "run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                catalog,
+                [_response(content="재개 결과")],
+                request="이전 데이터 참고해서 계속해줘",
+                max_loops=7,
+            )
+
+        self.assertEqual(captured_max_tokens, [1412])
+
     async def test_new_goal_does_not_auto_resume_incomplete_run(self):
         catalog = self.catalog()
         failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
