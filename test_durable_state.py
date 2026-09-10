@@ -492,6 +492,10 @@ class TaskContractResolutionTest(unittest.TestCase):
                             "role": "user",
                             "content": "[🤖 시스템 안내: 도구를 호출하세요.]",
                         },
+                        {
+                            "role": "user",
+                            "content": "[도구 실행 결과: read_file]\n원문",
+                        },
                     ],
                 },
                 22,

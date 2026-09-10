@@ -2776,7 +2776,12 @@ def resolve_task_contract(restored, message_id, content, same_origin):
             and candidate
             and not wants_auto_resume(candidate)
             and not candidate.startswith(
-                ("💬 [사용자(", "[🤖 시스템", "[롤링 컨텍스트 재개]")
+                (
+                    "💬 [사용자(",
+                    "[🤖 시스템",
+                    "[도구 실행 결과:",
+                    "[롤링 컨텍스트 재개]",
+                )
             )
         ):
             return {
