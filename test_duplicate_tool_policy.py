@@ -1067,6 +1067,70 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked["reason"], "known_failure")
         self.assertEqual(blocked["tool"], "read_file")
 
+    # Artifact 통째 읽기는 결과가 또 artifact로 저장돼 연쇄가 된다. 3회 연속
+    # 뒤의 4번째 동일 패턴 읽기는 디스패처에 닿지 않는다.
+    async def test_artifact_chain_blocks_fourth_consecutive_read(self):
+        def artifact_command(index):
+            return (
+                "cat /Users/edwin/discord-llm-bot/workspace/runs/abc/"
+                f"artifacts/out_{index}.log"
+            )
+
+        await self.run_agent([
+            *[
+                _response(tool_calls=[
+                    _tool_call(
+                        f"artifact-read-{attempt}",
+                        "bash_exec",
+                        {"command": artifact_command(attempt)},
+                    ),
+                ])
+                for attempt in range(1, 5)
+            ],
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [
+                ["artifact-read-1"],
+                ["artifact-read-2"],
+                ["artifact-read-3"],
+            ],
+        )
+        blocked = json.loads(
+            self._tool_messages(self.model.agent_payloads[4])[-1]["content"]
+        )
+        self.assertTrue(blocked.get("blocked"))
+        self.assertEqual(blocked["reason"], "artifact_chain")
+        self.assertEqual(blocked["tool"], "bash_exec")
+
+    async def test_non_artifact_call_resets_artifact_chain(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("chain-1", "bash_exec", {"command": "cat runs/abc/artifacts/out_1.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("chain-2", "bash_exec", {"command": "cat runs/abc/artifacts/out_2.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("fresh", "bash_exec", {"command": "printf fresh"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("chain-3", "bash_exec", {"command": "cat runs/abc/artifacts/out_3.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["chain-1"], ["chain-2"], ["fresh"], ["chain-3"]],
+        )
+
     # Mutation caught: treating a producer-owned write_file conflict envelope as
     # success lets an unchanged third stale canonical write reach the dispatcher.
     async def test_stale_canonical_write_conflict_blocks_third_attempt_end_to_end(self):

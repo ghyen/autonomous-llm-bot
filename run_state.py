@@ -69,6 +69,17 @@ def snapshot_path(workspace):
     return Path(workspace.root) / FILE_NAME
 
 
+def normalize_artifact_chain(value):
+    """artifact 연쇄 카운터. 깨진 값·없는 값은 0."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        return 0
+    return value
+
+
 def normalize_known_bad_calls(value):
     """확정 실패 회피 목록을 관대하게 정규화한다. 깨진 값·없는 값은 {}.
 
@@ -214,6 +225,7 @@ def save(
     task_contract=None,
     artifact_manifest=None,
     known_bad_calls=None,
+    artifact_chain=0,
 ):
     """Replace the run's record atomically.
 
@@ -254,6 +266,7 @@ def save(
                 known_bad_calls
             ).items()
         ],
+        "artifact_chain": normalize_artifact_chain(artifact_chain),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -330,6 +343,9 @@ def load(workspace):
     )
     payload["known_bad_calls"] = normalize_known_bad_calls(
         payload.get("known_bad_calls")
+    )
+    payload["artifact_chain"] = normalize_artifact_chain(
+        payload.get("artifact_chain")
     )
     return payload
 
