@@ -1958,6 +1958,7 @@ async def prepare_agent_request_payload(
     ledger=None,
     token=None,
     trajectory_gap_step=None,
+    resume_context=False,
 ):
     """Prepare a bounded agent request using the serving tokenizer when available."""
     input_budget = max(
@@ -1971,6 +1972,7 @@ async def prepare_agent_request_payload(
     summary = existing_summary
     rollover_used = False
     trim_passes = 0
+    summary_compactions = 0
     count_fallback = False
     counter_unavailable = False
 
@@ -1992,6 +1994,37 @@ async def prepare_agent_request_payload(
 
     payload = build_agent_request_payload(workspace, live_messages)
     input_tokens = await count(payload)
+
+    if input_tokens is not None and input_tokens > input_budget and resume_context:
+        for tier2_limit, tier3_chars, discovery_limit in (
+            (6, 1200, 4),
+            (3, 800, 2),
+            (0, 400, 0),
+        ):
+            compacted_summary = compact_resume_summary(
+                existing_summary,
+                tier2_limit,
+                tier3_chars,
+                discovery_limit,
+            )
+            if compacted_summary == summary:
+                continue
+            if not live_messages or _msg_role(live_messages[0]) != "system":
+                break
+            compacted_messages = list(live_messages)
+            compacted_messages[0] = {
+                "role": "system",
+                "content": build_system_content(
+                    workspace, ledger, compacted_summary
+                ),
+            }
+            live_messages = validate_chat_payload(compacted_messages).messages
+            summary = compacted_summary
+            summary_compactions += 1
+            payload = build_agent_request_payload(workspace, live_messages)
+            input_tokens = await count(payload)
+            if input_tokens <= input_budget:
+                break
 
     if input_tokens is not None and input_tokens > input_budget:
         live_messages, summary = await rollover_agent_context(
@@ -2030,6 +2063,7 @@ async def prepare_agent_request_payload(
             input_budget=input_budget,
             rollover=rollover_used,
             trim_passes=trim_passes,
+            summary_compactions=summary_compactions,
             count_fallback=count_fallback,
             rejected=True,
         )
@@ -2045,6 +2079,7 @@ async def prepare_agent_request_payload(
         input_budget=input_budget,
         rollover=rollover_used,
         trim_passes=trim_passes,
+        summary_compactions=summary_compactions,
         count_fallback=count_fallback,
         rejected=False,
     )
@@ -2056,6 +2091,7 @@ async def prepare_agent_request_payload(
         input_budget=input_budget,
         rollover_used=rollover_used,
         trim_passes=trim_passes,
+        summary_compactions=summary_compactions,
         count_fallback=count_fallback,
     )
 
@@ -2480,6 +2516,37 @@ def parse_tiered_summary(text: str) -> dict:
         "tier2": sections["tier2"],
         "discoveries": sections["discoveries"],
     }
+
+
+def compact_resume_summary(
+    summary: str, tier2_limit: int, tier3_chars: int, discovery_limit: int
+) -> str:
+    source = str(summary or "").strip()
+    parsed = parse_tiered_summary(source)
+    is_canonical_empty = source == format_tiered_summary()
+    is_tiered = (
+        source.startswith(_TIERED_SUMMARY_VERSION_LINE)
+        and (any(parsed.values()) or is_canonical_empty)
+    )
+    if not is_tiered:
+        return _clip_summary_text(source, max(0, int(tier3_chars)))
+
+    tier2_limit = max(0, int(tier2_limit))
+    tier3_chars = max(0, int(tier3_chars))
+    discovery_limit = max(0, int(discovery_limit))
+    tier2 = parsed["tier2"][-tier2_limit:] if tier2_limit else []
+    discoveries = (
+        parsed["discoveries"][-discovery_limit:] if discovery_limit else []
+    )
+    tier3 = parsed["tier3"]
+    if len(tier3) > tier3_chars:
+        tier3 = tier3[-tier3_chars:] if tier3_chars else ""
+    return format_tiered_summary(
+        tier3=tier3,
+        tier3_through=parsed["tier3_through"],
+        tier2_lines=tier2,
+        discoveries=discoveries,
+    )
 
 
 def _deterministic_tier3_fallback(source: str, start_step: int, end_step: int) -> str:
@@ -4366,12 +4433,17 @@ async def on_message(message: discord.Message):
                     ledger=ledger,
                     token=token,
                     trajectory_gap_step=trajectory_gap_step,
+                    resume_context=restored is not None,
                 )
                 messages_payload = prepared.messages
                 rolling_summary = prepared.summary
                 channel_summary[message.channel.id] = rolling_summary
                 compacted_payload = prepared.payload
-                if prepared.rollover_used or prepared.trim_passes:
+                if (
+                    prepared.rollover_used
+                    or prepared.trim_passes
+                    or prepared.summary_compactions
+                ):
                     save_snapshot(iteration + 1, "context_budget")
 
                 resp = await run_completion_stage(
