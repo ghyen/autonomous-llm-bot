@@ -582,6 +582,9 @@ TOOL_LOOP_GUARD_TOOLS = ("bash_exec", "read_file", "web_search")
 # 기억하고, 시스템 프롬프트에도 누적해서 모델이 계획 단계에서 우회하게 한다.
 KNOWN_BAD_CALLS_MAX = 20
 AVOIDANCE_BLOCK_MAX_CHARS = 1200
+# artifact 통째 읽기는 결과가 또 artifact로 저장돼서 연쇄가 된다(out_*.log
+# cat 192→197 실측). N회 연속이면 막고 grep/head를 가리킨다.
+ARTIFACT_CHAIN_LIMIT = 3
 AGENT_STEP_MAX_TOKENS = CONFIG.agent_step_max_tokens
 REASONING_MAX_TOKENS = CONFIG.reasoning_max_tokens
 ADAPTIVE_REASONING = CONFIG.adaptive_reasoning
@@ -678,6 +681,14 @@ def _blocked_tool_result(
             "결정적으로 실패했습니다. 같은 인자로 재시도해도 같은 결과가 "
             "나옵니다. 다른 경로나 인자를 시도하세요. 실제 상태가 "
             "바뀌었을 때만 force=true를 사용하세요."
+        )
+    if reason == "artifact_chain":
+        payload["directive"] = (
+            "[Artifact 연쇄 차단]: artifact 파일 통째 읽기가 "
+            f"{int(count)}회 연속되었습니다. 통째로 읽으면 결과가 또 "
+            "artifact로 저장될 뿐 진전이 없습니다. grep -n '패턴'이나 "
+            "head로 필요한 줄만 조회하거나, 원본 내용은 lookup_trajectory로 "
+            "보세요. 정말 전체가 필요할 때만 force=true를 쓰세요."
         )
     return json.dumps(
         payload,
@@ -832,6 +843,17 @@ def _invalidate_known_bad(known_bad_calls: dict, tool_name: str, arguments: dict
     except KeyError:
         return
     known_bad_calls.pop(fingerprint, None)
+
+
+def _is_artifact_read(tool_name: str, arguments: dict) -> bool:
+    """artifact 파일 통째 읽기를 판정한다."""
+    if not isinstance(arguments, dict):
+        return False
+    if tool_name == "bash_exec":
+        return "artifacts/" in str(arguments.get("command", ""))
+    if tool_name == "read_file":
+        return str(arguments.get("path", "")).startswith("artifacts/")
+    return False
 
 
 ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
@@ -4452,6 +4474,11 @@ async def on_message(message: discord.Message):
         else {}
     )
     workspace.known_bad_calls = known_bad_calls
+    consecutive_artifact_reads = (
+        run_state.normalize_artifact_chain(restored.get("artifact_chain"))
+        if restored is not None
+        else 0
+    )
     run_end_logged = False
     released = False
 
@@ -4720,6 +4747,7 @@ async def on_message(message: discord.Message):
                 task_contract=task_contract,
                 artifact_manifest=artifact_manifest,
                 known_bad_calls=known_bad_calls,
+                artifact_chain=consecutive_artifact_reads,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -5304,6 +5332,7 @@ async def on_message(message: discord.Message):
                 ]
                 batch_signatures = set()
                 batch_fingerprints = set()
+                batch_artifact_reads = 0
                 allowed_calls = []
                 allowed_indexes = []
                 allowed_failure_signatures = []
@@ -5416,6 +5445,34 @@ async def on_message(message: discord.Message):
                                 fingerprint=(guarded_fingerprint or "")[:16],
                             )
                             continue
+                    is_artifact_read = _is_artifact_read(tc["name"], tc["arguments"])
+                    if (
+                        is_artifact_read
+                        and tc["arguments"].get("force") is not True
+                        and consecutive_artifact_reads + batch_artifact_reads
+                        >= ARTIFACT_CHAIN_LIMIT
+                    ):
+                        batch_signatures.add(signature)
+                        if guarded_fingerprint is not None:
+                            batch_fingerprints.add(guarded_fingerprint)
+                        merged_results[call_index] = _blocked_tool_result(
+                            "artifact_chain",
+                            tc["name"],
+                            ARTIFACT_CHAIN_LIMIT,
+                            consecutive_artifact_reads
+                            + batch_artifact_reads
+                            + 1,
+                        )
+                        log_session_event(
+                            workspace,
+                            "tool_artifact_chain_blocked",
+                            step=current_tool_step,
+                            tool=tc["name"],
+                            chain=consecutive_artifact_reads
+                            + batch_artifact_reads
+                            + 1,
+                        )
+                        continue
                     if (
                         total_tools_executed + len(allowed_calls)
                         >= MAX_TOOL_EXECUTIONS_PER_RUN
@@ -5430,6 +5487,8 @@ async def on_message(message: discord.Message):
                     batch_signatures.add(signature)
                     if guarded_fingerprint is not None:
                         batch_fingerprints.add(guarded_fingerprint)
+                    if is_artifact_read:
+                        batch_artifact_reads += 1
                     allowed_calls.append(tc)
                     allowed_indexes.append(call_index)
                     allowed_failure_signatures.append(failure_signature)
@@ -5585,6 +5644,15 @@ async def on_message(message: discord.Message):
                             recent_tool_fingerprints.append(
                                 [guarded_fingerprint, current_tool_step]
                             )
+
+                if allowed_calls:
+                    if any(
+                        not _is_artifact_read(tc["name"], tc["arguments"])
+                        for tc in allowed_calls
+                    ):
+                        consecutive_artifact_reads = 0
+                    else:
+                        consecutive_artifact_reads += batch_artifact_reads
 
                 for result_index, (tc, tool_result) in enumerate(
                     zip(tool_calls_to_run, merged_results)
