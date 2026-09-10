@@ -185,6 +185,52 @@ class TokenCountPayloadTest(unittest.TestCase):
 
 
 class ContextPreflightTest(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_compaction_keeps_the_contract_and_manifest(self):
+        ledger = ResearchLedger()
+        task_contract = {
+            "version": 1,
+            "origin_message_id": 101,
+            "goal": "원래 장애 조사",
+        }
+        artifact_manifest = {
+            "version": 1,
+            "items": [{
+                "path": "findings.md",
+                "kind": "workspace_file",
+                "step": 8,
+                "revision": "sha256:" + "b" * 64,
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            messages = [{
+                "role": "system",
+                "content": bot.build_system_content(workspace, ledger, "summary"),
+            }, {
+                "role": "user",
+                "content": "이전 작업을 이어서 진행해줘",
+            }]
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000, 4000]),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    "summary",
+                    76,
+                    4096,
+                    {"tools": []},
+                    ledger=ledger,
+                    resume_context=True,
+                    task_contract=task_contract,
+                    artifact_manifest=artifact_manifest,
+                )
+
+        self.assertIn("원래 장애 조사", result.messages[0]["content"])
+        self.assertIn("findings.md", result.messages[0]["content"])
+
     async def test_resume_context_compacts_summary_before_group_trim(self):
         full_summary = bot.format_tiered_summary(
             tier3="절차 " * 500,

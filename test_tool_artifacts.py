@@ -88,6 +88,26 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             (self.run.root / path).read_text(encoding="utf-8").count("x"), 5001
         )
 
+    async def test_stored_output_path_is_recorded_in_the_run_manifest(self):
+        result = await bot.tool_bash_exec(
+            self.run, long_bash_command(), "manifest-bash-call"
+        )
+        path = artifact_path(result)
+
+        manifest = bot.update_artifact_manifest(
+            {"version": 1, "items": []},
+            self.run,
+            [{"name": "bash_exec"}],
+            [result],
+            [path],
+            3,
+        )
+
+        self.assertEqual(
+            manifest["items"],
+            [{"path": path, "kind": "tool_output", "step": 3}],
+        )
+
     # Mutation caught: appending the artifact path or the grep hint after the
     # exit marker unanchors _tool_result_failed and disables the failure brake.
     async def test_summarized_bash_output_still_ends_with_the_exit_marker(self):

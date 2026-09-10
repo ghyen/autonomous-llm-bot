@@ -52,6 +52,38 @@ def _is_report_stage(messages):
     return any(m in system for m in ("수석 분석가", "AI 리포터", "컨텍스트 압축기"))
 
 
+class RunReportIdentityTest(unittest.TestCase):
+    def test_incomplete_report_contains_one_idempotent_run_marker(self):
+        workspace = SimpleNamespace(
+            root="/tmp/run-fedcba9876543210fedcba9876543210",
+            run_id="fedcba9876543210fedcba9876543210",
+        )
+        outcome = bot.RunOutcome()
+        outcome.settle(outcome_mod.STOPPED, "사용자 중단")
+
+        report = bot.build_incomplete_report(
+            workspace, outcome, None, "", []
+        )
+
+        marker = "> 🧾 **run ID**: `fedcba9876543210fedcba9876543210`"
+        self.assertIn(marker, report)
+        self.assertEqual(
+            bot.ensure_run_id_marker(report, workspace).count(
+                "> 🧾 **run ID**:"
+            ),
+            1,
+        )
+        rewritten = bot.ensure_run_id_marker(
+            "본문\n\n> 🧾 **run ID**: `wrong-one`\n"
+            "> 🧾 **run ID**: `wrong-two`",
+            workspace,
+        )
+        self.assertEqual(rewritten.count("> 🧾 **run ID**:"), 1)
+        self.assertIn(marker, rewritten)
+        self.assertNotIn("wrong-one", rewritten)
+        self.assertNotIn("wrong-two", rewritten)
+
+
 class ClientInitializationTest(unittest.TestCase):
     # Mutation caught: removing eager chat-resource initialization moves cold
     # OpenAI setup into the first request's event-loop turn and blocks the loop.
@@ -302,6 +334,7 @@ class NoStageAfterCancellationTest(CancellationTestCase):
         delivered = "\n".join(message.replies[1:] + message.channel.sent)
         self.assertIn("미완료", delivered)
         self.assertNotIn("완료 시간", delivered)
+        self.assertRegex(delivered, r"> 🧾 \*\*run ID\*\*: `[^`]+`")
 
 
 class PostModelCancellationBoundaryTest(CancellationTestCase):

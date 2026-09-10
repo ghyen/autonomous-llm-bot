@@ -24,16 +24,26 @@ Two rules are structural rather than documented:
 """
 
 import json
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ledger import ResearchLedger
 from run_workspace import atomic_write
+from workspace_io import REVISION_PATTERN
 
 
 SCHEMA = 4
 SUMMARY_VERSION = 2
 FILE_NAME = "state.json"
+TASK_CONTRACT_VERSION = 1
+ARTIFACT_MANIFEST_VERSION = 1
+ARTIFACT_MANIFEST_MAX_ITEMS = 24
+TASK_GOAL_MAX_CHARS = 4000
+
+
+def _has_unsafe_path_chars(value):
+    return any(unicodedata.category(char).startswith("C") for char in value)
 
 # 살아 있는 런의 상태. 시작 시 이 값이 남아 있으면 종료 이벤트 없이 끝난 런이다.
 RUNNING = "running"
@@ -61,6 +71,74 @@ def _dump(record):
     return json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")
 
 
+def _normalize_task_contract(value):
+    if not isinstance(value, dict):
+        return None
+    if value.get("version") != TASK_CONTRACT_VERSION:
+        return None
+    origin_message_id = value.get("origin_message_id")
+    if (
+        not isinstance(origin_message_id, int)
+        or isinstance(origin_message_id, bool)
+        or origin_message_id < 1
+    ):
+        return None
+    goal = value.get("goal")
+    if not isinstance(goal, str):
+        return None
+    goal = goal.strip()
+    if not goal:
+        return None
+    return {
+        "version": TASK_CONTRACT_VERSION,
+        "origin_message_id": origin_message_id,
+        "goal": goal[:TASK_GOAL_MAX_CHARS],
+    }
+
+
+def _normalize_artifact_manifest(value):
+    empty = {"version": ARTIFACT_MANIFEST_VERSION, "items": []}
+    if not isinstance(value, dict) or value.get("version") != ARTIFACT_MANIFEST_VERSION:
+        return empty
+    raw_items = value.get("items")
+    if not isinstance(raw_items, list):
+        return empty
+    items = []
+    seen = set()
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        path = raw_item.get("path")
+        if not isinstance(path, str) or not path or len(path) > 512:
+            continue
+        path_parts = Path(path).parts
+        if (
+            Path(path).is_absolute()
+            or ".." in path_parts
+            or _has_unsafe_path_chars(path)
+        ):
+            continue
+        kind = raw_item.get("kind")
+        if kind not in ("workspace_file", "tool_output"):
+            continue
+        step = raw_item.get("step")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+            continue
+        item = {"path": path, "kind": kind, "step": step}
+        if "revision" in raw_item:
+            revision = raw_item.get("revision")
+            if not isinstance(revision, str) or not REVISION_PATTERN.fullmatch(revision):
+                continue
+            item["revision"] = revision
+        if path in seen:
+            continue
+        seen.add(path)
+        items.append(item)
+        if len(items) >= ARTIFACT_MANIFEST_MAX_ITEMS:
+            break
+    return {"version": ARTIFACT_MANIFEST_VERSION, "items": items}
+
+
 def save(
     workspace,
     message_id,
@@ -73,6 +151,8 @@ def save(
     tool_fingerprints,
     trajectory_gap_step,
     state=RUNNING,
+    task_contract=None,
+    artifact_manifest=None,
 ):
     """Replace the run's record atomically.
 
@@ -105,6 +185,8 @@ def save(
             for fingerprint, step in tool_fingerprints or ()
         ],
         "trajectory_gap_step": trajectory_gap_step,
+        "task_contract": _normalize_task_contract(task_contract),
+        "artifact_manifest": _normalize_artifact_manifest(artifact_manifest),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -175,6 +257,10 @@ def load(workspace):
     payload["summary"] = str(payload["summary"] or "")
     payload["tail"] = [item for item in payload["tail"] if isinstance(item, dict)]
     payload["tool_fingerprints"] = normalized_fingerprints
+    payload["task_contract"] = _normalize_task_contract(payload.get("task_contract"))
+    payload["artifact_manifest"] = _normalize_artifact_manifest(
+        payload.get("artifact_manifest")
+    )
     return payload
 
 
