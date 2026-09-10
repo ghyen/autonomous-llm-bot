@@ -3577,7 +3577,22 @@ def bound_local_fallback_output(text: str) -> str:
     )
 
 
-def build_incomplete_report(outcome, ledger, rolling_summary: str, messages_payload: list) -> str:
+RUN_ID_MARKER_TEMPLATE = "> 🧾 **run ID**: `{run_id}`"
+
+
+def run_id_marker(workspace) -> str:
+    return RUN_ID_MARKER_TEMPLATE.format(run_id=str(workspace.run_id))
+
+
+def ensure_run_id_marker(text: str, workspace) -> str:
+    text = str(text or "").rstrip()
+    marker = run_id_marker(workspace)
+    return text if marker in text else (text + "\n\n" + marker).strip()
+
+
+def build_incomplete_report(
+    workspace, outcome, ledger, rolling_summary: str, messages_payload: list
+) -> str:
     """Render collected state without starting another model stage.
 
     Cancellation and model-timeout paths cannot safely ask the same backend to
@@ -3603,7 +3618,7 @@ def build_incomplete_report(outcome, ledger, rolling_summary: str, messages_payl
         "## 최근 실행 기록\n" + (tail or "보존된 실행 기록이 없습니다."),
         closing_section,
     ]
-    return "\n\n".join(sections)
+    return ensure_run_id_marker("\n\n".join(sections), workspace)
 
 
 def format_full_discord_output(text: str) -> str:
@@ -4321,6 +4336,7 @@ async def on_message(message: discord.Message):
         except RunCancelled as direct_cancelled:
             outcome.settle(outcome_mod.STOPPED, direct_cancelled.reason)
             direct_report = build_incomplete_report(
+                workspace,
                 outcome,
                 channel_ledger[message.channel.id],
                 channel_summary[message.channel.id],
@@ -4341,6 +4357,7 @@ async def on_message(message: discord.Message):
                 f"마감 초과: {direct_timeout.stage} {direct_timeout.seconds:g}s",
             )
             direct_report = build_incomplete_report(
+                workspace,
                 outcome,
                 channel_ledger[message.channel.id],
                 channel_summary[message.channel.id],
@@ -5463,6 +5480,7 @@ async def on_message(message: discord.Message):
                             f"> ⏱️ **경과 시간**: {elapsed_cp_str} (총 {total_tools_executed}개 도구 실행 완료)\n"
                             f"> ⚡ **[자율 연장]** 목표 달성을 위해 다음 구간(Step {iteration+2} ~ {iteration+1+CHECKPOINT_INTERVAL})으로 계속 진행합니다... *(중단: `!stop`)*"
                         )
+                        cp_message = ensure_run_id_marker(cp_message, workspace)
 
                         chunks_cp = []
                         rem_cp = cp_message
@@ -5667,7 +5685,9 @@ async def on_message(message: discord.Message):
         no_follow_up_stage = outcome.reason in (outcome_mod.STOPPED, outcome_mod.FAILED)
         uses_local_fallback = no_follow_up_stage
         if no_follow_up_stage:
-            final_raw = build_incomplete_report(outcome, ledger, rolling_summary, messages_payload)
+            final_raw = build_incomplete_report(
+                workspace, outcome, ledger, rolling_summary, messages_payload
+            )
             if stage_failure_note:
                 # 왜 보고서가 없는지는 사용자가 알아야 한다. 이 줄은 채널로만 가고
                 # 종료 기록에는 예외 종류만 남는다.
@@ -5742,7 +5762,7 @@ async def on_message(message: discord.Message):
             except RunCancelled as synthesis_cancelled:
                 uses_local_fallback = True
                 final_raw = build_incomplete_report(
-                    outcome, ledger, rolling_summary, messages_payload
+                    workspace, outcome, ledger, rolling_summary, messages_payload
                 )
                 final_raw += (
                     "\n\n> 보고서 합성 취소: `"
@@ -5759,7 +5779,7 @@ async def on_message(message: discord.Message):
             except StageTimeout as synthesis_timeout:
                 uses_local_fallback = True
                 final_raw = build_incomplete_report(
-                    outcome, ledger, rolling_summary, messages_payload
+                    workspace, outcome, ledger, rolling_summary, messages_payload
                 )
                 final_raw += (
                     "\n\n> 보고서 합성 마감 초과: `"
@@ -5776,7 +5796,7 @@ async def on_message(message: discord.Message):
             except Exception as synthesis_error:
                 uses_local_fallback = True
                 final_raw = build_incomplete_report(
-                    outcome, ledger, rolling_summary, messages_payload
+                    workspace, outcome, ledger, rolling_summary, messages_payload
                 )
                 failure = _clip_summary_text(
                     f"{type(synthesis_error).__name__}: {synthesis_error}", 500
@@ -5830,7 +5850,10 @@ async def on_message(message: discord.Message):
                     + ", ".join(f"`{name}`" for name in refused_companion_calls)
                 )
             header_text = "" if outcome.is_completed else f"**{outcome.label}**\n\n"
-            final_text_with_footer = header_text + final_text + footer_text
+            final_text_with_footer = ensure_run_id_marker(
+                header_text + final_text + footer_text,
+                workspace,
+            )
 
         if uses_local_fallback:
             final_text_with_footer = bound_local_fallback_output(final_text_with_footer)
@@ -5856,7 +5879,10 @@ async def on_message(message: discord.Message):
         # earlier reason was, this path did not deliver a finished investigation.
         # 예외 문자열 대신 종류만 전달한다. 예외 본문은 실패 지점의 값을 그대로
         # 물고 오므로 채널·로그·표준 출력 어디에도 남기지 않는다(이슈 #11).
-        err_msg = f"⚠️ **{outcome_mod.LABELS[outcome_mod.FAILED]}** — 작업 도중 예외 발생: `{type(e).__name__}`\n📁 현재까지의 실행 기록은 시스템 로그에 저장되었습니다."
+        err_msg = ensure_run_id_marker(
+            f"⚠️ **{outcome_mod.LABELS[outcome_mod.FAILED]}** — 작업 도중 예외 발생: `{type(e).__name__}`\n📁 현재까지의 실행 기록은 시스템 로그에 저장되었습니다.",
+            workspace,
+        )
         # 같은 이유로 종료 기록도 FAILED로 남긴다. outcome.reason은 선착순이라
         # 이미 completed일 수 있는데, 이 경로는 완료된 조사를 전달하지 못했다.
         log_run_end(

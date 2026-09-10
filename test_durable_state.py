@@ -1449,6 +1449,7 @@ class InterimReportNamingTest(DurableStateTestCase):
         )
         self.assertIn("중간 진행 보고서", channel_text)
         self.assertNotIn("체크포인트", channel_text)
+        self.assertRegex(channel_text, r"> 🧾 \*\*run ID\*\*: `[^`]+`")
 
     def test_5_the_documentation_does_not_call_it_a_persistent_checkpoint(self):
         # Production mutation caught: documentation still promising a recovery
