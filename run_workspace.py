@@ -31,6 +31,7 @@ READ_HASH_LIMIT = 128
 TERMINAL_STATUSES = frozenset(
     ("completed", "stopped", "exhausted", "failed", "interrupted")
 )
+RESUMABLE_STATUSES = TERMINAL_STATUSES - {"completed"}
 REVISION_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 
 
@@ -370,6 +371,24 @@ class RunCatalog:
                 if channel_id is None or workspace.channel_id == channel_id
             ]
 
+    def resumable_workspaces(self, owner_id, channel_id):
+        with self._lock:
+            return sorted(
+                (
+                    workspace
+                    for workspace in self._runs.values()
+                    if workspace.owner_id == owner_id
+                    and workspace.channel_id == channel_id
+                    and workspace.status in RESUMABLE_STATUSES
+                ),
+                key=lambda item: (
+                    str(item.updated_at),
+                    str(item.created_at),
+                    item.run_id,
+                ),
+                reverse=True,
+            )
+
     def _reset_conflicts(self, owner_id, channel_id):
         return any(
             reserved_owner == owner_id or reserved_channel == channel_id
@@ -415,23 +434,35 @@ class RunCatalog:
             finally:
                 self._reset_reservations.pop(key, None)
 
-    def acquire(self, owner_id, channel_id):
+    def _activate(self, workspace, channel_id):
+        workspace.channel_id = channel_id
+        workspace.status = "active"
+        workspace.updated_at = _now()
+        workspace.clear_read_cache()
+        workspace.persist()
+        return workspace
+
+    def acquire(self, owner_id, channel_id, resume_run_id=None):
         with self._lock:
             if self._reset_conflicts(owner_id, channel_id):
                 raise RunActiveError("reset/clear is in progress")
             selected_id = self._selected.pop((owner_id, channel_id), None)
             workspace = self._runs.get(selected_id) if selected_id else None
-            if workspace is None or workspace.status != "prepared":
-                workspace = self._create(
-                    owner_id, channel_id, "active", inherit_canonical=True
-                )
-            else:
-                workspace.channel_id = channel_id
-                workspace.status = "active"
-                workspace.updated_at = _now()
-                workspace.clear_read_cache()
-                workspace.persist()
-            return workspace
+            if workspace is not None and workspace.status == "prepared":
+                return self._activate(workspace, channel_id)
+
+            workspace = self._runs.get(str(resume_run_id)) if resume_run_id else None
+            if (
+                workspace is not None
+                and workspace.owner_id == owner_id
+                and workspace.channel_id == channel_id
+                and workspace.status in RESUMABLE_STATUSES
+            ):
+                return self._activate(workspace, channel_id)
+
+            return self._create(
+                owner_id, channel_id, "active", inherit_canonical=True
+            )
 
     def prepare(self, owner_id, channel_id):
         with self._lock:

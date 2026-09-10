@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from test_support import FakeMessage
 
 import bot
+from ledger import ResearchLedger
 
 
 TOOLS = [{
@@ -184,6 +185,226 @@ class TokenCountPayloadTest(unittest.TestCase):
 
 
 class ContextPreflightTest(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_compaction_keeps_the_contract_and_manifest(self):
+        ledger = ResearchLedger()
+        task_contract = {
+            "version": 1,
+            "origin_message_id": 101,
+            "goal": "원래 장애 조사",
+        }
+        artifact_manifest = {
+            "version": 1,
+            "items": [{
+                "path": "findings.md",
+                "kind": "workspace_file",
+                "step": 8,
+                "revision": "sha256:" + "b" * 64,
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            messages = [{
+                "role": "system",
+                "content": bot.build_system_content(workspace, ledger, "summary"),
+            }, {
+                "role": "user",
+                "content": "이전 작업을 이어서 진행해줘",
+            }]
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000, 4000]),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    "summary",
+                    76,
+                    4096,
+                    {"tools": []},
+                    ledger=ledger,
+                    resume_context=True,
+                    task_contract=task_contract,
+                    artifact_manifest=artifact_manifest,
+                )
+
+        self.assertIn("원래 장애 조사", result.messages[0]["content"])
+        self.assertIn("findings.md", result.messages[0]["content"])
+
+    async def test_resume_context_compacts_summary_before_group_trim(self):
+        full_summary = bot.format_tiered_summary(
+            tier3="절차 " * 500,
+            tier3_through=20,
+            tier2_lines=[
+                f"Step {i}: 상세 인덱스" + (" 내용" * 20)
+                for i in range(1, 21)
+            ],
+            discoveries=[f"- 발견 {i}" for i in range(1, 11)],
+        )
+        ledger = ResearchLedger()
+        ledger.set_goal("권위 상태")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            messages = [{
+                "role": "system",
+                "content": bot.build_system_content(workspace, ledger, full_summary),
+            }, {
+                "role": "user",
+                "content": "이전 작업을 이어서 진행해줘",
+            }]
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000, 4000]),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    full_summary,
+                    76,
+                    4096,
+                    {"tools": []},
+                    ledger=ledger,
+                    resume_context=True,
+                )
+
+        self.assertLessEqual(result.input_tokens, result.input_budget)
+        self.assertGreater(result.summary_compactions, 0)
+        self.assertIn("Step 20", result.summary)
+        self.assertNotIn("Step 1:", result.summary)
+        self.assertIn(ledger.render(), result.messages[0]["content"])
+        self.assertEqual(
+            [bot._msg_role(item) for item in result.messages],
+            ["system", "user"],
+        )
+
+    async def test_resume_recompacts_summary_after_rollover_rebuilds_it(self):
+        expanded_summary = bot.format_tiered_summary(
+            tier3="절차 " * 500,
+            tier3_through=20,
+            tier2_lines=[
+                f"Step {i}: 상세 인덱스" + (" 내용" * 20)
+                for i in range(1, 21)
+            ],
+            discoveries=[f"- 발견 {i}" for i in range(1, 11)],
+        )
+        ledger = ResearchLedger()
+        ledger.set_goal("권위 상태")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            expanded_messages = [{
+                "role": "system",
+                "content": bot.build_system_content(
+                    workspace, ledger, expanded_summary
+                ),
+            }, {
+                "role": "user",
+                "content": "[롤링 컨텍스트 재개] 계속하세요.",
+            }]
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000] * 8 + [4000]),
+            ), patch.object(
+                bot,
+                "rollover_agent_context",
+                AsyncMock(return_value=(expanded_messages, expanded_summary)),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    expanded_messages,
+                    expanded_summary,
+                    76,
+                    4096,
+                    {"tools": []},
+                    ledger=ledger,
+                    resume_context=True,
+                )
+
+        self.assertLess(len(result.summary), len(expanded_summary))
+
+    async def test_over_budget_rolls_once_then_trims_complete_groups(self):
+        messages = _messages(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(side_effect=[9000, 9000, 4000]),
+            ), patch.object(
+                bot,
+                "rollover_agent_context",
+                AsyncMock(return_value=(messages, "summary")),
+            ) as rollover:
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    "",
+                    12,
+                    4096,
+                    {"tools": TOOLS},
+                )
+
+        self.assertEqual(result.input_budget, 4864)
+        rollover.assert_awaited_once()
+        self.assertEqual(result.input_tokens, 4000)
+        self.assertTrue(bot.validate_chat_payload(result.messages).ok)
+        self.assertEqual(
+            len([m for m in result.messages if bot._msg_role(m) == "tool"]),
+            1,
+        )
+        self.assertEqual(result.summary, "summary")
+        self.assertEqual(result.trim_passes, 1)
+
+    async def test_over_budget_fails_closed_after_all_trim_passes(self):
+        messages = _messages(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(return_value=9000),
+            ), patch.object(
+                bot,
+                "rollover_agent_context",
+                AsyncMock(return_value=(messages, "summary")),
+            ):
+                with self.assertRaises(bot.AgentContextBudgetExceeded):
+                    await bot.prepare_agent_request_payload(
+                        workspace,
+                        messages,
+                        "",
+                        12,
+                        4096,
+                        {"tools": TOOLS},
+                    )
+
+    async def test_over_budget_reduces_output_cap_before_rejecting(self):
+        messages = _messages(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=tmp)
+            with patch.object(
+                bot,
+                "count_agent_input_tokens",
+                AsyncMock(return_value=7548),
+            ), patch.object(
+                bot,
+                "rollover_agent_context",
+                AsyncMock(return_value=(messages, "summary")),
+            ):
+                result = await bot.prepare_agent_request_payload(
+                    workspace,
+                    messages,
+                    "",
+                    76,
+                    4096,
+                    {"tools": TOOLS},
+                )
+
+        self.assertEqual(result.input_tokens, 7548)
+        self.assertEqual(result.output_max_tokens, 1412)
+        self.assertEqual(result.input_budget, 7548)
+
     async def test_over_budget_adapts_output_limit_before_rejecting(self):
         messages = _messages(3)
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,62 +465,6 @@ class ContextPreflightTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("call-1", json.dumps(result.messages, ensure_ascii=False))
         self.assertNotIn("call-2", json.dumps(result.messages, ensure_ascii=False))
         self.assertIn("keep this steering", json.dumps(result.messages, ensure_ascii=False))
-
-    async def test_over_budget_rolls_once_then_trims_complete_groups(self):
-        messages = _messages(3)
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = SimpleNamespace(root=tmp)
-            with patch.object(
-                bot,
-                "count_agent_input_tokens",
-                AsyncMock(side_effect=[9000, 9000, 4000]),
-            ), patch.object(
-                bot,
-                "rollover_agent_context",
-                AsyncMock(return_value=(messages, "summary")),
-            ) as rollover:
-                result = await bot.prepare_agent_request_payload(
-                    workspace,
-                    messages,
-                    "",
-                    12,
-                    4096,
-                    {"tools": TOOLS},
-                )
-
-        self.assertEqual(result.input_budget, 4864)
-        rollover.assert_awaited_once()
-        self.assertEqual(result.input_tokens, 4000)
-        self.assertTrue(bot.validate_chat_payload(result.messages).ok)
-        self.assertEqual(
-            len([m for m in result.messages if bot._msg_role(m) == "tool"]),
-            1,
-        )
-        self.assertEqual(result.summary, "summary")
-        self.assertEqual(result.trim_passes, 1)
-
-    async def test_over_budget_fails_closed_after_all_trim_passes(self):
-        messages = _messages(3)
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = SimpleNamespace(root=tmp)
-            with patch.object(
-                bot,
-                "count_agent_input_tokens",
-                AsyncMock(return_value=9000),
-            ), patch.object(
-                bot,
-                "rollover_agent_context",
-                AsyncMock(return_value=(messages, "summary")),
-            ):
-                with self.assertRaises(bot.AgentContextBudgetExceeded):
-                    await bot.prepare_agent_request_payload(
-                        workspace,
-                        messages,
-                        "",
-                        12,
-                        4096,
-                        {"tools": TOOLS},
-                    )
 
     async def test_unavailable_counter_uses_conservative_fallback(self):
         messages = _messages(1)

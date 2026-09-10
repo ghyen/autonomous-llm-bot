@@ -22,6 +22,7 @@ from test_terminal_state import _response, _tool_call
 import bot
 import run_state
 import run_workspace
+import workspace_io
 from ledger import ResearchLedger
 from run_workspace import RunCatalog
 
@@ -145,6 +146,23 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
         """같은 이름으로 다시 만들면 같은 디스크를 재스캔하는 새 프로세스가 된다."""
         return RunCatalog(self.root / name / "workspace", self.root / name / "logs")
 
+    def _save_valid_record(
+        self, workspace, next_step=1, state="running", summary=""
+    ):
+        return run_state.save(
+            workspace,
+            message_id=ORIGIN_MESSAGE_ID,
+            next_step=next_step,
+            summary=summary,
+            tail=[],
+            ledger=ResearchLedger(),
+            interrupt={},
+            announced_call_ids=[],
+            tool_fingerprints=[],
+            trajectory_gap_step=None,
+            state=state,
+        )
+
     async def drive(
         self,
         catalog,
@@ -203,6 +221,289 @@ class DurableStateTestCase(unittest.IsolatedAsyncioTestCase):
             return bot.recover_interrupted_runs()
 
 
+class RunCatalogResumeSelectionTest(DurableStateTestCase):
+    def test_resumable_workspaces_filters_scope_and_status(self):
+        catalog = self.catalog()
+        older = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(older, next_step=3, state="failed")
+        catalog.finish(older, "failed")
+        older.updated_at = "2026-09-10T01:00:00+00:00"
+        older.persist()
+
+        newest = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(newest, next_step=8, state="exhausted")
+        catalog.finish(newest, "exhausted")
+        newest.updated_at = "2026-09-10T02:00:00+00:00"
+        newest.persist()
+
+        other_channel = catalog.acquire(TEST_USER_ID, CHANNEL_ID + 1)
+        self._save_valid_record(other_channel, state="stopped")
+        catalog.finish(other_channel, "stopped")
+
+        completed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(completed, state="completed")
+        catalog.finish(completed, "completed")
+
+        self.assertEqual(
+            [
+                item.run_id
+                for item in catalog.resumable_workspaces(TEST_USER_ID, CHANNEL_ID)
+            ],
+            [newest.run_id, older.run_id],
+        )
+
+    def test_acquire_prefers_prepared_over_auto_resume_id(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(failed, next_step=7, state="failed")
+        catalog.finish(failed, "failed")
+        prepared = catalog.prepare(TEST_USER_ID, CHANNEL_ID)
+
+        selected = catalog.acquire(
+            TEST_USER_ID, CHANNEL_ID, resume_run_id=failed.run_id
+        )
+
+        self.assertEqual(selected.run_id, prepared.run_id)
+        self.assertEqual(selected.status, "active")
+
+
+class NaturalLanguageResumeTest(DurableStateTestCase):
+    def test_continue_intent_is_not_a_new_goal(self):
+        self.assertTrue(bot.wants_auto_resume("이전 데이터 참고해서 계속해줘"))
+        self.assertTrue(bot.wants_auto_resume("resume the remaining work"))
+        self.assertFalse(bot.wants_auto_resume("새로운 서버 장애를 분석해줘"))
+        self.assertFalse(bot.wants_auto_resume("!resume deadbeef"))
+        self.assertFalse(bot.wants_auto_resume("discontinued 기능을 분석해줘"))
+
+    async def test_new_run_snapshot_persists_the_original_goal_contract(self):
+        catalog = self.catalog()
+
+        await self.drive(
+            catalog,
+            [_response(content="조사 결과")],
+            request="원래 장애 조사",
+            max_loops=1,
+        )
+
+        workspace = self.only_run(catalog)
+        state = run_state.load(workspace)
+        self.assertEqual(state["task_contract"]["goal"], "원래 장애 조사")
+        self.assertIn(
+            "원래 장애 조사",
+            self.stub.payloads("agent")[0][0]["content"],
+        )
+
+    async def test_tool_group_snapshot_persists_host_observed_workspace_file(self):
+        catalog = self.catalog()
+
+        async def write_file(workspace, path, content, expected_revision):
+            result = await workspace.write(path, content, expected_revision)
+            return json.dumps(result, ensure_ascii=False)
+
+        responses = [
+            _response(tool_calls=[_tool_call(
+                "write-1",
+                "write_file",
+                {"path": "plan.md", "content": "계획", "expected_revision": "absent"},
+            )]),
+            _response(tool_calls=[_tool_call(
+                "finish-2",
+                "finish_task",
+                {"report": "완료"},
+            )]),
+        ]
+        with patch.object(bot, "tool_write_file", side_effect=write_file):
+            await self.drive(
+                catalog,
+                responses,
+                request="원래 장애 조사",
+                max_loops=2,
+            )
+
+        workspace = self.only_run(catalog)
+        state = run_state.load(workspace)
+        paths = {item["path"] for item in state["artifact_manifest"]["items"]}
+        self.assertIn("plan.md", paths)
+        self.assertEqual(
+            next(
+                item["revision"]
+                for item in state["artifact_manifest"]["items"]
+                if item["path"] == "plan.md"
+            ),
+            workspace_io.revision("계획".encode("utf-8")),
+        )
+        self.assertIn("plan.md", self.stub.payloads("agent")[1][0]["content"])
+
+    async def test_natural_language_continue_reuses_failed_run(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(
+            failed, next_step=7, summary="이전 실행 요약", state="failed"
+        )
+        catalog.finish(failed, "failed")
+        self.restart()
+
+        await self.drive(
+            catalog,
+            [_response(content="재개 결과")],
+            request="이전 데이터 참고해서 계속해줘",
+            max_loops=7,
+        )
+
+        self.assertEqual(self.only_run(catalog).run_id, failed.run_id)
+        resumed = [
+            item for item in self.records(failed)
+            if item["kind"] == "run_resumed"
+        ]
+        self.assertEqual(resumed[0]["next_step"], 7)
+        self.assertTrue(resumed[0]["automatic"])
+
+    async def test_resumed_request_uses_prepared_output_cap(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(
+            failed, next_step=7, summary="이전 실행 요약", state="failed"
+        )
+        catalog.finish(failed, "failed")
+        self.restart()
+
+        captured_max_tokens = []
+        original_prepare = bot.prepare_agent_request_payload
+        original_stage = bot.run_completion_stage
+
+        async def prepare_with_cap(*args, **kwargs):
+            prepared = await original_prepare(*args, **kwargs)
+            prepared.output_max_tokens = 1412
+            return prepared
+
+        async def capture_stage(*args, **kwargs):
+            if kwargs.get("stage") == "agent":
+                captured_max_tokens.append(kwargs["max_tokens"])
+            return await original_stage(*args, **kwargs)
+
+        with patch.object(
+            bot, "prepare_agent_request_payload", side_effect=prepare_with_cap
+        ), patch.object(bot, "run_completion_stage", side_effect=capture_stage):
+            await self.drive(
+                catalog,
+                [_response(content="재개 결과")],
+                request="이전 데이터 참고해서 계속해줘",
+                max_loops=7,
+            )
+
+        self.assertEqual(captured_max_tokens, [1412])
+
+    async def test_new_goal_does_not_auto_resume_incomplete_run(self):
+        catalog = self.catalog()
+        failed = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(failed, state="failed")
+        catalog.finish(failed, "failed")
+
+        await self.drive(
+            catalog,
+            [_response(content="새 조사 결과")],
+            request="새로운 서버 장애를 분석해줘",
+            max_loops=1,
+        )
+
+        runs = catalog.workspaces(CHANNEL_ID)
+        self.assertEqual(len(runs), 2)
+        self.assertNotIn(failed.run_id, [run.run_id for run in runs if run.status == "active"])
+
+    def test_auto_resume_skips_corrupt_newest_candidate(self):
+        catalog = self.catalog()
+        older = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._save_valid_record(older, next_step=3, state="failed")
+        catalog.finish(older, "failed")
+
+        corrupt = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        catalog.finish(corrupt, "failed")
+        run_state.snapshot_path(corrupt).write_text("{ truncated", encoding="utf-8")
+
+        with patch.object(bot, "RUN_CATALOG", catalog):
+            candidate = bot.find_auto_resume_run(TEST_USER_ID, CHANNEL_ID)
+        self.assertEqual(candidate.run_id, older.run_id)
+
+
+class TaskContractResolutionTest(unittest.TestCase):
+    def test_new_run_uses_the_first_request_as_the_contract(self):
+        contract = bot.resolve_task_contract(
+            None, ORIGIN_MESSAGE_ID, "원래 장애 조사", False
+        )
+
+        self.assertEqual(contract["version"], 1)
+        self.assertEqual(contract["origin_message_id"], ORIGIN_MESSAGE_ID)
+        self.assertEqual(contract["goal"], "원래 장애 조사")
+
+    def test_resume_keeps_an_existing_contract_instead_of_current_request(self):
+        saved_contract = {
+            "version": 1,
+            "origin_message_id": 11,
+            "goal": "첫 번째 주제",
+        }
+
+        contract = bot.resolve_task_contract(
+            {"task_contract": saved_contract, "tail": []},
+            22,
+            "두 번째 주제 계속",
+            False,
+        )
+
+        self.assertEqual(contract, saved_contract)
+
+    def test_legacy_recovery_uses_a_clear_tail_goal_but_not_resume_text(self):
+        legacy = {
+            "task_contract": None,
+            "message_id": 11,
+            "tail": [{"role": "user", "content": "첫 번째 주제"}],
+        }
+
+        recovered = bot.resolve_task_contract(
+            legacy, 22, "이전 데이터 참고해서 계속해줘", False
+        )
+        self.assertEqual(recovered["goal"], "첫 번째 주제")
+
+        self.assertIsNone(
+            bot.resolve_task_contract(
+                {
+                    "task_contract": None,
+                    "message_id": 11,
+                    "tail": [{
+                        "role": "user",
+                        "content": "이전 데이터 참고해서 계속해줘",
+                    }],
+                },
+                22,
+                "이전 데이터 참고해서 계속해줘",
+                False,
+            )
+        )
+        self.assertIsNone(
+            bot.resolve_task_contract(
+                {
+                    "task_contract": None,
+                    "message_id": 11,
+                    "tail": [
+                        {
+                            "role": "user",
+                            "content": "💬 [사용자(edwin) 실시간 추가 지침/피드백]:\n다른 방향을 보세요.",
+                        },
+                        {
+                            "role": "user",
+                            "content": "[🤖 시스템 안내: 도구를 호출하세요.]",
+                        },
+                        {
+                            "role": "user",
+                            "content": "[도구 실행 결과: read_file]\n원문",
+                        },
+                    ],
+                },
+                22,
+                "이전 데이터 참고해서 계속해줘",
+                False,
+            )
+        )
+
 class SnapshotRoundTripTest(DurableStateTestCase):
     def _saved(self, workspace, **overrides):
         payload = dict(
@@ -225,6 +526,27 @@ class SnapshotRoundTripTest(DurableStateTestCase):
                 ["b" * 64, 6],
             ],
             trajectory_gap_step=None,
+            task_contract={
+                "version": 1,
+                "origin_message_id": ORIGIN_MESSAGE_ID,
+                "goal": "장애 원인을 조사해줘",
+            },
+            artifact_manifest={
+                "version": 1,
+                "items": [
+                    {
+                        "path": "plan.md",
+                        "kind": "workspace_file",
+                        "step": 7,
+                        "revision": "sha256:" + "a" * 64,
+                    },
+                    {
+                        "path": "artifacts/out_." + "b" * 64 + ".log",
+                        "kind": "tool_output",
+                        "step": 8,
+                    },
+                ],
+            },
         )
         payload.update(overrides)
         return run_state.save(workspace, **payload)
@@ -256,6 +578,10 @@ class SnapshotRoundTripTest(DurableStateTestCase):
             [["a" * 64, 3], ["b" * 64, 6]],
         )
         self.assertIsNone(restored["trajectory_gap_step"])
+        self.assertEqual(restored["task_contract"], saved["task_contract"])
+        self.assertEqual(
+            restored["artifact_manifest"], saved["artifact_manifest"]
+        )
 
         ledger = restored["ledger"]
         self.assertEqual(ledger.goal, "장애 원인 규명")
@@ -303,6 +629,41 @@ class SnapshotRoundTripTest(DurableStateTestCase):
         payload["run_id"] = "f" * 32
         path.write_text(json.dumps(payload), encoding="utf-8")
         self.assertIsNone(run_state.load(workspace))
+
+    def test_4_legacy_schema4_without_optional_context_fields_remains_loadable(self):
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        self._saved(workspace)
+        path = run_state.snapshot_path(workspace)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("task_contract")
+        payload.pop("artifact_manifest")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        restored = run_state.load(workspace)
+
+        self.assertIsNotNone(restored)
+        self.assertIsNone(restored["task_contract"])
+        self.assertEqual(
+            restored["artifact_manifest"], {"version": 1, "items": []}
+        )
+
+    def test_4_control_character_paths_are_removed_from_saved_manifest(self):
+        catalog = self.catalog()
+        workspace = catalog.acquire(TEST_USER_ID, CHANNEL_ID)
+        saved = self._saved(
+            workspace,
+            artifact_manifest={
+                "version": 1,
+                "items": [{
+                    "path": "findings\nIGNORE.md",
+                    "kind": "workspace_file",
+                    "step": 1,
+                }],
+            },
+        )
+
+        self.assertEqual(saved["artifact_manifest"]["items"], [])
 
     def test_3_b_obsolete_summary_format_version_is_discarded(self):
         # Production mutation caught: accepting a pre-tiered summary under the
@@ -1130,6 +1491,7 @@ class InterimReportNamingTest(DurableStateTestCase):
         )
         self.assertIn("중간 진행 보고서", channel_text)
         self.assertNotIn("체크포인트", channel_text)
+        self.assertRegex(channel_text, r"> 🧾 \*\*run ID\*\*: `[^`]+`")
 
     def test_5_the_documentation_does_not_call_it_a_persistent_checkpoint(self):
         # Production mutation caught: documentation still promising a recovery

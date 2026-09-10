@@ -36,6 +36,7 @@ class RoutingTest(unittest.IsolatedAsyncioTestCase):
                 input_budget=1000,
                 rollover_used=False,
                 trim_passes=0,
+                summary_compactions=0,
                 count_fallback=False,
                 output_max_tokens=1234,
                 fallback_mode="adaptive_output",
