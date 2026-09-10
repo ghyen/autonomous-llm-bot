@@ -574,6 +574,11 @@ TOOL_LOOP_GUARD_WINDOW = 8
 # 권위 있는 상태 갱신이라 막으면 상태 기록이 멈추고, write_file은 CAS가 이미
 # 두 번째 동일 쓰기를 conflict로 돌려세운다.
 TOOL_LOOP_GUARD_TOOLS = ("bash_exec", "read_file", "web_search")
+# 루프 가드는 윈도우(최근 N스텝)만 기억해서 윈도우가 밀리면 같은 결정적 실패를
+# 무한히 재시도한다(read_file not_found 75회 실측). 확정 실패는 만료 없이
+# 기억하고, 시스템 프롬프트에도 누적해서 모델이 계획 단계에서 우회하게 한다.
+KNOWN_BAD_CALLS_MAX = 20
+AVOIDANCE_BLOCK_MAX_CHARS = 1200
 AGENT_STEP_MAX_TOKENS = CONFIG.agent_step_max_tokens
 REASONING_MAX_TOKENS = CONFIG.reasoning_max_tokens
 ADAPTIVE_REASONING = CONFIG.adaptive_reasoning
@@ -663,6 +668,14 @@ def _blocked_tool_result(
             "확보된 데이터를 가공하거나 새로운 가설을 시도하세요. 의도적인 "
             "재시도라면 force=true를 사용하세요."
         )
+    if reason == "known_failure" and first_step is not None:
+        payload["first_step"] = int(first_step)
+        payload["directive"] = (
+            f"[확정 실패 차단]: 이 호출은 Step {int(first_step)}에서 이미 "
+            "결정적으로 실패했습니다. 같은 인자로 재시도해도 같은 결과가 "
+            "나옵니다. 다른 경로나 인자를 시도하세요. 실제 상태가 "
+            "바뀌었을 때만 force=true를 사용하세요."
+        )
     return json.dumps(
         payload,
         ensure_ascii=False,
@@ -705,6 +718,117 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
     if tool_name == "record_state":
         return result.partition("\n")[0] == "[record_state status: refused]"
     return False
+
+
+# 확정 실패(not_found 등)는 재시도해도 결과가 안 바뀌므로 만료 없이 기억한다.
+# _tool_fingerprint와 같은 effective key를 써서 같은 호출을 식별한다.
+DETERMINISTIC_TOOL_ERRORS = ("not_found",)
+
+
+def _known_bad_target(tool_name: str, arguments: dict) -> str:
+    key = {
+        "bash_exec": "command",
+        "read_file": "path",
+        "web_search": "query",
+    }.get(tool_name, "")
+    target = str((arguments or {}).get(key, ""))
+    return target if len(target) <= 80 else target[:77] + "..."
+
+
+def _deterministic_tool_failure(tool_name: str, result: str):
+    """결정적 실패면 (error, target)을, 아니면 None을 돌려준다."""
+    if not isinstance(result, str):
+        return None
+    try:
+        envelope = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    error = envelope.get("error")
+    if error not in DETERMINISTIC_TOOL_ERRORS:
+        return None
+    target = envelope.get("path") or envelope.get("name") or ""
+    if not target:
+        return None
+    return error, str(target)
+
+
+def _record_known_bad(known_bad_calls: dict, tool_name: str, arguments: dict,
+                      error: str, target: str, step: int):
+    """확정 실패를 기록한다. fingerprint를 만들 수 없으면 무시한다."""
+    if tool_name not in TOOL_LOOP_GUARD_TOOLS or not isinstance(arguments, dict):
+        return
+    try:
+        fingerprint = _tool_fingerprint(tool_name, arguments)
+    except KeyError:
+        return
+    entry = known_bad_calls.get(fingerprint)
+    if entry is None:
+        entry = {
+            "tool": tool_name,
+            "target": _known_bad_target(tool_name, arguments) or str(target),
+            "error": str(error),
+            "first_step": int(step),
+            "count": 0,
+        }
+        known_bad_calls[fingerprint] = entry
+    entry["count"] += 1
+    while len(known_bad_calls) > KNOWN_BAD_CALLS_MAX:
+        known_bad_calls.pop(next(iter(known_bad_calls)))
+
+
+def _known_bad_block(known_bad_calls: dict, tool_name: str, arguments: dict):
+    """확정 실패 호출이면 차단 결과 JSON을, 아니면 None을 돌려준다."""
+    if tool_name not in TOOL_LOOP_GUARD_TOOLS or not isinstance(arguments, dict):
+        return None
+    try:
+        fingerprint = _tool_fingerprint(tool_name, arguments)
+    except KeyError:
+        return None
+    entry = known_bad_calls.get(fingerprint)
+    if entry is None:
+        return None
+    return _blocked_tool_result(
+        "known_failure",
+        tool_name,
+        KNOWN_BAD_CALLS_MAX,
+        entry["count"],
+        first_step=entry["first_step"],
+    )
+
+
+def _render_avoidance_block(known_bad_calls: dict) -> str:
+    """시스템 프롬프트용 확정 실패 목록. 없으면 빈 문자열."""
+    if not known_bad_calls:
+        return ""
+    lines = [
+        "[재시도 금지(확정 실패): 아래 호출은 이미 결정적으로 실패했습니다. "
+        "같은 인자로 다시 호출하지 마세요.]"
+    ]
+    for entry in list(known_bad_calls.values())[:8]:
+        lines.append(
+            f"- {entry['tool']} {entry['target']} → {entry['error']} "
+            f"(step {entry['first_step']})"
+        )
+    block = "\n".join(lines)
+    if len(block) > AVOIDANCE_BLOCK_MAX_CHARS:
+        block = block[:AVOIDANCE_BLOCK_MAX_CHARS] + "…"
+    return block
+
+
+def _invalidate_known_bad(known_bad_calls: dict, tool_name: str, arguments: dict):
+    """write_file 성공 시 같은 path의 read not_found 기록을 지운다."""
+    if tool_name != "write_file" or not isinstance(arguments, dict):
+        return
+    path = arguments.get("path")
+    if not path:
+        return
+    try:
+        fingerprint = _tool_fingerprint("read_file", {"path": path})
+    except KeyError:
+        return
+    known_bad_calls.pop(fingerprint, None)
 
 
 ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
@@ -2910,6 +3034,14 @@ def build_system_content(
         parts.append(skills_block)
     parts.append(_render_task_contract(workspace, task_contract))
     parts.append(_render_artifact_manifest(artifact_manifest))
+    # 확정 실패 목록은 런Scoped로 workspace 객체에 붙어 다닌다. 스레딩 대신
+    # 여기서 읽는 이유는 prepare 내부의 시스템 메시지 재구성 3곳까지 같은
+    # 목록을 보게 하기 위해서다. 없으면(테스트 SimpleNamespace 등) 생략된다.
+    avoidance = _render_avoidance_block(
+        getattr(workspace, "known_bad_calls", None) or {}
+    )
+    if avoidance:
+        parts.append(avoidance)
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
@@ -4280,6 +4412,14 @@ async def on_message(message: discord.Message):
         if restored is not None
         else []
     )
+    # 확정 실패 회피 목록. 구 레코드에는 키가 없어 {}로 시작한다. 시스템
+    # 프롬프트 렌더가 workspace에서 읽으므로 같은 dict 객체를 붙여 둔다.
+    known_bad_calls = (
+        run_state.normalize_known_bad_calls(restored.get("known_bad_calls"))
+        if restored is not None
+        else {}
+    )
+    workspace.known_bad_calls = known_bad_calls
     run_end_logged = False
     released = False
 
@@ -4536,6 +4676,7 @@ async def on_message(message: discord.Message):
                 trajectory_gap_step=trajectory_gap_step,
                 task_contract=task_contract,
                 artifact_manifest=artifact_manifest,
+                known_bad_calls=known_bad_calls,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -5215,6 +5356,23 @@ async def on_message(message: discord.Message):
                             first_step=prior_step,
                         )
                         continue
+                    if tc["arguments"].get("force") is not True:
+                        known_block = _known_bad_block(
+                            known_bad_calls, tc["name"], tc["arguments"]
+                        )
+                        if known_block is not None:
+                            batch_signatures.add(signature)
+                            if guarded_fingerprint is not None:
+                                batch_fingerprints.add(guarded_fingerprint)
+                            merged_results[call_index] = known_block
+                            log_session_event(
+                                workspace,
+                                "tool_known_bad_blocked",
+                                step=current_tool_step,
+                                tool=tc["name"],
+                                fingerprint=(guarded_fingerprint or "")[:16],
+                            )
+                            continue
                     if (
                         total_tools_executed + len(allowed_calls)
                         >= MAX_TOOL_EXECUTIONS_PER_RUN
@@ -5356,9 +5514,25 @@ async def on_message(message: discord.Message):
                         else:
                             last_failed_signature = failure_signature
                             consecutive_failed_tool_calls = 1
+                        deterministic = _deterministic_tool_failure(
+                            tc["name"], tool_result
+                        )
+                        if deterministic is not None:
+                            error, target = deterministic
+                            _record_known_bad(
+                                known_bad_calls,
+                                tc["name"],
+                                tc["arguments"],
+                                error,
+                                target,
+                                current_tool_step,
+                            )
                     else:
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
+                        _invalidate_known_bad(
+                            known_bad_calls, tc["name"], tc["arguments"]
+                        )
                         if guarded_fingerprint is not None:
                             recent_tool_fingerprints[:] = [
                                 [fingerprint, seen_step]

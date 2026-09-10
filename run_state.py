@@ -40,6 +40,8 @@ TASK_CONTRACT_VERSION = 1
 ARTIFACT_MANIFEST_VERSION = 1
 ARTIFACT_MANIFEST_MAX_ITEMS = 24
 TASK_GOAL_MAX_CHARS = 4000
+KNOWN_BAD_CALLS_VERSION = 1
+KNOWN_BAD_CALLS_MAX_ITEMS = 20
 
 
 def _has_unsafe_path_chars(value):
@@ -65,6 +67,64 @@ _REQUIRED = (
 
 def snapshot_path(workspace):
     return Path(workspace.root) / FILE_NAME
+
+
+def normalize_known_bad_calls(value):
+    """확정 실패 회피 목록을 관대하게 정규화한다. 깨진 값·없는 값은 {}.
+
+    선택적 키라 구 레코드에 없어도 load가 실패하지 않는다.
+    """
+    normalized = {}
+    if not isinstance(value, (dict, list)):
+        return normalized
+    items = value.items() if isinstance(value, dict) else value
+    for item in items:
+        if isinstance(value, dict):
+            fingerprint, entry = item
+        else:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 2
+            ):
+                continue
+            fingerprint, entry = item
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in fingerprint)
+            or not isinstance(entry, dict)
+        ):
+            continue
+        tool = entry.get("tool")
+        target = entry.get("target")
+        error = entry.get("error")
+        first_step = entry.get("first_step")
+        count = entry.get("count", 1)
+        if (
+            not isinstance(tool, str)
+            or not tool
+            or not isinstance(target, str)
+            or not target
+            or not isinstance(error, str)
+            or not error
+            or not isinstance(first_step, int)
+            or isinstance(first_step, bool)
+            or first_step < 1
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+        ):
+            continue
+        normalized[fingerprint] = {
+            "tool": tool[:32],
+            "target": target[:128],
+            "error": error[:32],
+            "first_step": first_step,
+            "count": count,
+        }
+        if len(normalized) >= KNOWN_BAD_CALLS_MAX_ITEMS:
+            break
+    return normalized
 
 
 def _dump(record):
@@ -153,6 +213,7 @@ def save(
     state=RUNNING,
     task_contract=None,
     artifact_manifest=None,
+    known_bad_calls=None,
 ):
     """Replace the run's record atomically.
 
@@ -187,6 +248,12 @@ def save(
         "trajectory_gap_step": trajectory_gap_step,
         "task_contract": _normalize_task_contract(task_contract),
         "artifact_manifest": _normalize_artifact_manifest(artifact_manifest),
+        "known_bad_calls": [
+            [fingerprint, entry]
+            for fingerprint, entry in normalize_known_bad_calls(
+                known_bad_calls
+            ).items()
+        ],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -260,6 +327,9 @@ def load(workspace):
     payload["task_contract"] = _normalize_task_contract(payload.get("task_contract"))
     payload["artifact_manifest"] = _normalize_artifact_manifest(
         payload.get("artifact_manifest")
+    )
+    payload["known_bad_calls"] = normalize_known_bad_calls(
+        payload.get("known_bad_calls")
     )
     return payload
 
