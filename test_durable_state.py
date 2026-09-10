@@ -22,6 +22,7 @@ from test_terminal_state import _response, _tool_call
 import bot
 import run_state
 import run_workspace
+import workspace_io
 from ledger import ResearchLedger
 from run_workspace import RunCatalog
 
@@ -291,6 +292,47 @@ class NaturalLanguageResumeTest(DurableStateTestCase):
             "원래 장애 조사",
             self.stub.payloads("agent")[0][0]["content"],
         )
+
+    async def test_tool_group_snapshot_persists_host_observed_workspace_file(self):
+        catalog = self.catalog()
+
+        async def write_file(workspace, path, content, expected_revision):
+            result = await workspace.write(path, content, expected_revision)
+            return json.dumps(result, ensure_ascii=False)
+
+        responses = [
+            _response(tool_calls=[_tool_call(
+                "write-1",
+                "write_file",
+                {"path": "plan.md", "content": "계획", "expected_revision": "absent"},
+            )]),
+            _response(tool_calls=[_tool_call(
+                "finish-2",
+                "finish_task",
+                {"report": "완료"},
+            )]),
+        ]
+        with patch.object(bot, "tool_write_file", side_effect=write_file):
+            await self.drive(
+                catalog,
+                responses,
+                request="원래 장애 조사",
+                max_loops=2,
+            )
+
+        workspace = self.only_run(catalog)
+        state = run_state.load(workspace)
+        paths = {item["path"] for item in state["artifact_manifest"]["items"]}
+        self.assertIn("plan.md", paths)
+        self.assertEqual(
+            next(
+                item["revision"]
+                for item in state["artifact_manifest"]["items"]
+                if item["path"] == "plan.md"
+            ),
+            workspace_io.revision("계획".encode("utf-8")),
+        )
+        self.assertIn("plan.md", self.stub.payloads("agent")[1][0]["content"])
 
     async def test_natural_language_continue_reuses_failed_run(self):
         catalog = self.catalog()

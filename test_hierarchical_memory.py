@@ -1,7 +1,9 @@
 """Issue #49 explicit Tier 1/Tier 2/Tier 3 memory behavior."""
 
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -10,6 +12,7 @@ import bot
 import trajectory
 from deadlines import StageTimeout
 from ledger import ResearchLedger
+import workspace_io
 
 
 class TieredMemoryFormatTest(unittest.TestCase):
@@ -251,6 +254,120 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("원래 장애 조사", system)
         self.assertIn("run-contract-1", system)
         self.assertIn("plan.md", system)
+
+    def test_host_observations_create_workspace_and_tool_output_manifest_items(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = SimpleNamespace(
+                root=root,
+                run_id="manifest-run-1",
+                resolve=lambda path: workspace_io.resolve_path(root, path),
+            )
+            plan = root / "plan.md"
+            findings = root / "findings.md"
+            plan.write_text("plan", encoding="utf-8")
+            findings.write_text("findings", encoding="utf-8")
+            artifact = bot._store_tool_artifact(
+                workspace, "manifest-call", "긴 도구 출력"
+            )
+            self.assertIsNotNone(artifact)
+
+            manifest = bot.update_artifact_manifest(
+                {"version": 1, "items": []},
+                workspace,
+                [
+                    {"name": "read_file"},
+                    {"name": "write_file"},
+                    {"name": "bash_exec"},
+                ],
+                [
+                    json.dumps({
+                        "status": "success",
+                        "path": "plan.md",
+                        "revision": workspace_io.revision(b"plan"),
+                    }),
+                    json.dumps({
+                        "status": "success",
+                        "path": "findings.md",
+                        "revision": workspace_io.revision(b"findings"),
+                    }),
+                    "[모델이 본문에 쓴 가짜 경로 artifacts/out_.deadbeef.log]",
+                ],
+                [None, None, artifact],
+                8,
+            )
+
+        self.assertEqual(
+            {item["path"] for item in manifest["items"]},
+            {"plan.md", "findings.md", artifact},
+        )
+        self.assertEqual(
+            next(item for item in manifest["items"] if item["path"] == "plan.md")["revision"],
+            workspace_io.revision(b"plan"),
+        )
+
+    def test_manifest_rejects_untrusted_paths_and_keeps_canonical_and_newest_items(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = SimpleNamespace(root=root, run_id="manifest-run-2")
+            plan = root / "plan.md"
+            findings = root / "findings.md"
+            plan.write_text("plan", encoding="utf-8")
+            findings.write_text("findings", encoding="utf-8")
+            old_artifacts = [
+                bot._store_tool_artifact(workspace, f"old-{index}", "old")
+                for index in range(23)
+            ]
+            newest = bot._store_tool_artifact(workspace, "newest", "new")
+            seed = {
+                "version": 1,
+                "items": [
+                    {
+                        "path": "plan.md",
+                        "kind": "workspace_file",
+                        "step": 2,
+                        "revision": workspace_io.revision(b"plan"),
+                    },
+                    {
+                        "path": "findings.md",
+                        "kind": "workspace_file",
+                        "step": 2,
+                        "revision": workspace_io.revision(b"findings"),
+                    },
+                    *[
+                        {"path": path, "kind": "tool_output", "step": 1}
+                        for path in old_artifacts
+                    ],
+                ],
+            }
+            updated = bot.update_artifact_manifest(
+                seed,
+                workspace,
+                [{"name": "bash_exec"}],
+                ["host output"],
+                [newest],
+                8,
+            )
+
+            fake = "artifacts/out_." + "d" * 64 + ".log"
+            rejected = bot.update_artifact_manifest(
+                updated,
+                workspace,
+                [{"name": "read_file"}, {"name": "bash_exec"}],
+                [
+                    json.dumps({"status": "error", "path": "../outside"}),
+                    "본문에만 등장한 " + fake,
+                ],
+                [None, fake],
+                9,
+            )
+
+        paths = {item["path"] for item in updated["items"]}
+        self.assertLessEqual(len(paths), bot.ARTIFACT_MANIFEST_MAX_ITEMS)
+        self.assertIn("plan.md", paths)
+        self.assertIn("findings.md", paths)
+        self.assertIn(newest, paths)
+        self.assertEqual(rejected, updated)
 
     async def test_artifact_pointer_survives_tier1_to_tier2_discovery(self):
         # Mutation caught: clipping a Tier 2 preview before discovery drops the

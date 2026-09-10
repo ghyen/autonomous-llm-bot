@@ -21,6 +21,7 @@ import contextvars
 import tempfile
 import unicodedata
 from collections import defaultdict
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 import discord
@@ -782,11 +783,93 @@ _ARTIFACT_PATH_SINK = contextvars.ContextVar(
 ARTIFACT_DIR_NAME = "artifacts"
 ARTIFACT_PREVIEW_LINES = 20
 ARTIFACT_PREVIEW_MAX_CHARS = 800
+ARTIFACT_MANIFEST_MAX_ITEMS = run_state.ARTIFACT_MANIFEST_MAX_ITEMS
 # ponytail: 런당 산출물 예산을 디스크 한도의 1/8로 고정한다. 산출물은 런 루트
 # 안에 쌓이므로 bash 워커의 workspace_disk_limit 감시에 함께 잡히고, 예산이 없으면
 # 긴 출력이 이어질 때 뒤쪽 bash 호출이 굶는다. 실행별 조정이 필요해지면 설정
 # 값으로 승격한다.
 ARTIFACT_RUN_BYTE_BUDGET = TOOL_LIMITS["disk_bytes"] // 8
+
+
+def _manifest_workspace_item(workspace, envelope, step_num):
+    path = envelope.get("path")
+    revision = envelope.get("revision")
+    if (
+        not isinstance(path, str)
+        or not path
+        or Path(path).is_absolute()
+        or not isinstance(revision, str)
+        or not workspace_io.REVISION_PATTERN.fullmatch(revision)
+    ):
+        return None
+    try:
+        root = Path(os.path.abspath(os.fspath(workspace.root)))
+        target = workspace_io.resolve_path(root, path)
+        relative = target.relative_to(root).as_posix()
+        if not target.is_file() or workspace_io.revision(target.read_bytes()) != revision:
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    return {
+        "path": relative,
+        "kind": "workspace_file",
+        "step": step_num,
+        "revision": revision,
+    }
+
+
+def _manifest_artifact_item(workspace, artifact_path, step_num):
+    if not isinstance(artifact_path, str) or Path(artifact_path).is_absolute():
+        return None
+    if not re.fullmatch(r"artifacts/out_\.[0-9a-f]{64}\.log", artifact_path):
+        return None
+    try:
+        root = Path(os.path.abspath(os.fspath(workspace.root)))
+        target = workspace_io.resolve_path(root, artifact_path)
+        relative = target.relative_to(root).as_posix()
+        if relative != artifact_path or not target.is_file():
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    return {"path": relative, "kind": "tool_output", "step": step_num}
+
+
+def update_artifact_manifest(
+    manifest, workspace, tool_calls, results, artifact_paths, step_num
+):
+    """Keep a bounded host-observed index for the current run only."""
+    items = {
+        item["path"]: dict(item)
+        for item in (manifest or {}).get("items", [])
+        if isinstance(item, dict) and item.get("path")
+    }
+    paths = artifact_paths or [None] * len(tool_calls)
+    for call, result, artifact_path in zip(tool_calls, results, paths):
+        if call.get("name") in ("read_file", "write_file"):
+            envelope = _robust_json_loads(result)
+            if isinstance(envelope, dict) and envelope.get("status") in (
+                "success",
+                "unchanged",
+            ):
+                item = _manifest_workspace_item(workspace, envelope, step_num)
+                if item is not None:
+                    items[item["path"]] = item
+        item = _manifest_artifact_item(workspace, artifact_path, step_num)
+        if item is not None:
+            items[item["path"]] = item
+
+    ordered = sorted(
+        items.values(),
+        key=lambda item: (
+            item.get("path") in ("plan.md", "findings.md"),
+            int(item.get("step", 0)),
+        ),
+        reverse=True,
+    )[:ARTIFACT_MANIFEST_MAX_ITEMS]
+    return {
+        "version": run_state.ARTIFACT_MANIFEST_VERSION,
+        "items": ordered,
+    }
 
 
 def _artifact_name(call_id: str) -> str:
@@ -5262,6 +5345,25 @@ async def on_message(message: discord.Message):
                         step=iteration + 1,
                         error=type(trajectory_error).__name__,
                         count=len(trajectory_calls),
+                    )
+
+                try:
+                    artifact_manifest = update_artifact_manifest(
+                        artifact_manifest,
+                        workspace,
+                        tool_calls_to_run,
+                        merged_results,
+                        merged_artifact_paths,
+                        iteration + 1,
+                    )
+                except Exception as manifest_error:
+                    # Manifest discovery is diagnostic context. A malformed or
+                    # unreadable entry must not discard the completed tool group.
+                    log_session_event(
+                        workspace,
+                        "artifact_manifest_update_failed",
+                        step=iteration + 1,
+                        error=type(manifest_error).__name__,
                     )
 
                 # 도구 실행 중에 접수된 지시를 여기서 흡수한다. 다음 루프 머리까지
