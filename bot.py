@@ -4410,13 +4410,14 @@ async def on_message(message: discord.Message):
                 rolling_summary = prepared.summary
                 channel_summary[message.channel.id] = rolling_summary
                 compacted_payload = prepared.payload
-                if "extra_body" in extra_params:
-                    extra_body = dict(extra_params["extra_body"])
+                request_extra_params = dict(extra_params)
+                if "extra_body" in request_extra_params:
+                    extra_body = dict(request_extra_params["extra_body"])
                     extra_body["reasoning_max_tokens"] = min(
                         extra_body["reasoning_max_tokens"],
                         prepared.output_max_tokens,
                     )
-                    extra_params["extra_body"] = extra_body
+                    request_extra_params["extra_body"] = extra_body
                 if prepared.rollover_used or prepared.trim_passes:
                     save_snapshot(iteration + 1, "context_budget")
 
@@ -4429,7 +4430,7 @@ async def on_message(message: discord.Message):
                     max_tokens=prepared.output_max_tokens,
                     temperature=0.7,
                     **step_tool_params,
-                    **extra_params
+                    **request_extra_params
                 )
             except (RunCancelled, StageTimeout) as stage_error:
                 settle_stage_failure(stage_error)
@@ -4477,7 +4478,7 @@ async def on_message(message: discord.Message):
                         messages=retry_payload,
                         max_tokens=prepared.output_max_tokens,
                         temperature=0.7,
-                        **extra_params
+                        **request_extra_params
                     )
                 except (RunCancelled, StageTimeout) as stage_error:
                     settle_stage_failure(stage_error)
