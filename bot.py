@@ -3440,22 +3440,24 @@ def prepare_new_run(owner_id, channel_id):
     return workspace
 
 
-_AUTO_RESUME_MARKERS = (
+_AUTO_RESUME_KOREAN_MARKERS = (
     "이전",
     "계속",
     "이어",
     "재개",
     "나머지",
-    "resume",
-    "continue",
 )
+_AUTO_RESUME_ENGLISH_MARKER = re.compile(r"\b(?:resume|continue)\b")
 
 
 def wants_auto_resume(content: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(content or "")).casefold().strip()
     if not normalized or normalized.startswith(("!", "/")):
         return False
-    return any(marker in normalized for marker in _AUTO_RESUME_MARKERS)
+    return (
+        any(marker in normalized for marker in _AUTO_RESUME_KOREAN_MARKERS)
+        or _AUTO_RESUME_ENGLISH_MARKER.search(normalized) is not None
+    )
 
 
 def find_auto_resume_run(owner_id, channel_id):

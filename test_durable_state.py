@@ -272,6 +272,7 @@ class NaturalLanguageResumeTest(DurableStateTestCase):
         self.assertTrue(bot.wants_auto_resume("resume the remaining work"))
         self.assertFalse(bot.wants_auto_resume("새로운 서버 장애를 분석해줘"))
         self.assertFalse(bot.wants_auto_resume("!resume deadbeef"))
+        self.assertFalse(bot.wants_auto_resume("discontinued 기능을 분석해줘"))
 
     async def test_natural_language_continue_reuses_failed_run(self):
         catalog = self.catalog()
