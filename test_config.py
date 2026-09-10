@@ -233,6 +233,7 @@ class AgentLimitConfigTest(unittest.TestCase):
         "MAX_TOOL_EXECUTIONS_PER_RUN": "max_tool_executions_per_run",
         "AGENT_STEP_MAX_TOKENS": "agent_step_max_tokens",
         "REASONING_MAX_TOKENS": "reasoning_max_tokens",
+        "AGENT_MAX_CONTEXT_TOKENS": "agent_max_context_tokens",
     }
 
     def test_defaults_match_the_documented_limits(self):
@@ -244,10 +245,11 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.max_tool_executions_per_run,
                 config.agent_step_max_tokens,
                 config.reasoning_max_tokens,
+                config.agent_max_context_tokens,
                 config.default_reasoning_effort,
                 config.adaptive_reasoning,
             ),
-            (2000, 50, 2000, 4096, 1536, "high", True),
+            (2000, 50, 2000, 4096, 1536, 10240, "high", True),
         )
 
     def test_environment_overrides_are_applied(self):
@@ -258,6 +260,7 @@ class AgentLimitConfigTest(unittest.TestCase):
                 MAX_TOOL_EXECUTIONS_PER_RUN="202",
                 AGENT_STEP_MAX_TOKENS="5000",
                 REASONING_MAX_TOKENS="2000",
+                AGENT_MAX_CONTEXT_TOKENS="12000",
                 DEFAULT_REASONING_EFFORT="medium",
                 ADAPTIVE_REASONING="false",
             ),
@@ -270,10 +273,11 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.max_tool_executions_per_run,
                 config.agent_step_max_tokens,
                 config.reasoning_max_tokens,
+                config.agent_max_context_tokens,
                 config.default_reasoning_effort,
                 config.adaptive_reasoning,
             ),
-            (101, 11, 202, 5000, 2000, "medium", False),
+            (101, 11, 202, 5000, 2000, 12000, "medium", False),
         )
 
     def test_env_file_overrides_are_applied(self):
@@ -288,6 +292,7 @@ class AgentLimitConfigTest(unittest.TestCase):
                     "MAX_TOOL_EXECUTIONS_PER_RUN=203\n"
                     "AGENT_STEP_MAX_TOKENS=5001\n"
                     "REASONING_MAX_TOKENS=2001\n"
+                    "AGENT_MAX_CONTEXT_TOKENS=12001\n"
                     "DEFAULT_REASONING_EFFORT=low\n"
                     "ADAPTIVE_REASONING=false\n"
                 )
@@ -300,10 +305,11 @@ class AgentLimitConfigTest(unittest.TestCase):
                 config.max_tool_executions_per_run,
                 config.agent_step_max_tokens,
                 config.reasoning_max_tokens,
+                config.agent_max_context_tokens,
                 config.default_reasoning_effort,
                 config.adaptive_reasoning,
             ),
-            (102, 12, 203, 5001, 2001, "low", False),
+            (102, 12, 203, 5001, 2001, 12001, "low", False),
         )
 
     def test_invalid_or_nonpositive_values_fail_with_the_field_name(self):
@@ -349,7 +355,7 @@ class AgentLimitConfigTest(unittest.TestCase):
     def test_diagnostics_report_effective_agent_limits(self):
         text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))
         self.assertIn(
-            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 effort=high adaptive=true",
+            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 context_tokens=10240 effort=high adaptive=true",
             text,
         )
 

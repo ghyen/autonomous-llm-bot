@@ -39,6 +39,7 @@ DEFAULT_CHECKPOINT_INTERVAL = 50
 DEFAULT_MAX_TOOL_EXECUTIONS_PER_RUN = 2000
 DEFAULT_AGENT_STEP_MAX_TOKENS = 4096
 DEFAULT_REASONING_MAX_TOKENS = 1536
+DEFAULT_AGENT_MAX_CONTEXT_TOKENS = 10240
 DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_ADAPTIVE_REASONING = True
 
@@ -93,6 +94,7 @@ class BotConfig:
     max_tool_executions_per_run: int
     agent_step_max_tokens: int
     reasoning_max_tokens: int
+    agent_max_context_tokens: int
     default_reasoning_effort: str
     adaptive_reasoning: bool
     tool_cpu_seconds: float
@@ -377,6 +379,11 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
             "REASONING_MAX_TOKENS",
             DEFAULT_REASONING_MAX_TOKENS,
         ),
+        agent_max_context_tokens=parse_positive_int(
+            get("AGENT_MAX_CONTEXT_TOKENS"),
+            "AGENT_MAX_CONTEXT_TOKENS",
+            DEFAULT_AGENT_MAX_CONTEXT_TOKENS,
+        ),
         default_reasoning_effort=get(
             "DEFAULT_REASONING_EFFORT", DEFAULT_REASONING_EFFORT
         ).lower().strip(),
@@ -473,12 +480,13 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             config.tool_stage_timeout,
             config.bash_timeout,
         ),
-        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3} reasoning_tokens={4} effort={5} adaptive={6}".format(
+        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3} reasoning_tokens={4} context_tokens={5} effort={6} adaptive={7}".format(
             config.max_agent_loops,
             config.checkpoint_interval,
             config.max_tool_executions_per_run,
             config.agent_step_max_tokens,
             config.reasoning_max_tokens,
+            config.agent_max_context_tokens,
             config.default_reasoning_effort,
             "true" if config.adaptive_reasoning else "false",
         ),

@@ -710,8 +710,9 @@ KEEP_RECENT_TOOL_GROUPS = int(os.environ.get("KEEP_RECENT_TOOL_GROUPS", "2"))
 ROLLING_SUMMARY_MAX_CHARS = 10000
 MAX_CONTEXT_CHARS_BEFORE_ROLLOVER = int(os.environ.get("MAX_CONTEXT_CHARS_BEFORE_ROLLOVER", "28000"))
 MAX_AGENT_PAYLOAD_CHARS = int(os.environ.get("MAX_AGENT_PAYLOAD_CHARS", "36000"))
-AGENT_MAX_CONTEXT_TOKENS = int(os.environ.get("AGENT_MAX_CONTEXT_TOKENS", "10240"))
+AGENT_MAX_CONTEXT_TOKENS = CONFIG.agent_max_context_tokens
 AGENT_CONTEXT_TRANSIENT_RESERVE = 1024
+AGENT_CONTEXT_COUNT_HEADROOM = 256
 MIN_RETAINED_TOOL_GROUPS = 1
 # 하나의 상수를 두 파일이 따로 정의하고 있었다. 워커는 workspace_io를 파일 경로로
 # 로드하므로 그쪽이 원본이고, 여기서는 그것을 가리킨다.
@@ -1788,28 +1789,45 @@ def build_agent_request_payload(workspace, messages):
     return bound_agent_payload(payload)
 
 
+class AgentContextBudgetExceeded(RuntimeError):
+    """The request is still too large after every safe compaction pass."""
+
+    def __init__(self, input_tokens: int, input_budget: int):
+        self.input_tokens = input_tokens
+        self.input_budget = input_budget
+        super().__init__(
+            f"컨텍스트 입력 토큰이 예산을 초과했습니다: {input_tokens}>{input_budget}"
+        )
+
+
 def build_token_count_payload(messages: list, tool_params: dict) -> dict:
     """Convert the OpenAI payload to oMLX's Anthropic token-count shape."""
     system_parts = []
     converted = []
-    for message in messages:
+    index = 0
+    while index < len(messages):
+        message = messages[index]
         role = _msg_role(message)
         if role == "system":
             content = _msg_content(message)
             if content:
                 system_parts.append(str(content))
+            index += 1
             continue
         if role == "tool":
-            converted.append({
-                "role": "user",
-                "content": [{
+            blocks = []
+            while index < len(messages) and _msg_role(messages[index]) == "tool":
+                tool_message = messages[index]
+                blocks.append({
                     "type": "tool_result",
-                    "tool_use_id": _tool_result_id(message) or "unknown-tool-call",
-                    "content": str(_msg_content(message)),
-                }],
-            })
+                    "tool_use_id": _tool_result_id(tool_message) or "unknown-tool-call",
+                    "content": str(_msg_content(tool_message)),
+                })
+                index += 1
+            converted.append({"role": "user", "content": blocks})
             continue
         if role not in ("user", "assistant"):
+            index += 1
             continue
 
         calls = _msg_tool_calls(message)
@@ -1832,12 +1850,14 @@ def build_token_count_payload(messages: list, tool_params: dict) -> dict:
                     "input": arguments,
                 })
             converted.append({"role": "assistant", "content": blocks})
+            index += 1
             continue
 
         content = _msg_content(message)
         if not isinstance(content, (str, list, dict)):
             content = str(content)
         converted.append({"role": role, "content": content})
+        index += 1
 
     payload = {
         "model": MODEL_NAME,
@@ -1857,6 +1877,39 @@ def build_token_count_payload(messages: list, tool_params: dict) -> dict:
     if tools:
         payload["tools"] = tools
     return payload
+
+
+def approximate_agent_input_tokens(messages: list, tool_params: dict) -> int:
+    """Estimate input conservatively when the serving tokenizer is unavailable."""
+    serialized = json.dumps(
+        build_token_count_payload(messages, tool_params),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    ascii_text = 0
+    ascii_other = 0
+    non_ascii = 0
+    non_ascii_bytes = 0
+    for char in serialized:
+        if ord(char) < 128:
+            if char.isalnum() or char.isspace():
+                ascii_text += 1
+            else:
+                ascii_other += 1
+        else:
+            non_ascii += 1
+            non_ascii_bytes += len(char.encode("utf-8"))
+    # The compact JSON includes tool schemas and serialized arguments. Weight
+    # ASCII prose at 3.5 chars/token, punctuation at two, and non-ASCII text at
+    # the larger of 0.75 codepoints/token or four UTF-8 bytes/token; the
+    # allowance covers chat-template framing.
+    return (
+        (ascii_text * 2 + 6) // 7
+        + (ascii_other + 1) // 2
+        + max((non_ascii * 3 + 3) // 4, (non_ascii_bytes + 3) // 4)
+        + 32
+    )
 
 
 async def count_agent_input_tokens(messages: list, tool_params: dict):
@@ -1910,17 +1963,28 @@ async def prepare_agent_request_payload(
         1024,
         AGENT_MAX_CONTEXT_TOKENS
         - step_max_tokens
-        - AGENT_CONTEXT_TRANSIENT_RESERVE,
+        - AGENT_CONTEXT_TRANSIENT_RESERVE
+        - AGENT_CONTEXT_COUNT_HEADROOM,
     )
     live_messages = validate_chat_payload(messages).messages
     summary = existing_summary
     rollover_used = False
     trim_passes = 0
+    count_fallback = False
+    counter_unavailable = False
 
     async def count(payload):
+        nonlocal count_fallback, counter_unavailable
         if token is not None:
             token.raise_if_cancelled()
-        result = await count_agent_input_tokens(payload, tool_params)
+        if counter_unavailable:
+            result = approximate_agent_input_tokens(payload, tool_params)
+        else:
+            result = await count_agent_input_tokens(payload, tool_params)
+            if result is None:
+                counter_unavailable = True
+                count_fallback = True
+                result = approximate_agent_input_tokens(payload, tool_params)
         if token is not None:
             token.raise_if_cancelled()
         return result
@@ -1956,13 +2020,19 @@ async def prepare_agent_request_payload(
         payload = build_agent_request_payload(workspace, live_messages)
         input_tokens = await count(payload)
 
-    count_fallback = input_tokens is None
-    if count_fallback:
-        live_messages = bound_agent_payload(
-            live_messages,
-            max_chars=min(MAX_AGENT_PAYLOAD_CHARS, max(12000, input_budget * 4)),
+    if input_tokens > input_budget:
+        log_session_event(
+            workspace,
+            "context_budget",
+            step=step_num,
+            input_tokens=input_tokens,
+            input_budget=input_budget,
+            rollover=rollover_used,
+            trim_passes=trim_passes,
+            count_fallback=count_fallback,
+            rejected=True,
         )
-        payload = build_agent_request_payload(workspace, live_messages)
+        raise AgentContextBudgetExceeded(input_tokens, input_budget)
 
     live_messages = validate_chat_payload(live_messages).messages
     payload = validate_chat_payload(payload).messages
@@ -1975,6 +2045,7 @@ async def prepare_agent_request_payload(
         rollover=rollover_used,
         trim_passes=trim_passes,
         count_fallback=count_fallback,
+        rejected=False,
     )
     return SimpleNamespace(
         messages=live_messages,
@@ -1984,6 +2055,7 @@ async def prepare_agent_request_payload(
         input_budget=input_budget,
         rollover_used=rollover_used,
         trim_passes=trim_passes,
+        count_fallback=count_fallback,
     )
 
 
@@ -4146,6 +4218,9 @@ async def on_message(message: discord.Message):
                 outcome_mod.FAILED,
                 f"마감 초과: {error.stage} {error.seconds:g}s",
             )
+        elif isinstance(error, AgentContextBudgetExceeded):
+            stage_failure_note = str(error)
+            outcome.settle(outcome_mod.FAILED, "컨텍스트 예산 초과")
         else:
             stage_failure_note = _clip_summary_text(
                 f"{type(error).__name__}: {error}", 500
@@ -4266,6 +4341,9 @@ async def on_message(message: discord.Message):
                     **extra_params
                 )
             except (RunCancelled, StageTimeout) as stage_error:
+                settle_stage_failure(stage_error)
+                break
+            except AgentContextBudgetExceeded as stage_error:
                 settle_stage_failure(stage_error)
                 break
             except Exception as api_err:

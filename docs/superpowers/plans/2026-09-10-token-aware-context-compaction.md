@@ -4,7 +4,7 @@
 
 **Goal:** Keep every local oMLX agent request below a conservative token/KV budget so long runs do not fail during prefill.
 
-**Architecture:** Add a small Anthropic-format request converter and async oMLX token-count preflight beside the existing payload validator. When a request is over budget, reuse tiered rollover once, then persistently trim complete old tool groups and finally clip tool-result bodies before sending. Keep the authoritative system/current-goal prefix and validate the resulting OpenAI payload again.
+**Architecture:** Add a small Anthropic-format request converter and async oMLX token-count preflight beside the existing payload validator. When a request is over budget, reuse tiered rollover once, then persistently trim complete old tool groups and finally clip tool-result bodies before sending. Keep the authoritative system/current-goal prefix and validate the resulting OpenAI payload again; reject the request if the final count still exceeds the budget.
 
 **Tech Stack:** Python 3.10+, existing `httpx`, `unittest`, OpenAI-compatible `AsyncOpenAI`, oMLX local `/v1/messages/count_tokens`, macOS LaunchAgent.
 
@@ -12,6 +12,7 @@
 
 - Default total context target: `AGENT_MAX_CONTEXT_TOKENS=10240`.
 - Reserve `1024` tokens for prefill/transient memory and subtract each step's `max_tokens` from the input budget.
+- Reserve another `256` tokens for differences between the Anthropic count shape and the OpenAI chat request.
 - Default verbatim tool-group retention: `KEEP_RECENT_TOOL_GROUPS=2`.
 - Minimum retained complete tool groups: `1`.
 - No new Python dependency and no kernel iogpu wired-limit increase.
@@ -75,7 +76,7 @@ git commit -m "feat: count agent context with serving tokenizer"
 - Test: `test_context_budget.py`
 
 **Interfaces:**
-- Produces `prepare_agent_request_payload(workspace, messages, existing_summary, step_num, step_max_tokens, tool_params, ledger=None, token=None, trajectory_gap_step=None) -> SimpleNamespace` with `messages`, `payload`, `summary`, `input_tokens`, `input_budget`, `rollover_used`, and `trim_passes`.
+- Produces `prepare_agent_request_payload(workspace, messages, existing_summary, step_num, step_max_tokens, tool_params, ledger=None, token=None, trajectory_gap_step=None) -> SimpleNamespace` with `messages`, `payload`, `summary`, `input_tokens`, `input_budget`, `rollover_used`, `trim_passes`, and `count_fallback`.
 - `messages` is the persistent live history; `payload` is the derived request including the lower-trust playbook block.
 
 - [ ] **Step 1: Write the failing preflight tests**
@@ -89,7 +90,7 @@ async def test_over_budget_rolls_once_then_trims_complete_groups(self):
         result = await bot.prepare_agent_request_payload(
             workspace, messages, "", 12, 4096, {"tools": tools}
         )
-    self.assertEqual(result.input_budget, 5120)
+    self.assertEqual(result.input_budget, 4864)
     rollover.assert_awaited_once()
     self.assertTrue(bot.validate_chat_payload(result.messages).ok)
     self.assertEqual(len([m for m in result.messages if bot._msg_role(m) == "tool"]), 1)
@@ -103,9 +104,9 @@ Expected: FAIL because the preflight function and token-budget constants do not 
 
 - [ ] **Step 3: Implement the preflight**
 
-Use `10240 - max_tokens - 1024` as the input budget, with a floor of `1024`. Count the derived payload; when over budget, call `rollover_agent_context` once and recount. If still over, run `bound_agent_payload(..., max_chars=0)` against persistent history (with minimum retention `1`), rebuild, and recount. If one group remains over, clip only tool-result content in caps `1000`, `400`, and `160` characters, recounting after each cap. Preserve system/current-goal messages, run `validate_chat_payload`, and log only counts, budgets, rollover use, trim passes, and fallback status.
+Use `10240 - max_tokens - 1024 - 256` as the input budget, with a floor of `1024`. Count the derived payload; when over budget, call `rollover_agent_context` once and recount. If still over, run `bound_agent_payload(..., max_chars=0)` against persistent history (with minimum retention `1`), rebuild, and recount. If one group remains over, clip only tool-result content in caps `1000`, `400`, and `160` characters, recounting after each cap. Preserve system/current-goal messages, run `validate_chat_payload`, and log only counts, budgets, rollover use, trim passes, and fallback status.
 
-When the count endpoint returns `None`, use the existing character bound with a conservative `max_chars=min(MAX_AGENT_PAYLOAD_CHARS, max(12000, input_budget * 4))` and log the fallback; do not raise any memory limit.
+When the count endpoint returns `None`, estimate conservatively from the compact UTF-8 serialization of the converted payload (including tools and arguments), add framing allowance, and run the same trim-or-reject path. Never send a payload that remains over the selected budget.
 
 - [ ] **Step 4: Wire the preflight before every normal agent completion**
 

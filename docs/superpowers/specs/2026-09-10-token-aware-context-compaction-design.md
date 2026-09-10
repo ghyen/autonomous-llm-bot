@@ -34,16 +34,20 @@ the configured `/v1` base URL and counts system text, messages, and tools with
 the serving model's tokenizer.
 
 The preflight uses a conservative total KV target of 10,240 tokens by default.
-The current step's `max_tokens` and a 1,024-token transient reserve are deducted
-from that target to calculate the input budget. The budget is configurable via
-`AGENT_MAX_CONTEXT_TOKENS` so it can be tuned after observing the real model.
+The current step's `max_tokens`, a 1,024-token transient reserve, and a
+256-token count-conversion headroom are deducted from that target to calculate
+the input budget. The budget is configurable via `AGENT_MAX_CONTEXT_TOKENS` so
+it can be tuned after observing the real model.
 
 If the input count exceeds its budget, the loop performs the existing tiered
 rollover once, rebuilds, and counts again. If it still exceeds the budget,
-complete old assistant/tool groups are removed until the request fits. The
-authoritative ledger and current user goal remain in the system/current-message
-prefix. A failure to count uses a conservative character-bound fallback and is
-logged; it never raises the memory ceiling.
+complete old assistant/tool groups are removed and tool-result bodies are
+clipped until the request fits. The authoritative ledger and current user goal
+remain in the system/current-message prefix. If every safe trim still exceeds
+the budget, the request is rejected before the completion API is called. A
+missing count endpoint uses a conservative UTF-8-aware estimate that includes
+tool schemas and serialized arguments, then follows the same trim-or-reject
+path; it never raises the memory ceiling.
 
 ### 2. Smaller verbatim tail
 
@@ -70,14 +74,15 @@ credentials.
 - Raising `machdep.cpu.iogpu.wired_limit_mb`.
 - Replacing the existing tiered trajectory/ledger design.
 - Adding a tokenizer package or implementing a second model-specific tokenizer.
-- Changing the bot's user-visible failure wording in this patch.
+- Changing unrelated user-visible failure wording in this patch.
 
 ## Acceptance criteria
 
 1. A payload with tool calls and results is converted to a valid count request,
    including tools and preserving tool-call/result relationships.
 2. An over-budget payload triggers at most one rollover, then deterministic
-   complete-group trimming, and the final payload is protocol-valid.
+   complete-group/result trimming; it either fits or is rejected before send,
+   and every sent payload is protocol-valid.
 3. The preflight is skipped for non-agent stages and does not recurse through
    rollover's summary completion.
 4. Existing payload-integrity, rollover, durable-state, and full test suites
