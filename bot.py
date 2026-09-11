@@ -3359,6 +3359,72 @@ def _render_artifact_manifest(artifact_manifest):
     return "\n".join(lines)
 
 
+ESTABLISHED_FINDINGS_MAX_CHARS = 3200
+ESTABLISHED_PLAN_MAX_CHARS = 2000
+
+
+def _find_canonical_file(workspace, filename: str) -> Optional[str]:
+    """Find a canonical project file (e.g. plan.md, findings.md) in run root or shared workspace."""
+    root_str = getattr(workspace, "root", None)
+    if not root_str:
+        return None
+    try:
+        run_root = Path(root_str)
+        candidates = [
+            run_root / filename,
+            run_root.parent.parent / filename,
+            run_root.parent / filename,
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                content = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                if content:
+                    return content
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _extract_key_findings(text: str, max_chars: int = ESTABLISHED_FINDINGS_MAX_CHARS) -> str:
+    """findings.md에서 핵심 결론 및 분석 요약을 정밀 추출한다."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+
+    conclusion_match = re.search(r"(## \[(?:확정|BREAKTHROUGH|결론)\].*)", text, re.DOTALL)
+    if conclusion_match:
+        conclusion_part = conclusion_match.group(1).strip()
+        remaining_budget = max_chars - len(conclusion_part) - 80
+        if remaining_budget > 400:
+            prefix = text[:remaining_budget].strip() + "\n\n...[중간 상세 데이터 생략]...\n\n"
+            return prefix + conclusion_part
+        return conclusion_part[:max_chars]
+
+    half = max_chars // 2
+    return text[:half].strip() + "\n\n...[중간 상세 데이터 생략]...\n\n" + text[-half:].strip()
+
+
+def _render_established_context(workspace) -> str:
+    """공용 findings.md 및 plan.md의 핵심 내용을 사전 지식 블록으로 렌더링한다."""
+    plan_text = _find_canonical_file(workspace, "plan.md")
+    findings_text = _find_canonical_file(workspace, "findings.md")
+    if not plan_text and not findings_text:
+        return ""
+
+    blocks = [
+        "[📌 기확정 사전 지식 및 계획 (Established Canonical Knowledge)]\n"
+        "아래 내용은 이전 단계에서 이미 전수 검증되어 확정된 사실과 프로젝트 계획입니다.\n"
+        "도구를 사용해 다시 읽거나 출력할 필요 없이, 아래 내용을 확정된 전제(Ground Truth)로 삼아 다음 작업을 진행하세요."
+    ]
+    if plan_text:
+        clipped_plan = plan_text[:ESTABLISHED_PLAN_MAX_CHARS].strip()
+        blocks.append(f"### 📋 확정 프로젝트 계획 (plan.md)\n{clipped_plan}")
+    if findings_text:
+        clipped_findings = _extract_key_findings(findings_text)
+        blocks.append(f"### 🔍 확정 조사 결론 (findings.md)\n{clipped_findings}")
+    return "\n\n".join(blocks)
+
+
 def build_system_content(
     workspace,
     ledger=None,
@@ -3375,6 +3441,9 @@ def build_system_content(
     skills_block = render_skills_block(workspace)
     if skills_block:
         parts.append(skills_block)
+    established_context = _render_established_context(workspace)
+    if established_context:
+        parts.append(established_context)
     parts.append(_render_task_contract(workspace, task_contract))
     parts.append(_render_artifact_manifest(artifact_manifest))
     # 확정 실패 목록은 런Scoped로 workspace 객체에 붙어 다닌다. 스레딩 대신
