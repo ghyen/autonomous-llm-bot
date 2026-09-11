@@ -12,6 +12,7 @@ Integrated with:
 import os
 import sys
 import re
+import shutil
 import stat
 import hashlib
 import json
@@ -3953,6 +3954,90 @@ def prepare_new_run(owner_id, channel_id):
     return workspace
 
 
+# 인계는 ledger·회피목록·산출물을 새 run에 넘긴다. clear_channel_state와 달리
+# 이전 run의 durable 레코드는 지우지 않는다(재개 가능하게 둔다).
+HANDOVER_ARTIFACT_DIR = "handover"
+HANDOVER_ARTIFACT_MAX_FILES = 50
+HANDOVER_ARTIFACT_MAX_BYTES = 65536
+HANDOVER_NOTE_MAX_CHARS = 2000
+
+
+def _build_handover_note(record, old_run_id, copied_artifacts):
+    ledger = record.get("ledger")
+    goal = ""
+    counts = ""
+    try:
+        # load()는 ResearchLedger 객체를, 낡은 경로·테스트는 dict를 준다.
+        snapshot = ledger.to_dict() if hasattr(ledger, "to_dict") else ledger
+        goal = str(snapshot.get("goal", "") or "")[:300]
+        counts = (
+            f"가설 {len(snapshot.get('hypotheses', []) or [])}/"
+            f"증거 {len(snapshot.get('evidence', []) or [])}/"
+            f"결론 {len(snapshot.get('conclusions', []) or [])}"
+        )
+    except (AttributeError, TypeError):
+        pass
+    known = run_state.normalize_known_bad_calls(record.get("known_bad_calls"))
+    avoidance = ", ".join(
+        f"{entry['tool']} {entry['target']}→{entry['error']}"
+        for entry in list(known.values())[:8]
+    ) or "없음"
+    tier2 = compact_resume_summary(
+        record.get("summary", ""),
+        RESUME_COMPACT_TIER2_LINES,
+        0,
+        RESUME_COMPACT_DISCOVERIES,
+    )
+    note = (
+        f"[이전 run {old_run_id} 인계: 목표·판단·회피목록만 계승합니다. "
+        "절차 상세를 더 보려면 이전 run 기록을 직접 조회하세요.]\n"
+        f"목표: {goal or '(없음)'} ({counts or '판단 없음'})\n"
+        f"재시도 금지: {avoidance}\n"
+        f"이전 산출물: {HANDOVER_ARTIFACT_DIR}/ 에 {copied_artifacts}건 복사됨\n"
+        f"{tier2}"
+    )
+    return _clip_summary_text(note, HANDOVER_NOTE_MAX_CHARS)
+
+
+def handover_run(owner_id, channel_id, run_id):
+    """이전 run의 판단·회피목록·산출물을 새 run에 실어 둔다. (workspace, note)."""
+    old_workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if old_workspace.status == "active":
+        raise RunActiveError("run is active")
+    record = run_state.load(old_workspace)
+    if record is None:
+        raise RunNotFoundError("run not found")
+    workspace = RUN_CATALOG.prepare(owner_id, channel_id)
+    # 채널 기억은 비우되 이전 레코드는 남긴다.
+    channel_history[channel_id].clear()
+    channel_summary[channel_id] = ""
+    channel_ledger[channel_id].clear()
+    known = run_state.normalize_known_bad_calls(record.get("known_bad_calls"))
+    workspace.known_bad_calls = {
+        fingerprint: dict(entry) for fingerprint, entry in known.items()
+    }
+    copied = 0
+    try:
+        source_dir = Path(old_workspace.root) / "artifacts"
+        target_dir = Path(workspace.root) / HANDOVER_ARTIFACT_DIR
+        if source_dir.is_dir():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for child in sorted(source_dir.iterdir()):
+                if copied >= HANDOVER_ARTIFACT_MAX_FILES:
+                    break
+                if not child.is_file() or child.stat().st_size > HANDOVER_ARTIFACT_MAX_BYTES:
+                    continue
+                shutil.copy2(child, target_dir / child.name)
+                copied += 1
+    except OSError:
+        pass
+    note = _build_handover_note(record, old_workspace.run_id, copied)
+    channel_summary[channel_id] = note
+    if record.get("ledger") is not None:
+        channel_ledger[channel_id] = record["ledger"]
+    return workspace, note
+
+
 _AUTO_RESUME_KOREAN_MARKERS = (
     "이전",
     "계속",
@@ -4226,6 +4311,28 @@ async def on_message(message: discord.Message):
             return
         channel_resume_full[message.channel.id] = resume_full
         await message.reply(f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다.")
+        return
+
+    if cmd_name in ["!handover", "/handover"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        if len(parts) != 2:
+            await message.reply("사용법: `!handover <run-id>`")
+            return
+        try:
+            workspace, _note = handover_run(caller_id, message.channel.id, parts[1])
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("실행 중인 run입니다. `!stop` 후 인계하세요.")
+            return
+        await message.reply(
+            f"🔀 run `{parts[1]}`의 판단·회피목록·산출물을 새 run `{workspace.run_id}`에 인계했습니다. "
+            "이어갈 목표를 보내주세요."
+        )
         return
 
     if cmd_name in ["!delete", "/delete"]:
