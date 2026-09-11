@@ -1328,7 +1328,7 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
                 self.assertEqual(source.read_text(encoding="utf-8"), payload)
                 self.assertEqual(retry.read("playbook.md").get("content"), payload)
 
-    async def test_acquire_inherits_only_playbook_from_prior_run_of_same_owner_and_channel(self):
+    async def test_acquire_inherits_playbook_and_findings_from_prior_run_of_same_owner_and_channel(self):
         catalog = self.catalog()
         run1 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
         await run1.write("plan.md", "# Plan 1\n- [x] Step 1", "absent")
@@ -1340,7 +1340,9 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         run2 = catalog.acquire(TEST_USER_ID, CHANNEL_A)
         self.assertNotEqual(run1.run_id, run2.run_id)
         self.assertEqual(run2.read("plan.md")["status"], "error")
-        self.assertEqual(run2.read("findings.md")["status"], "error")
+        read_findings = run2.read("findings.md")
+        self.assertEqual(read_findings["status"], "success")
+        self.assertEqual(read_findings["content"], "# Findings\nDiscovered secret")
         read_playbook = run2.read("playbook.md")
         self.assertEqual(read_playbook["status"], "success")
         self.assertEqual(read_playbook["content"], "- Mac grep은 -P를 지원하지 않는다")
@@ -1349,12 +1351,14 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         # Different channel must not inherit
         diff_channel = catalog.acquire(TEST_USER_ID, CHANNEL_B)
         self.assertEqual(diff_channel.read("plan.md")["status"], "error")
+        self.assertEqual(diff_channel.read("findings.md")["status"], "error")
         self.assertEqual(diff_channel.read("playbook.md")["status"], "error")
         catalog.finish(diff_channel, "completed")
 
         # Different owner must not inherit
         diff_owner = catalog.acquire(TEST_ADMIN_ID, CHANNEL_A)
         self.assertEqual(diff_owner.read("plan.md")["status"], "error")
+        self.assertEqual(diff_owner.read("findings.md")["status"], "error")
         self.assertEqual(diff_owner.read("playbook.md")["status"], "error")
         catalog.finish(diff_owner, "completed")
 
@@ -1374,6 +1378,16 @@ class HandlerWorkspaceTest(WorkspaceTestCase):
         self.assertEqual(after_reset.read("plan.md")["status"], "error")
         self.assertEqual(after_reset.read("findings.md")["status"], "error")
         self.assertEqual(after_reset.read("playbook.md")["status"], "error")
+
+    async def test_acquire_seeds_findings_from_workspace_root_when_no_prior_candidates(self):
+        catalog = self.catalog()
+        shared_findings = catalog.workspace_root / "findings.md"
+        shared_findings.write_text("# Shared Root Findings\nBase knowledge", encoding="utf-8")
+
+        fresh_run = catalog.acquire(TEST_USER_ID, CHANNEL_A)
+        read_findings = fresh_run.read("findings.md")
+        self.assertEqual(read_findings["status"], "success")
+        self.assertEqual(read_findings["content"], "# Shared Root Findings\nBase knowledge")
 
 
 if __name__ == "__main__":
