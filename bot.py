@@ -846,14 +846,37 @@ def _invalidate_known_bad(known_bad_calls: dict, tool_name: str, arguments: dict
     known_bad_calls.pop(fingerprint, None)
 
 
+ARTIFACT_SLICER_OR_FILTER_PIPE = re.compile(
+    r"\|\s*(?:grep|egrep|fgrep|head|tail|wc|awk|sed|jq|cut|sort|less|more)\b"
+)
+ARTIFACT_SAFE_OR_SLICING_CMD = re.compile(
+    r"^\s*(?:grep|egrep|fgrep|head|tail|wc|awk|sed|jq|cut|ls|find|file|stat|rm|test|python|python3)\b"
+)
+
+
 def _is_artifact_read(tool_name: str, arguments: dict) -> bool:
-    """artifact 파일 통째 읽기를 판정한다."""
+    """artifact 파일 통째 읽기를 판정한다.
+    grep, head, tail, wc, python3 등 필터링/슬라이싱 접근은 통째 읽기가 아니므로 허용한다.
+    """
     if not isinstance(arguments, dict):
         return False
-    if tool_name == "bash_exec":
-        return "artifacts/" in str(arguments.get("command", ""))
     if tool_name == "read_file":
         return str(arguments.get("path", "")).startswith("artifacts/")
+    if tool_name == "bash_exec":
+        command = str(arguments.get("command", ""))
+        if "artifacts/" not in command:
+            return False
+        parts = re.split(r"&&|\|\||;", command)
+        for part in parts:
+            part = part.strip()
+            if "artifacts/" not in part:
+                continue
+            if ARTIFACT_SLICER_OR_FILTER_PIPE.search(part):
+                continue
+            if ARTIFACT_SAFE_OR_SLICING_CMD.search(part):
+                continue
+            return True
+        return False
     return False
 
 
@@ -4868,7 +4891,6 @@ async def on_message(message: discord.Message):
             f"(다음 Step {stats['next_step']}, 버린 기록 {stats['dropped_records']}건, "
             f"지운 산출물 {stats['artifacts_deleted']}건). 잘라낸 기록은 traj.jsonl.bak에 있습니다. "
             "이어갈 지시를 보내주세요."
->>>>>>> origin/main
         )
         return
 

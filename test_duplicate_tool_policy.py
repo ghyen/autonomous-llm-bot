@@ -1131,6 +1131,65 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             [["chain-1"], ["chain-2"], ["fresh"], ["chain-3"]],
         )
 
+    async def test_slicing_artifact_call_allowed_and_resets_chain(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("chain-1", "bash_exec", {"command": "cat runs/abc/artifacts/out_1.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("chain-2", "bash_exec", {"command": "cat runs/abc/artifacts/out_2.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("slicing", "bash_exec", {"command": "head -n 20 runs/abc/artifacts/out_3.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("chain-3", "bash_exec", {"command": "cat runs/abc/artifacts/out_4.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["chain-1"], ["chain-2"], ["slicing"], ["chain-3"]],
+        )
+
+    async def test_slicing_artifact_call_allowed_after_chain_block(self):
+        await self.run_agent([
+            _response(tool_calls=[
+                _tool_call("chain-1", "bash_exec", {"command": "cat runs/abc/artifacts/out_1.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("chain-2", "bash_exec", {"command": "cat runs/abc/artifacts/out_2.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("chain-3", "bash_exec", {"command": "cat runs/abc/artifacts/out_3.log"}),
+            ]),
+            # 4th cat is blocked by artifact_chain limit
+            _response(tool_calls=[
+                _tool_call("chain-4-blocked", "bash_exec", {"command": "cat runs/abc/artifacts/out_4.log"}),
+            ]),
+            # following with grep is allowed (not blocked!)
+            _response(tool_calls=[
+                _tool_call("grep-slicing", "bash_exec", {"command": "grep -n 'target' runs/abc/artifacts/out_4.log"}),
+            ]),
+            _response(tool_calls=[
+                _tool_call("finish", "finish_task", {"report": LONG_REPORT}),
+            ]),
+        ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [
+                ["chain-1"],
+                ["chain-2"],
+                ["chain-3"],
+                # chain-4-blocked was not dispatched
+                ["grep-slicing"],
+            ],
+        )
+
     # Mutation caught: treating a producer-owned write_file conflict envelope as
     # success lets an unchanged third stale canonical write reach the dispatcher.
     async def test_stale_canonical_write_conflict_blocks_third_attempt_end_to_end(self):

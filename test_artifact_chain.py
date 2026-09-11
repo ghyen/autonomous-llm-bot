@@ -19,9 +19,33 @@ class IsArtifactReadTest(unittest.TestCase):
             "bash_exec", {"command": "cat runs/abc/artifacts/out_1.log"}
         ))
 
-    def test_bash_grep_of_artifact_is_still_artifact_read(self):
-        self.assertTrue(bot._is_artifact_read(
+    def test_bash_grep_of_artifact_is_slicing_not_full_read(self):
+        self.assertFalse(bot._is_artifact_read(
             "bash_exec", {"command": "grep -n 'x' runs/abc/artifacts/out_1.log | head"}
+        ))
+
+    def test_bash_head_tail_wc_of_artifact_are_not_full_reads(self):
+        self.assertFalse(bot._is_artifact_read(
+            "bash_exec", {"command": "head -n 60 artifacts/out_1.log"}
+        ))
+        self.assertFalse(bot._is_artifact_read(
+            "bash_exec", {"command": "tail -n 20 artifacts/out_1.log"}
+        ))
+        self.assertFalse(bot._is_artifact_read(
+            "bash_exec", {"command": "wc -l artifacts/out_1.log"}
+        ))
+
+    def test_bash_piped_filter_is_not_full_read(self):
+        self.assertFalse(bot._is_artifact_read(
+            "bash_exec", {"command": "cat artifacts/out_1.log | grep pattern"}
+        ))
+        self.assertFalse(bot._is_artifact_read(
+            "bash_exec", {"command": "cat artifacts/out_1.log | head -n 20"}
+        ))
+
+    def test_bash_python_script_is_not_full_read(self):
+        self.assertFalse(bot._is_artifact_read(
+            "bash_exec", {"command": "python3 -c \"open('artifacts/out_1.log')\""}
         ))
 
     def test_plain_bash_is_not(self):
