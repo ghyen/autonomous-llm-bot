@@ -12,6 +12,7 @@ Integrated with:
 import os
 import sys
 import re
+import shutil
 import stat
 import hashlib
 import json
@@ -47,7 +48,7 @@ from deadlines import (
 )
 from outcome import RunOutcome
 from ledger import LedgerRefusal, ResearchLedger
-from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
+from run_workspace import RunActiveError, RunCatalog, RunNotFoundError, atomic_write
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
 import tool_sandbox
@@ -470,6 +471,9 @@ channel_ledger = defaultdict(ResearchLedger)
 
 channel_active_runs = defaultdict(bool)
 channel_run_owner = {}
+# !resume --full 지정 시에만 옛 동작(요약 전체 복원)을 쓴다. 재개 메시지가
+# on_message에 닿을 때 1회성으로 소비한다.
+channel_resume_full = defaultdict(bool)
 
 
 def caller_can_manage_messages(channel, user) -> bool:
@@ -574,6 +578,14 @@ TOOL_LOOP_GUARD_WINDOW = 8
 # 권위 있는 상태 갱신이라 막으면 상태 기록이 멈추고, write_file은 CAS가 이미
 # 두 번째 동일 쓰기를 conflict로 돌려세운다.
 TOOL_LOOP_GUARD_TOOLS = ("bash_exec", "read_file", "web_search")
+# 루프 가드는 윈도우(최근 N스텝)만 기억해서 윈도우가 밀리면 같은 결정적 실패를
+# 무한히 재시도한다(read_file not_found 75회 실측). 확정 실패는 만료 없이
+# 기억하고, 시스템 프롬프트에도 누적해서 모델이 계획 단계에서 우회하게 한다.
+KNOWN_BAD_CALLS_MAX = 20
+AVOIDANCE_BLOCK_MAX_CHARS = 1200
+# artifact 통째 읽기는 결과가 또 artifact로 저장돼서 연쇄가 된다(out_*.log
+# cat 192→197 실측). N회 연속이면 막고 grep/head를 가리킨다.
+ARTIFACT_CHAIN_LIMIT = 3
 AGENT_STEP_MAX_TOKENS = CONFIG.agent_step_max_tokens
 REASONING_MAX_TOKENS = CONFIG.reasoning_max_tokens
 ADAPTIVE_REASONING = CONFIG.adaptive_reasoning
@@ -663,6 +675,22 @@ def _blocked_tool_result(
             "확보된 데이터를 가공하거나 새로운 가설을 시도하세요. 의도적인 "
             "재시도라면 force=true를 사용하세요."
         )
+    if reason == "known_failure" and first_step is not None:
+        payload["first_step"] = int(first_step)
+        payload["directive"] = (
+            f"[확정 실패 차단]: 이 호출은 Step {int(first_step)}에서 이미 "
+            "결정적으로 실패했습니다. 같은 인자로 재시도해도 같은 결과가 "
+            "나옵니다. 다른 경로나 인자를 시도하세요. 실제 상태가 "
+            "바뀌었을 때만 force=true를 사용하세요."
+        )
+    if reason == "artifact_chain":
+        payload["directive"] = (
+            "[Artifact 연쇄 차단]: artifact 파일 통째 읽기가 "
+            f"{int(count)}회 연속되었습니다. 통째로 읽으면 결과가 또 "
+            "artifact로 저장될 뿐 진전이 없습니다. grep -n '패턴'이나 "
+            "head로 필요한 줄만 조회하거나, 원본 내용은 lookup_trajectory로 "
+            "보세요. 정말 전체가 필요할 때만 force=true를 쓰세요."
+        )
     return json.dumps(
         payload,
         ensure_ascii=False,
@@ -704,6 +732,128 @@ def _tool_result_failed(tool_name: str, result: str) -> bool:
         return bool(exit_code and int(exit_code.group(1)) != 0)
     if tool_name == "record_state":
         return result.partition("\n")[0] == "[record_state status: refused]"
+    return False
+
+
+# 확정 실패(not_found 등)는 재시도해도 결과가 안 바뀌므로 만료 없이 기억한다.
+# _tool_fingerprint와 같은 effective key를 써서 같은 호출을 식별한다.
+DETERMINISTIC_TOOL_ERRORS = ("not_found",)
+
+
+def _known_bad_target(tool_name: str, arguments: dict) -> str:
+    key = {
+        "bash_exec": "command",
+        "read_file": "path",
+        "web_search": "query",
+    }.get(tool_name, "")
+    target = str((arguments or {}).get(key, ""))
+    return target if len(target) <= 80 else target[:77] + "..."
+
+
+def _deterministic_tool_failure(tool_name: str, result: str):
+    """결정적 실패면 (error, target)을, 아니면 None을 돌려준다."""
+    if not isinstance(result, str):
+        return None
+    try:
+        envelope = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    error = envelope.get("error")
+    if error not in DETERMINISTIC_TOOL_ERRORS:
+        return None
+    target = envelope.get("path") or envelope.get("name") or ""
+    if not target:
+        return None
+    return error, str(target)
+
+
+def _record_known_bad(known_bad_calls: dict, tool_name: str, arguments: dict,
+                      error: str, target: str, step: int):
+    """확정 실패를 기록한다. fingerprint를 만들 수 없으면 무시한다."""
+    if tool_name not in TOOL_LOOP_GUARD_TOOLS or not isinstance(arguments, dict):
+        return
+    try:
+        fingerprint = _tool_fingerprint(tool_name, arguments)
+    except KeyError:
+        return
+    entry = known_bad_calls.get(fingerprint)
+    if entry is None:
+        entry = {
+            "tool": tool_name,
+            "target": _known_bad_target(tool_name, arguments) or str(target),
+            "error": str(error),
+            "first_step": int(step),
+            "count": 0,
+        }
+        known_bad_calls[fingerprint] = entry
+    entry["count"] += 1
+    while len(known_bad_calls) > KNOWN_BAD_CALLS_MAX:
+        known_bad_calls.pop(next(iter(known_bad_calls)))
+
+
+def _known_bad_block(known_bad_calls: dict, tool_name: str, arguments: dict):
+    """확정 실패 호출이면 차단 결과 JSON을, 아니면 None을 돌려준다."""
+    if tool_name not in TOOL_LOOP_GUARD_TOOLS or not isinstance(arguments, dict):
+        return None
+    try:
+        fingerprint = _tool_fingerprint(tool_name, arguments)
+    except KeyError:
+        return None
+    entry = known_bad_calls.get(fingerprint)
+    if entry is None:
+        return None
+    return _blocked_tool_result(
+        "known_failure",
+        tool_name,
+        KNOWN_BAD_CALLS_MAX,
+        entry["count"],
+        first_step=entry["first_step"],
+    )
+
+
+def _render_avoidance_block(known_bad_calls: dict) -> str:
+    """시스템 프롬프트용 확정 실패 목록. 없으면 빈 문자열."""
+    if not known_bad_calls:
+        return ""
+    lines = [
+        "[재시도 금지(확정 실패): 아래 호출은 이미 결정적으로 실패했습니다. "
+        "같은 인자로 다시 호출하지 마세요.]"
+    ]
+    for entry in list(known_bad_calls.values())[:8]:
+        lines.append(
+            f"- {entry['tool']} {entry['target']} → {entry['error']} "
+            f"(step {entry['first_step']})"
+        )
+    block = "\n".join(lines)
+    if len(block) > AVOIDANCE_BLOCK_MAX_CHARS:
+        block = block[:AVOIDANCE_BLOCK_MAX_CHARS] + "…"
+    return block
+
+
+def _invalidate_known_bad(known_bad_calls: dict, tool_name: str, arguments: dict):
+    """write_file 성공 시 같은 path의 read not_found 기록을 지운다."""
+    if tool_name != "write_file" or not isinstance(arguments, dict):
+        return
+    path = arguments.get("path")
+    if not path:
+        return
+    try:
+        fingerprint = _tool_fingerprint("read_file", {"path": path})
+    except KeyError:
+        return
+    known_bad_calls.pop(fingerprint, None)
+
+
+def _is_artifact_read(tool_name: str, arguments: dict) -> bool:
+    """artifact 파일 통째 읽기를 판정한다."""
+    if not isinstance(arguments, dict):
+        return False
+    if tool_name == "bash_exec":
+        return "artifacts/" in str(arguments.get("command", ""))
+    if tool_name == "read_file":
+        return str(arguments.get("path", "")).startswith("artifacts/")
     return False
 
 
@@ -2764,6 +2914,33 @@ def compact_resume_summary(
     )
 
 
+# 재개는 ledger·목표·회피목록·contract를 계승하고, 절차 상세(Tier 3)는
+# 버린다. 오염된 루프 기록을 매 스텝 다시 읽게 하지 않기 위해서다. 원본은
+# traj.jsonl·state.json에 그대로 남아 lookup_trajectory로 꺼낼 수 있다.
+RESUME_COMPACT_TIER2_LINES = 6
+RESUME_COMPACT_DISCOVERIES = 4
+RESUME_COMPACT_LEGACY_CHARS = 2000
+
+
+def _parse_resume_args(parts):
+    """!resume <run-id> [--full]. 기본은 압축 재개다."""
+    args = list(parts or [])
+    full = "--full" in args[2:]
+    run_id = args[1] if len(args) > 1 else ""
+    return run_id, full
+
+
+def _compact_summary_for_resume(summary):
+    source = str(summary or "")
+    if not source.strip():
+        return ""
+    if not source.startswith(_TIERED_SUMMARY_VERSION_LINE):
+        return _clip_summary_text(source, RESUME_COMPACT_LEGACY_CHARS)
+    return compact_resume_summary(
+        source, RESUME_COMPACT_TIER2_LINES, 0, RESUME_COMPACT_DISCOVERIES
+    )
+
+
 def _deterministic_tier3_fallback(source: str, start_step: int, end_step: int) -> str:
     groups = {}
     for line in str(source or "").splitlines():
@@ -3177,6 +3354,14 @@ def build_system_content(
         parts.append(skills_block)
     parts.append(_render_task_contract(workspace, task_contract))
     parts.append(_render_artifact_manifest(artifact_manifest))
+    # 확정 실패 목록은 런Scoped로 workspace 객체에 붙어 다닌다. 스레딩 대신
+    # 여기서 읽는 이유는 prepare 내부의 시스템 메시지 재구성 3곳까지 같은
+    # 목록을 보게 하기 위해서다. 없으면(테스트 SimpleNamespace 등) 생략된다.
+    avoidance = _render_avoidance_block(
+        getattr(workspace, "known_bad_calls", None) or {}
+    )
+    if avoidance:
+        parts.append(avoidance)
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
@@ -4036,6 +4221,232 @@ def prepare_new_run(owner_id, channel_id):
     return workspace
 
 
+# 인계는 ledger·회피목록·산출물을 새 run에 넘긴다. clear_channel_state와 달리
+# 이전 run의 durable 레코드는 지우지 않는다(재개 가능하게 둔다).
+HANDOVER_ARTIFACT_DIR = "handover"
+HANDOVER_ARTIFACT_MAX_FILES = 50
+HANDOVER_ARTIFACT_MAX_BYTES = 65536
+HANDOVER_NOTE_MAX_CHARS = 2000
+
+
+def _build_handover_note(record, old_run_id, copied_artifacts):
+    ledger = record.get("ledger")
+    goal = ""
+    counts = ""
+    try:
+        # load()는 ResearchLedger 객체를, 낡은 경로·테스트는 dict를 준다.
+        snapshot = ledger.to_dict() if hasattr(ledger, "to_dict") else ledger
+        goal = str(snapshot.get("goal", "") or "")[:300]
+        counts = (
+            f"가설 {len(snapshot.get('hypotheses', []) or [])}/"
+            f"증거 {len(snapshot.get('evidence', []) or [])}/"
+            f"결론 {len(snapshot.get('conclusions', []) or [])}"
+        )
+    except (AttributeError, TypeError):
+        pass
+    known = run_state.normalize_known_bad_calls(record.get("known_bad_calls"))
+    avoidance = ", ".join(
+        f"{entry['tool']} {entry['target']}→{entry['error']}"
+        for entry in list(known.values())[:8]
+    ) or "없음"
+    tier2 = compact_resume_summary(
+        record.get("summary", ""),
+        RESUME_COMPACT_TIER2_LINES,
+        0,
+        RESUME_COMPACT_DISCOVERIES,
+    )
+    note = (
+        f"[이전 run {old_run_id} 인계: 목표·판단·회피목록만 계승합니다. "
+        "절차 상세를 더 보려면 이전 run 기록을 직접 조회하세요.]\n"
+        f"목표: {goal or '(없음)'} ({counts or '판단 없음'})\n"
+        f"재시도 금지: {avoidance}\n"
+        f"이전 산출물: {HANDOVER_ARTIFACT_DIR}/ 에 {copied_artifacts}건 복사됨\n"
+        f"{tier2}"
+    )
+    return _clip_summary_text(note, HANDOVER_NOTE_MAX_CHARS)
+
+
+# 되돌리기는 절차만 N스텝으로 자르고 판단(ledger)은 유지한다. 잘라낸 traj는
+# 백업하고, Tier 3는 남은 traj에서 재생성한다. 바깥 부작용(실행된 명령·쓴
+# 파일)은 되돌릴 수 없으므로 조사형 run이 대상이다.
+REWIND_BACKUP_NAME = "traj.jsonl.bak"
+REWIND_ARTIFACT_DELETE_MAX = 200
+_TIER2_STEP_PATTERN = re.compile(r"Step (\d+)")
+
+
+def _parse_rewind_args(parts):
+    """!rewind <run-id> <step>."""
+    args = list(parts or [])
+    run_id = args[1] if len(args) > 1 else ""
+    try:
+        step = int(args[2]) if len(args) > 2 else 0
+    except (TypeError, ValueError):
+        step = 0
+    return run_id, step
+
+
+def _tier2_line_start(line: str):
+    match = _TIER2_STEP_PATTERN.search(str(line or ""))
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return 0
+
+
+def rewind_run(owner_id, channel_id, run_id, step):
+    """run을 N스텝으로 되돌리고 그 다음 목표 선택으로 둔다. 통계 dict 반환."""
+    if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+        raise ValueError("step must be a positive integer")
+    old_workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if old_workspace.status == "active":
+        raise RunActiveError("run is active")
+    record = run_state.load(old_workspace)
+    if record is None:
+        raise RunNotFoundError("run not found")
+    if step >= record["next_step"]:
+        raise ValueError("step must be before the current step")
+    records, complete = trajectory.read_records(old_workspace)
+    if not complete:
+        raise ValueError("trajectory is not trustworthy")
+    root = Path(old_workspace.root)
+    backup = root / REWIND_BACKUP_NAME
+    try:
+        traj_path = trajectory.trajectory_path(old_workspace)
+        backup.write_bytes(traj_path.read_bytes())
+        kept = [rec for rec in records if rec.get("step", 0) <= step]
+        lines = "".join(
+            trajectory._canonical(rec) + "\n" for rec in kept
+        ).encode("utf-8")
+        atomic_write(traj_path, lines)
+    except OSError as exc:
+        raise ValueError(f"cannot rewrite trajectory: {exc}") from exc
+    dropped = [rec for rec in records if rec.get("step", 0) > step]
+    artifacts_deleted = 0
+    for rec in dropped:
+        if artifacts_deleted >= REWIND_ARTIFACT_DELETE_MAX:
+            break
+        artifact_path = rec.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            continue
+        try:
+            target = (root / artifact_path).resolve()
+            if target.is_file() and target.is_relative_to(root.resolve()):
+                target.unlink()
+                artifacts_deleted += 1
+        except OSError:
+            continue
+    summary = record.get("summary", "")
+    parsed = parse_tiered_summary(summary)
+    is_tiered = str(summary or "").startswith(_TIERED_SUMMARY_VERSION_LINE) and (
+        any(parsed.values())
+        or str(summary or "").strip() == format_tiered_summary()
+    )
+    if is_tiered:
+        tier2 = [
+            line for line in parsed["tier2"]
+            if _tier2_line_start(line) <= step
+        ]
+        tier3_text, tier3_through = trajectory.procedural_source(
+            old_workspace, step, _TIER3_MAX_CHARS
+        )
+        summary = format_tiered_summary(
+            tier3=tier3_text,
+            tier3_through=tier3_through,
+            tier2_lines=tier2,
+            discoveries=parsed["discoveries"],
+        )
+    known = run_state.normalize_known_bad_calls(record.get("known_bad_calls"))
+    known = {
+        fingerprint: entry
+        for fingerprint, entry in known.items()
+        if entry["first_step"] <= step
+    }
+    fingerprints = [
+        [fingerprint, seen_step]
+        for fingerprint, seen_step in (record.get("tool_fingerprints") or [])
+        if isinstance(seen_step, int) and seen_step <= step
+    ]
+    manifest = run_state._normalize_artifact_manifest(
+        record.get("artifact_manifest")
+    )
+    manifest["items"] = [
+        item for item in manifest["items"] if item.get("step", 0) <= step
+    ]
+    gap = record.get("trajectory_gap_step")
+    if not isinstance(gap, int) or isinstance(gap, bool) or gap > step:
+        gap = None
+    run_state.save(
+        old_workspace,
+        message_id=record.get("message_id"),
+        next_step=step + 1,
+        summary=summary,
+        tail=[],
+        ledger=record["ledger"],
+        interrupt=record.get("interrupt") or {},
+        announced_call_ids=record.get("announced_call_ids") or [],
+        tool_fingerprints=fingerprints,
+        trajectory_gap_step=gap,
+        state=record.get("state") or run_state.RUNNING,
+        task_contract=record.get("task_contract"),
+        artifact_manifest=manifest,
+        known_bad_calls=known,
+        artifact_chain=0,
+    )
+    workspace = RUN_CATALOG.resume(owner_id, channel_id, old_workspace.run_id)
+    stats = {
+        "run_id": workspace.run_id,
+        "step": step,
+        "next_step": step + 1,
+        "dropped_records": len(dropped),
+        "artifacts_deleted": artifacts_deleted,
+    }
+    log_session_event(
+        old_workspace, "run_rewound", **stats,
+    )
+    return workspace, stats
+
+
+def handover_run(owner_id, channel_id, run_id):
+    """이전 run의 판단·회피목록·산출물을 새 run에 실어 둔다. (workspace, note)."""
+    old_workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if old_workspace.status == "active":
+        raise RunActiveError("run is active")
+    record = run_state.load(old_workspace)
+    if record is None:
+        raise RunNotFoundError("run not found")
+    workspace = RUN_CATALOG.prepare(owner_id, channel_id)
+    # 채널 기억은 비우되 이전 레코드는 남긴다.
+    channel_history[channel_id].clear()
+    channel_summary[channel_id] = ""
+    channel_ledger[channel_id].clear()
+    known = run_state.normalize_known_bad_calls(record.get("known_bad_calls"))
+    workspace.known_bad_calls = {
+        fingerprint: dict(entry) for fingerprint, entry in known.items()
+    }
+    copied = 0
+    try:
+        source_dir = Path(old_workspace.root) / "artifacts"
+        target_dir = Path(workspace.root) / HANDOVER_ARTIFACT_DIR
+        if source_dir.is_dir():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for child in sorted(source_dir.iterdir()):
+                if copied >= HANDOVER_ARTIFACT_MAX_FILES:
+                    break
+                if not child.is_file() or child.stat().st_size > HANDOVER_ARTIFACT_MAX_BYTES:
+                    continue
+                shutil.copy2(child, target_dir / child.name)
+                copied += 1
+    except OSError:
+        pass
+    note = _build_handover_note(record, old_workspace.run_id, copied)
+    channel_summary[channel_id] = note
+    if record.get("ledger") is not None:
+        channel_ledger[channel_id] = record["ledger"]
+    return workspace, note
+
+
 _AUTO_RESUME_KOREAN_MARKERS = (
     "이전",
     "계속",
@@ -4371,17 +4782,19 @@ async def on_message(message: discord.Message):
         if not control:
             await message.reply(f"⛔ {control.reason}")
             return
-        if len(parts) != 2:
-            await message.reply("사용법: `!resume <run-id>`")
+        resume_run_id, resume_full = _parse_resume_args(parts)
+        if not resume_run_id or resume_run_id.startswith("--"):
+            await message.reply("사용법: `!resume <run-id> [--full]`")
             return
         try:
-            workspace = resume_run(caller_id, message.channel.id, parts[1])
+            workspace = resume_run(caller_id, message.channel.id, resume_run_id)
         except RunNotFoundError:
             await message.reply("run not found")
             return
         except RunActiveError:
             await message.reply("run is active")
             return
+        channel_resume_full[message.channel.id] = resume_full
         await message.reply(f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다.")
         return
 
@@ -4403,6 +4816,59 @@ async def on_message(message: discord.Message):
             return
         await message.reply(
             f"🧭 run `{parts[1]}`의 목표·조사 요약만 새 run `{workspace.run_id}`으로 가져왔습니다."
+        )
+        return
+
+    if cmd_name in ["!handover", "/handover"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        if len(parts) != 2:
+            await message.reply("사용법: `!handover <run-id>`")
+            return
+        try:
+            workspace, _note = handover_run(caller_id, message.channel.id, parts[1])
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("실행 중인 run입니다. `!stop` 후 인계하세요.")
+            return
+        await message.reply(
+            f"🔀 run `{parts[1]}`의 판단·회피목록·산출물을 새 run `{workspace.run_id}`에 인계했습니다. "
+            "이어갈 목표를 보내주세요."
+        )
+        return
+
+    if cmd_name in ["!rewind", "/rewind"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        rewind_run_id, rewind_step = _parse_rewind_args(parts)
+        if not rewind_run_id or rewind_step < 1:
+            await message.reply("사용법: `!rewind <run-id> <step>`")
+            return
+        try:
+            workspace, stats = rewind_run(
+                caller_id, message.channel.id, rewind_run_id, rewind_step
+            )
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("실행 중인 run입니다. `!stop` 후 되돌리세요.")
+            return
+        except ValueError as exc:
+            await message.reply(f"되돌릴 수 없습니다: {exc}")
+            return
+        await message.reply(
+            f"⏪ run `{workspace.run_id}`을 Step {stats['step']}으로 되돌렸습니다 "
+            f"(다음 Step {stats['next_step']}, 버린 기록 {stats['dropped_records']}건, "
+            f"지운 산출물 {stats['artifacts_deleted']}건). 잘라낸 기록은 traj.jsonl.bak에 있습니다. "
+            "이어갈 지시를 보내주세요."
+>>>>>>> origin/main
         )
         return
 
@@ -4646,6 +5112,19 @@ async def on_message(message: discord.Message):
         if restored is not None
         else []
     )
+    # 확정 실패 회피 목록. 구 레코드에는 키가 없어 {}로 시작한다. 시스템
+    # 프롬프트 렌더가 workspace에서 읽으므로 같은 dict 객체를 붙여 둔다.
+    known_bad_calls = (
+        run_state.normalize_known_bad_calls(restored.get("known_bad_calls"))
+        if restored is not None
+        else {}
+    )
+    workspace.known_bad_calls = known_bad_calls
+    consecutive_artifact_reads = (
+        run_state.normalize_artifact_chain(restored.get("artifact_chain"))
+        if restored is not None
+        else 0
+    )
     run_end_logged = False
     released = False
 
@@ -4727,6 +5206,14 @@ async def on_message(message: discord.Message):
     if restored is not None:
         # 재개는 조용히 일어나지 않는다. 이 레코드가 없으면 Step 기록만으로는
         # 재시작 때문인지 새 요청 때문인지 구분할 수 없다.
+        resume_full = channel_resume_full.pop(message.channel.id, False)
+        resumed_summary = restored["summary"]
+        summary_compacted = False
+        if not same_origin and not resume_full:
+            compacted = _compact_summary_for_resume(resumed_summary)
+            if compacted != resumed_summary:
+                resumed_summary = compacted
+                summary_compacted = True
         log_session_event(
             workspace,
             "run_resumed",
@@ -4735,16 +5222,19 @@ async def on_message(message: discord.Message):
             same_origin=same_origin,
             tail_msgs=len(restored["tail"]),
             calls=len(announced_call_ids),
-            summary_chars=len(restored["summary"]),
+            summary_chars=len(resumed_summary),
+            summary_compacted=summary_compacted,
+            resume_full=resume_full,
             automatic=automatic_resume,
         )
         # 재시작으로 비어 있던 채널 메모리를 레코드의 값으로 되돌린다.
-        channel_summary[message.channel.id] = restored["summary"]
+        channel_summary[message.channel.id] = resumed_summary
         channel_ledger[message.channel.id] = restored["ledger"]
         try:
             await message.channel.send(
                 f"▶️ **[중단된 실행 재개]** run `{workspace.run_id}`을 Step {resume_from}에서 "
                 f"이어갑니다. 이미 알린 도구 호출 {len(announced_call_ids)}건은 다시 받지 않습니다."
+                + (" 요약은 압축해서 이어갑니다." if summary_compacted else "")
             )
         except Exception:
             pass
@@ -4902,6 +5392,8 @@ async def on_message(message: discord.Message):
                 trajectory_gap_step=trajectory_gap_step,
                 task_contract=task_contract,
                 artifact_manifest=artifact_manifest,
+                known_bad_calls=known_bad_calls,
+                artifact_chain=consecutive_artifact_reads,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -5489,6 +5981,7 @@ async def on_message(message: discord.Message):
                 ]
                 batch_signatures = set()
                 batch_fingerprints = set()
+                batch_artifact_reads = 0
                 allowed_calls = []
                 allowed_indexes = []
                 allowed_failure_signatures = []
@@ -5584,6 +6077,51 @@ async def on_message(message: discord.Message):
                             first_step=prior_step,
                         )
                         continue
+                    if tc["arguments"].get("force") is not True:
+                        known_block = _known_bad_block(
+                            known_bad_calls, tc["name"], tc["arguments"]
+                        )
+                        if known_block is not None:
+                            batch_signatures.add(signature)
+                            if guarded_fingerprint is not None:
+                                batch_fingerprints.add(guarded_fingerprint)
+                            merged_results[call_index] = known_block
+                            log_session_event(
+                                workspace,
+                                "tool_known_bad_blocked",
+                                step=current_tool_step,
+                                tool=tc["name"],
+                                fingerprint=(guarded_fingerprint or "")[:16],
+                            )
+                            continue
+                    is_artifact_read = _is_artifact_read(tc["name"], tc["arguments"])
+                    if (
+                        is_artifact_read
+                        and tc["arguments"].get("force") is not True
+                        and consecutive_artifact_reads + batch_artifact_reads
+                        >= ARTIFACT_CHAIN_LIMIT
+                    ):
+                        batch_signatures.add(signature)
+                        if guarded_fingerprint is not None:
+                            batch_fingerprints.add(guarded_fingerprint)
+                        merged_results[call_index] = _blocked_tool_result(
+                            "artifact_chain",
+                            tc["name"],
+                            ARTIFACT_CHAIN_LIMIT,
+                            consecutive_artifact_reads
+                            + batch_artifact_reads
+                            + 1,
+                        )
+                        log_session_event(
+                            workspace,
+                            "tool_artifact_chain_blocked",
+                            step=current_tool_step,
+                            tool=tc["name"],
+                            chain=consecutive_artifact_reads
+                            + batch_artifact_reads
+                            + 1,
+                        )
+                        continue
                     if (
                         total_tools_executed + len(allowed_calls)
                         >= MAX_TOOL_EXECUTIONS_PER_RUN
@@ -5598,6 +6136,8 @@ async def on_message(message: discord.Message):
                     batch_signatures.add(signature)
                     if guarded_fingerprint is not None:
                         batch_fingerprints.add(guarded_fingerprint)
+                    if is_artifact_read:
+                        batch_artifact_reads += 1
                     allowed_calls.append(tc)
                     allowed_indexes.append(call_index)
                     allowed_failure_signatures.append(failure_signature)
@@ -5725,9 +6265,25 @@ async def on_message(message: discord.Message):
                         else:
                             last_failed_signature = failure_signature
                             consecutive_failed_tool_calls = 1
+                        deterministic = _deterministic_tool_failure(
+                            tc["name"], tool_result
+                        )
+                        if deterministic is not None:
+                            error, target = deterministic
+                            _record_known_bad(
+                                known_bad_calls,
+                                tc["name"],
+                                tc["arguments"],
+                                error,
+                                target,
+                                current_tool_step,
+                            )
                     else:
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
+                        _invalidate_known_bad(
+                            known_bad_calls, tc["name"], tc["arguments"]
+                        )
                         if guarded_fingerprint is not None:
                             recent_tool_fingerprints[:] = [
                                 [fingerprint, seen_step]
@@ -5737,6 +6293,15 @@ async def on_message(message: discord.Message):
                             recent_tool_fingerprints.append(
                                 [guarded_fingerprint, current_tool_step]
                             )
+
+                if allowed_calls:
+                    if any(
+                        not _is_artifact_read(tc["name"], tc["arguments"])
+                        for tc in allowed_calls
+                    ):
+                        consecutive_artifact_reads = 0
+                    else:
+                        consecutive_artifact_reads += batch_artifact_reads
 
                 for result_index, (tc, tool_result) in enumerate(
                     zip(tool_calls_to_run, merged_results)
