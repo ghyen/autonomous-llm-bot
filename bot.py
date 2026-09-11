@@ -48,7 +48,7 @@ from deadlines import (
 )
 from outcome import RunOutcome
 from ledger import ResearchLedger
-from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
+from run_workspace import RunActiveError, RunCatalog, RunNotFoundError, atomic_write
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
 import tool_sandbox
@@ -3999,6 +3999,148 @@ def _build_handover_note(record, old_run_id, copied_artifacts):
     return _clip_summary_text(note, HANDOVER_NOTE_MAX_CHARS)
 
 
+# 되돌리기는 절차만 N스텝으로 자르고 판단(ledger)은 유지한다. 잘라낸 traj는
+# 백업하고, Tier 3는 남은 traj에서 재생성한다. 바깥 부작용(실행된 명령·쓴
+# 파일)은 되돌릴 수 없으므로 조사형 run이 대상이다.
+REWIND_BACKUP_NAME = "traj.jsonl.bak"
+REWIND_ARTIFACT_DELETE_MAX = 200
+_TIER2_STEP_PATTERN = re.compile(r"Step (\d+)")
+
+
+def _parse_rewind_args(parts):
+    """!rewind <run-id> <step>."""
+    args = list(parts or [])
+    run_id = args[1] if len(args) > 1 else ""
+    try:
+        step = int(args[2]) if len(args) > 2 else 0
+    except (TypeError, ValueError):
+        step = 0
+    return run_id, step
+
+
+def _tier2_line_start(line: str):
+    match = _TIER2_STEP_PATTERN.search(str(line or ""))
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return 0
+
+
+def rewind_run(owner_id, channel_id, run_id, step):
+    """run을 N스텝으로 되돌리고 그 다음 목표 선택으로 둔다. 통계 dict 반환."""
+    if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+        raise ValueError("step must be a positive integer")
+    old_workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if old_workspace.status == "active":
+        raise RunActiveError("run is active")
+    record = run_state.load(old_workspace)
+    if record is None:
+        raise RunNotFoundError("run not found")
+    if step >= record["next_step"]:
+        raise ValueError("step must be before the current step")
+    records, complete = trajectory.read_records(old_workspace)
+    if not complete:
+        raise ValueError("trajectory is not trustworthy")
+    root = Path(old_workspace.root)
+    backup = root / REWIND_BACKUP_NAME
+    try:
+        traj_path = trajectory.trajectory_path(old_workspace)
+        backup.write_bytes(traj_path.read_bytes())
+        kept = [rec for rec in records if rec.get("step", 0) <= step]
+        lines = "".join(
+            trajectory._canonical(rec) + "\n" for rec in kept
+        ).encode("utf-8")
+        atomic_write(traj_path, lines)
+    except OSError as exc:
+        raise ValueError(f"cannot rewrite trajectory: {exc}") from exc
+    dropped = [rec for rec in records if rec.get("step", 0) > step]
+    artifacts_deleted = 0
+    for rec in dropped:
+        if artifacts_deleted >= REWIND_ARTIFACT_DELETE_MAX:
+            break
+        artifact_path = rec.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            continue
+        try:
+            target = (root / artifact_path).resolve()
+            if target.is_file() and target.is_relative_to(root.resolve()):
+                target.unlink()
+                artifacts_deleted += 1
+        except OSError:
+            continue
+    summary = record.get("summary", "")
+    parsed = parse_tiered_summary(summary)
+    is_tiered = str(summary or "").startswith(_TIERED_SUMMARY_VERSION_LINE) and (
+        any(parsed.values())
+        or str(summary or "").strip() == format_tiered_summary()
+    )
+    if is_tiered:
+        tier2 = [
+            line for line in parsed["tier2"]
+            if _tier2_line_start(line) <= step
+        ]
+        tier3_text, tier3_through = trajectory.procedural_source(
+            old_workspace, step, _TIER3_MAX_CHARS
+        )
+        summary = format_tiered_summary(
+            tier3=tier3_text,
+            tier3_through=tier3_through,
+            tier2_lines=tier2,
+            discoveries=parsed["discoveries"],
+        )
+    known = run_state.normalize_known_bad_calls(record.get("known_bad_calls"))
+    known = {
+        fingerprint: entry
+        for fingerprint, entry in known.items()
+        if entry["first_step"] <= step
+    }
+    fingerprints = [
+        [fingerprint, seen_step]
+        for fingerprint, seen_step in (record.get("tool_fingerprints") or [])
+        if isinstance(seen_step, int) and seen_step <= step
+    ]
+    manifest = run_state._normalize_artifact_manifest(
+        record.get("artifact_manifest")
+    )
+    manifest["items"] = [
+        item for item in manifest["items"] if item.get("step", 0) <= step
+    ]
+    gap = record.get("trajectory_gap_step")
+    if not isinstance(gap, int) or isinstance(gap, bool) or gap > step:
+        gap = None
+    run_state.save(
+        old_workspace,
+        message_id=record.get("message_id"),
+        next_step=step + 1,
+        summary=summary,
+        tail=[],
+        ledger=record["ledger"],
+        interrupt=record.get("interrupt") or {},
+        announced_call_ids=record.get("announced_call_ids") or [],
+        tool_fingerprints=fingerprints,
+        trajectory_gap_step=gap,
+        state=record.get("state") or run_state.RUNNING,
+        task_contract=record.get("task_contract"),
+        artifact_manifest=manifest,
+        known_bad_calls=known,
+        artifact_chain=0,
+    )
+    workspace = RUN_CATALOG.resume(owner_id, channel_id, old_workspace.run_id)
+    stats = {
+        "run_id": workspace.run_id,
+        "step": step,
+        "next_step": step + 1,
+        "dropped_records": len(dropped),
+        "artifacts_deleted": artifacts_deleted,
+    }
+    log_session_event(
+        old_workspace, "run_rewound", **stats,
+    )
+    return workspace, stats
+
+
 def handover_run(owner_id, channel_id, run_id):
     """이전 run의 판단·회피목록·산출물을 새 run에 실어 둔다. (workspace, note)."""
     old_workspace = RUN_CATALOG.lookup_owned(owner_id, run_id)
@@ -4332,6 +4474,36 @@ async def on_message(message: discord.Message):
         await message.reply(
             f"🔀 run `{parts[1]}`의 판단·회피목록·산출물을 새 run `{workspace.run_id}`에 인계했습니다. "
             "이어갈 목표를 보내주세요."
+        )
+        return
+
+    if cmd_name in ["!rewind", "/rewind"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        rewind_run_id, rewind_step = _parse_rewind_args(parts)
+        if not rewind_run_id or rewind_step < 1:
+            await message.reply("사용법: `!rewind <run-id> <step>`")
+            return
+        try:
+            workspace, stats = rewind_run(
+                caller_id, message.channel.id, rewind_run_id, rewind_step
+            )
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("실행 중인 run입니다. `!stop` 후 되돌리세요.")
+            return
+        except ValueError as exc:
+            await message.reply(f"되돌릴 수 없습니다: {exc}")
+            return
+        await message.reply(
+            f"⏪ run `{workspace.run_id}`을 Step {stats['step']}으로 되돌렸습니다 "
+            f"(다음 Step {stats['next_step']}, 버린 기록 {stats['dropped_records']}건, "
+            f"지운 산출물 {stats['artifacts_deleted']}건). 잘라낸 기록은 traj.jsonl.bak에 있습니다. "
+            "이어갈 지시를 보내주세요."
         )
         return
 
