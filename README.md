@@ -463,7 +463,7 @@ message came from, never who sent it. Identity is `DISCORD_ALLOWED_USER_IDS`.
 | :--- | :--- |
 | Talk to the bot at all | On `DISCORD_ALLOWED_USER_IDS` |
 | `!stop`, `!reset`, `!new`, mid-flight steering | The owner of the active run, or a `DISCORD_ADMIN_USER_IDS` admin. With no run in flight, any allowed caller. |
-| `!resume <run-id>` / `!delete <run-id>` | Exact run owner only after normal caller authorization; admin status does not grant workspace access. |
+| `!resume <run-id>` / `!fork <run-id>` / `!delete <run-id>` | Exact run owner only after normal caller authorization; admin status does not grant workspace access. |
 | `!clear` / `/clear` (bulk delete) | An admin **and** the caller's own Discord "Manage Messages" permission. The bot's permission is not the caller's. |
 
 Text commands and slash commands share the same policy path. Deletion is
@@ -480,6 +480,7 @@ leaves your history intact and is reported as a failure.
 | `!reset` / `/reset` | Clears channel memory and prepares a blank run for the next goal; rejects while the caller/channel owns an active run. |
 | `!new` / `/new` | Alias of reset with the same authorization and active-run preflight. |
 | `!resume <run-id>` / `/resume` | Selects the exact inactive run for its owner; the next accepted goal consumes it with an empty read cache. |
+| `!fork <run-id>` / `/fork` | Creates a fresh run with only the source run's recovered goal, bounded summary, and ledger; old files and full history stay isolated. |
 | Continuation-intent message | A message such as “이전 데이터 참고해서 계속해줘” resumes the newest valid incomplete run in the same owner/channel; an ordinary new goal starts a new run. |
 | `!delete <run-id>` / `/delete` | Deletes an exact-owner inactive workspace and its run log. Active runs are rejected; cross-owner IDs are not disclosed. |
 | `!clear [count]` / `/clear` | Preflights active state, purges recent Discord messages, then prepares a blank run and clears channel memory. Failure changes nothing. |

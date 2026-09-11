@@ -46,7 +46,7 @@ from deadlines import (
     with_deadline,
 )
 from outcome import RunOutcome
-from ledger import ResearchLedger
+from ledger import LedgerRefusal, ResearchLedger
 from run_workspace import RunActiveError, RunCatalog, RunNotFoundError
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
@@ -2178,6 +2178,7 @@ async def prepare_agent_request_payload(
                 break
 
     if input_tokens is not None and input_tokens > input_budget:
+        before_summary = summary
         live_messages, summary = await rollover_agent_context(
             workspace,
             live_messages,
@@ -2189,7 +2190,7 @@ async def prepare_agent_request_payload(
             task_contract=task_contract,
             artifact_manifest=artifact_manifest,
         )
-        rollover_used = True
+        rollover_used = summary != before_summary
         payload = build_agent_request_payload(workspace, live_messages)
         input_tokens = await count(payload)
 
@@ -2853,6 +2854,272 @@ def resolve_task_contract(restored, message_id, content, same_origin):
                 "goal": _clip_summary_text(candidate, TASK_CONTRACT_MAX_CHARS),
             }
     return None
+
+
+LEGACY_RECONSTRUCTED_EVIDENCE_MAX = 12
+
+
+def _trajectory_state_updates(record):
+    if (
+        not isinstance(record, dict)
+        or record.get("tool") != "record_state"
+        or not record.get("executed")
+        or record.get("failed")
+    ):
+        return None
+    arguments = record.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    updates = arguments.get("updates", arguments)
+    return updates if isinstance(updates, dict) else None
+
+
+def _trajectory_goal(records):
+    goal = ""
+    for record in records:
+        updates = _trajectory_state_updates(record)
+        candidate = updates.get("goal") if updates else None
+        if isinstance(candidate, str) and candidate.strip():
+            goal = _clip_summary_text(candidate, TASK_CONTRACT_MAX_CHARS)
+    return goal
+
+
+def _legacy_result_evidence(record):
+    result = " ".join(str(record.get("result") or "").split())
+    if not result:
+        return ""
+    return _clip_summary_text(
+        f"{record.get('tool') or 'unknown'} 실행 결과: {result}", 220
+    )
+
+
+def _legacy_findings(workspace):
+    if not hasattr(workspace, "read"):
+        return ""
+    try:
+        result = workspace.read("findings.md")
+    except (OSError, ValueError):
+        return ""
+    if result.get("status") != "success":
+        return ""
+    return str(result.get("content") or "").strip()
+
+
+def _rebuild_legacy_summary(
+    workspace, existing_summary, records, trusted_step, include_findings=True
+):
+    if not records:
+        return str(existing_summary or "")
+    parsed = parse_tiered_summary(existing_summary)
+    if (
+        existing_summary
+        and parsed["tier3_through"] >= trusted_step
+        and (parsed["tier3"] or parsed["tier2"])
+    ):
+        return existing_summary
+
+    source, source_through = trajectory.procedural_source(
+        workspace,
+        trusted_step,
+        max_chars=ROLLING_SUMMARY_MAX_CHARS,
+    )
+    tier3_parts = []
+    if parsed["tier3"]:
+        tier3_parts.append(parsed["tier3"])
+    elif existing_summary:
+        tier3_parts.append(
+            "- 기존 저장 요약: " + _clip_summary_text(existing_summary, 800)
+        )
+    if source:
+        tier3_parts.append(
+            _deterministic_tier3_fallback(source, 1, source_through)
+        )
+    if not tier3_parts:
+        tier3_parts.append(
+            _deterministic_tier3_fallback("", 1, trusted_step)
+        )
+    tier2_start = max(1, trusted_step - _TIER2_MAX_LINES + 1)
+    tier2_lines = trajectory.micro_index(workspace, tier2_start, trusted_step)
+    findings = _legacy_findings(workspace) if include_findings else ""
+    discovery_source = "\n".join(
+        part for part in (source, *tier2_lines, findings) if part
+    )
+    discoveries = extract_discovered_artifacts(discovery_source, workspace)
+    if findings and not discoveries:
+        discoveries = ["- 기존 findings.md를 복구 입력으로 사용했습니다."]
+    return format_tiered_summary(
+        tier3="\n".join(tier3_parts),
+        tier3_through=max(source_through, parsed["tier3_through"]),
+        tier2_lines=tier2_lines,
+        discoveries=discoveries,
+    )
+
+
+def rebuild_legacy_resume_state(workspace, restored, persist=True):
+    """Rebuild a bounded legacy snapshot from durable trajectory records."""
+    if not isinstance(restored, dict):
+        return restored
+    ledger = ResearchLedger.from_dict(restored["ledger"].to_dict())
+    original_ledger = ledger.to_dict()
+    try:
+        records, _complete = trajectory.read_records(workspace)
+    except (OSError, ValueError):
+        records = []
+    gap_step = restored.get("trajectory_gap_step")
+    has_gap = (
+        isinstance(gap_step, int)
+        and not isinstance(gap_step, bool)
+        and gap_step > 0
+    )
+    trusted_records = [
+        record
+        for record in records
+        if not has_gap
+        or record.get("step", 0) < gap_step
+    ]
+    last_step = trusted_records[-1]["step"] if trusted_records else 0
+    trusted_step = last_step
+
+    trajectory_goal = _trajectory_goal(trusted_records)
+    existing_contract = restored.get("task_contract")
+    contract_goal = (
+        existing_contract.get("goal")
+        if isinstance(existing_contract, dict) and existing_contract.get("goal")
+        else ""
+    )
+
+    for record in trusted_records:
+        updates = _trajectory_state_updates(record)
+        if updates is None:
+            continue
+        candidate = ResearchLedger.from_dict(ledger.to_dict())
+        try:
+            candidate.apply_updates(updates)
+        except (LedgerRefusal, TypeError, ValueError, KeyError):
+            continue
+        ledger = candidate
+    if not ledger.goal:
+        ledger.set_goal(trajectory_goal or contract_goal)
+
+    goal = contract_goal or trajectory_goal or ledger.goal
+
+    ordinary_records = [
+        record
+        for record in trusted_records
+        if record.get("executed")
+        and not record.get("failed")
+        and record.get("tool") not in (
+            "record_state",
+            "finish_task",
+            "think",
+            "lookup_trajectory",
+        )
+        and _legacy_result_evidence(record)
+    ]
+    for record in ordinary_records[-LEGACY_RECONSTRUCTED_EVIDENCE_MAX:]:
+        record_id = str(record.get("id") or "")
+        if not record_id:
+            continue
+        evidence_id = "TRAJ_" + record_id[:16]
+        try:
+            ledger.add_evidence(
+                evidence_id,
+                _legacy_result_evidence(record),
+                f"trajectory://step/{record.get('step')}/{record.get('call_id') or 'unknown'}",
+            )
+        except (LedgerRefusal, TypeError, ValueError):
+            continue
+
+    findings = _legacy_findings(workspace) if not has_gap else ""
+    if findings:
+        ledger.add_evidence(
+            "LEGACY_FINDINGS",
+            _clip_summary_text("기존 findings.md: " + " ".join(findings.split()), 220),
+            "workspace://findings.md",
+        )
+
+    contract = existing_contract
+    if not contract and goal:
+        origin_message_id = restored.get("message_id")
+        if (
+            not isinstance(origin_message_id, int)
+            or isinstance(origin_message_id, bool)
+            or origin_message_id < 1
+        ):
+            origin_message_id = 1
+        contract = {
+            "version": run_state.TASK_CONTRACT_VERSION,
+            "origin_message_id": origin_message_id,
+            "goal": _clip_summary_text(goal, TASK_CONTRACT_MAX_CHARS),
+        }
+
+    summary = _rebuild_legacy_summary(
+        workspace,
+        restored.get("summary", ""),
+        trusted_records,
+        trusted_step,
+        include_findings=not has_gap,
+    )
+    next_step = restored["next_step"]
+    if last_step:
+        next_step = max(next_step, last_step + 1)
+    if isinstance(gap_step, int) and gap_step > 0:
+        next_step = min(next_step, gap_step)
+
+    changed = any((
+        summary != restored.get("summary", ""),
+        contract != restored.get("task_contract"),
+        ledger.to_dict() != original_ledger,
+        next_step != restored.get("next_step"),
+    ))
+    if not changed or not persist:
+        if changed and not persist:
+            rebuilt = dict(restored)
+            rebuilt["summary"] = summary
+            rebuilt["task_contract"] = contract
+            rebuilt["ledger"] = ledger
+            rebuilt["next_step"] = next_step
+            return rebuilt
+        return restored
+    try:
+        run_state.save(
+            workspace,
+            message_id=restored.get("message_id"),
+            next_step=next_step,
+            summary=summary,
+            tail=restored.get("tail", []),
+            ledger=ledger,
+            interrupt=restored.get("interrupt", {}),
+            announced_call_ids=restored.get("announced_call_ids", []),
+            tool_fingerprints=restored.get("tool_fingerprints", []),
+            trajectory_gap_step=gap_step,
+            state=restored.get("state", run_state.RUNNING),
+            task_contract=contract,
+            artifact_manifest=restored.get("artifact_manifest"),
+            source_run_id=restored.get("source_run_id"),
+            source_step=restored.get("source_step"),
+        )
+    except OSError:
+        log_session_event(
+            workspace,
+            "legacy_context_rebuild_failed",
+            step=last_step or None,
+            error="OSError",
+        )
+        return restored
+    updated = run_state.load(workspace)
+    if updated is not None:
+        log_session_event(
+            workspace,
+            "legacy_context_rebuilt",
+            step=last_step or None,
+            next_step=updated["next_step"],
+            summary_changed=summary != restored.get("summary", ""),
+            ledger_changed=ledger.to_dict() != original_ledger,
+            goal_recovered=contract is not None and not restored.get("task_contract"),
+        )
+        return updated
+    return restored
 
 
 def _render_task_contract(workspace, task_contract):
@@ -3803,6 +4070,60 @@ def resume_run(owner_id, channel_id, run_id):
     return RUN_CATALOG.resume(owner_id, channel_id, run_id)
 
 
+def fork_run(owner_id, channel_id, run_id):
+    """Prepare a fresh run with only the source run's bounded research brief."""
+    source = RUN_CATALOG.lookup_owned(owner_id, run_id)
+    if source.status == "active":
+        raise RunActiveError("run is active")
+    restored = run_state.load(source)
+    if restored is None:
+        raise RunNotFoundError("run not found")
+    restored = rebuild_legacy_resume_state(source, restored, persist=False)
+    source_step = max(0, int(restored.get("next_step", 1)) - 1)
+    try:
+        source_records, _complete = trajectory.read_records(source)
+    except (OSError, ValueError):
+        source_records = []
+    if source_records:
+        source_step = source_records[-1]["step"]
+    gap_step = restored.get("trajectory_gap_step")
+    if isinstance(gap_step, int) and gap_step > 0:
+        source_step = min(source_step, gap_step - 1)
+
+    workspace = RUN_CATALOG.prepare(owner_id, channel_id)
+    try:
+        run_state.save(
+            workspace,
+            message_id=None,
+            next_step=1,
+            summary=restored.get("summary", ""),
+            tail=[],
+            ledger=restored["ledger"],
+            interrupt={},
+            announced_call_ids=[],
+            tool_fingerprints=[],
+            trajectory_gap_step=None,
+            state="prepared",
+            task_contract=restored.get("task_contract"),
+            artifact_manifest={
+                "version": run_state.ARTIFACT_MANIFEST_VERSION,
+                "items": [],
+            },
+            source_run_id=source.run_id,
+            source_step=source_step,
+        )
+    except BaseException:
+        try:
+            RUN_CATALOG.finish(workspace, "failed")
+        except (RunNotFoundError, ValueError):
+            pass
+        raise
+    channel_history[channel_id].clear()
+    channel_summary[channel_id] = ""
+    channel_ledger[channel_id].clear()
+    return workspace
+
+
 def delete_run(owner_id, run_id):
     RUN_CATALOG.delete(owner_id, run_id)
 
@@ -3856,6 +4177,28 @@ async def slash_resume(interaction: discord.Interaction, run_id: str):
         return
     await interaction.response.send_message(
         f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다."
+    )
+
+
+@bot.tree.command(name="fork", description="기존 run의 목표·요약·원장만 새 run으로 가져옵니다.")
+async def slash_fork(interaction: discord.Interaction, run_id: str):
+    owner_id = getattr(interaction.user, "id", None)
+    decision = authorize_caller(
+        authz.CONTROL, owner_id, channel_id=interaction.channel_id
+    )
+    if not decision:
+        await deny_interaction(interaction, authz.CONTROL, decision)
+        return
+    try:
+        workspace = fork_run(owner_id, interaction.channel_id, run_id)
+    except RunNotFoundError:
+        await interaction.response.send_message("run not found", ephemeral=True)
+        return
+    except RunActiveError:
+        await interaction.response.send_message("run is active", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"🧭 run `{run_id}`의 목표·조사 요약만 새 run `{workspace.run_id}`으로 가져왔습니다."
     )
 
 
@@ -4042,6 +4385,27 @@ async def on_message(message: discord.Message):
         await message.reply(f"▶️ run `{workspace.run_id}`을 다음 목표로 선택했습니다.")
         return
 
+    if cmd_name in ["!fork", "/fork"]:
+        control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
+        if not control:
+            await message.reply(f"⛔ {control.reason}")
+            return
+        if len(parts) != 2:
+            await message.reply("사용법: `!fork <run-id>`")
+            return
+        try:
+            workspace = fork_run(caller_id, message.channel.id, parts[1])
+        except RunNotFoundError:
+            await message.reply("run not found")
+            return
+        except RunActiveError:
+            await message.reply("run is active")
+            return
+        await message.reply(
+            f"🧭 run `{parts[1]}`의 목표·조사 요약만 새 run `{workspace.run_id}`으로 가져왔습니다."
+        )
+        return
+
     if cmd_name in ["!delete", "/delete"]:
         control = authorize_caller(authz.CONTROL, caller_id, channel_id=message.channel.id)
         if not control:
@@ -4205,6 +4569,8 @@ async def on_message(message: discord.Message):
     # 재시작 전에 남은 durable 레코드. 있으면 이 런은 같은 런 id로 다음 커서에서
     # 이어간다. 신규 런에는 레코드가 없으므로 평소처럼 Step 1부터다.
     restored = run_state.load(workspace)
+    if restored is not None:
+        restored = rebuild_legacy_resume_state(workspace, restored)
     resume_from = restored["next_step"] if restored is not None else 1
     same_origin = (
         restored is not None
@@ -4649,6 +5015,8 @@ async def on_message(message: discord.Message):
 
         if not (is_interval or is_over_budget or is_group_overflow):
             return
+        previous_messages = messages_payload
+        previous_summary = rolling_summary
         messages_payload, rolling_summary = await rollover_agent_context(
             workspace,
             messages_payload,
@@ -4660,9 +5028,10 @@ async def on_message(message: discord.Message):
             task_contract=task_contract,
             artifact_manifest=artifact_manifest,
         )
-        # 롤오버는 누적 요약이 바뀌는 유일한 지점이다. 되돌려 쓰지 않으면 이 런의
-        # 모든 롤오버 요약이 함수 종료와 함께 사라지고, 같은 프로세스의 다음
-        # 메시지조차 낡은 요약에서 시작한다.
+        if messages_payload == previous_messages and rolling_summary == previous_summary:
+            return
+        # 실제 롤오버 결과를 되돌려 쓰지 않으면 이 런의 요약·tail이 함수 종료와
+        # 함께 사라지고, 같은 프로세스의 다음 메시지조차 낡은 컨텍스트에서 시작한다.
         channel_summary[message.channel.id] = rolling_summary
         save_snapshot(step_num + 1, "rollover")
 
