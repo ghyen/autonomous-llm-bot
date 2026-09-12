@@ -38,11 +38,11 @@ class ContextFlushTest(unittest.TestCase):
             findings_path = workspace_path / "findings.md"
             self.assertTrue(findings_path.is_file())
             content = findings_path.read_text(encoding="utf-8")
-            self.assertIn("## 📌 마일스톤 1 진행 보고 및 발견점", content)
+            self.assertIn("## 📌 마일스톤 1 진행 보고 및 핵심 상태", content)
             self.assertIn("Cycles API 엔드포인트", content)
             self.assertNotIn("state_update", content)
 
-    def test_sync_milestone_to_disk_appends_subsequent_milestones(self):
+    def test_sync_milestone_to_disk_overwrites_with_latest_milestone_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace_path = Path(tmp)
             workspace = SimpleNamespace(root=str(workspace_path), run_id="r1")
@@ -52,10 +52,25 @@ class ContextFlushTest(unittest.TestCase):
 
             findings_path = workspace_path / "findings.md"
             content = findings_path.read_text(encoding="utf-8")
-            self.assertIn("## 📌 마일스톤 1 진행 보고 및 발견점", content)
-            self.assertIn("## 📌 마일스톤 2 진행 보고 및 발견점", content)
-            self.assertIn("마일스톤 1 내용", content)
+            self.assertIn("## 📌 마일스톤 2 진행 보고 및 핵심 상태", content)
             self.assertIn("마일스톤 2 내용", content)
+            # 이전 마일스톤 전문이 계속 누적되지 않고 최신 1장으로 덮어쓰기되어야 함
+            self.assertNotIn("마일스톤 1 내용", content)
+
+    def test_sync_milestone_to_disk_preserves_preexisting_preamble(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_path = Path(tmp)
+            findings_path = workspace_path / "findings.md"
+            findings_path.write_text("# 프로젝트 기본 조사\n- 초기 발견 사실", encoding="utf-8")
+
+            workspace = SimpleNamespace(root=str(workspace_path), run_id="r1")
+            bot.sync_milestone_to_disk(workspace, "마일스톤 1 내용", checkpoint_num=1)
+            bot.sync_milestone_to_disk(workspace, "마일스톤 2 내용", checkpoint_num=2)
+
+            content = findings_path.read_text(encoding="utf-8")
+            self.assertIn("초기 발견 사실", content)
+            self.assertIn("마일스톤 2 내용", content)
+            self.assertNotIn("마일스톤 1 내용", content)
 
     def test_flush_agent_context_resets_messages_and_embeds_canonical(self):
         with tempfile.TemporaryDirectory() as tmp:
