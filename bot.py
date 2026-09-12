@@ -117,7 +117,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
   - `lookup_trajectory(step, call_id)`: 롤링 컨텍스트에서 빠진 과거 스텝의 도구·인자·결과 조회
   - `record_state(...)`: 목표·증거·가설·결론의 권위 있는 상태를 갱신하는 전용 도구
   - `record_playbook(rule_type, rule_content)`: 환경 제약·무효 경로·검증된 성공 패턴을 다음 런에도 남기는 전용 도구
-  - `think(focus, effort)`: 복잡한 데이터 분석, 가설 검증, 오류 원인 규명 등 심층 사고가 필요할 때 호출하는 전용 도구. 다음 스텝에서 외부 도구 없이 지정된 강도로 심층 사고 및 분석을 수행합니다. (쉬운 분석은 minimal/low, 복잡한 분석은 medium 권장)
+  - `think(focus, effort)`: 대량 데이터/코드 수집 후 핵심 결론 종합, 가설 검증, 복잡한 공격 벡터 설계 등 심층 사고가 필요할 때 호출하는 전용 도구. 다음 스텝에서 외부 도구 없이 지정된 강도로 심층 사고 및 분석을 수행합니다. (가설 종합 및 원인 분석은 medium, 거시적 전략 및 다단계 계획 설계는 high 권장)
   - `finish_task(report)`: 사용자의 목표를 100% 달성하여 최종 결론을 낼 때 호출하는 전용 완료 도구
 - `bash_exec`, `read_file`, `web_search`에서 최근 8스텝 안에 이미 성공한 동일 인자 호출은 Loop Guard가 실행 전에 차단합니다. 기존 결과를 가공하거나 다른 가설을 시도하세요. 백그라운드 작업 완료 확인처럼 의도적인 재시도일 때만 `force=true`를 추가하세요. `force`는 한 번의 재실행만 허용하며 호출의 동일성 자체를 바꾸지 않습니다.
 - 루트 `plan.md`, `findings.md`, `playbook.md`를 쓸 때는 직전 읽기에서 받은 `sha256:<64자리 해시>`를 `expected_revision`으로 그대로 전달하세요. 파일이 전혀 없을 때만 최초 생성으로 `absent`를 사용하세요. 이미 존재하는 `plan.md`, `findings.md`, `playbook.md`의 이전 내용(조사 결과, 완료된 체크리스트, 단서)을 빈 템플릿으로 덮어쓰거나 초기화하지 말고 반드시 기존 내용을 바탕으로 유지·갱신하세요.
@@ -150,7 +150,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 - 모델 내부 생각(<think>)은 도구 실행 전 짧고 구체적인 판단(1~3문장)에만 집중하세요.
 - 파일이 없거나(not_found), 명령어가 실패(exit code != 0)했거나 에러가 발생한 경우:
   원인을 머릿속으로 길게 추측하거나 상상 속에서 결론을 내리지 마세요. 디렉토리 구조 및 실제 환경을 확인하기 위한 탐색 도구(`bash_exec`로 `ls -la`, `find`, `zg query` 등)를 즉시 호출하세요.
-- 복잡한 데이터 분석, 가설 검증, 오류 원인 분석 등 긴 생각이 반드시 필요할 때는 섣부르게 도구를 연타하지 말고 `think(focus="...", effort="low"|"medium")` 도구를 명시적으로 호출하여 심층 사고를 진행하세요.
+- 대량의 데이터/소스코드/로그를 수집한 후 핵심 결론을 도출하거나, 3단계 이상의 복잡한 공격/우회 경로를 설계할 때, 또는 가설 검증이 2회 이상 연속 실패했을 때는 무작정 쉘 도구를 연타하지 말고 반드시 `think(focus="분석 주제", effort="medium"|"high")`를 호출하여 심층 가설 재검토 및 전략 수립을 수행하세요.
 - 도구 실행 중 긴 독백, 강의식 설명, 가상 시뮬레이션을 작성하지 마세요. 필요한 도구가 결정되면 즉시 생각을 마치고 도구를 호출하세요.
 - 도구 출력 필터링 및 산출물 조회 규칙:
   - 긴 출력이 `artifacts/out_*.log`로 저장된 경우, `cat`이나 `sed`로 처음부터 끝까지 조금씩 이어 읽으려 하지 마세요 (컨텍스트 낭비 및 반복 루프 유발). 찾고자 하는 키워드로 `grep -n '패턴' <파일>`을 실행하거나 필요한 특정 라인 구간만 조회하세요.
@@ -411,7 +411,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "think",
-            "description": "복잡한 데이터 분석, 가설 검증, 오류 원인 규명 등 심층 사고가 필요할 때 호출합니다. 다음 스텝에서 외부 도구 없이 지정된 강도로 심층 사고 및 분석 턴을 진행합니다.",
+            "description": "대량 데이터/코드 수집 후 핵심 결론 도출, 다단계 공격 전략 수립, 가설 검증 실패 원인 규명 등 심층 사고가 필요할 때 호출합니다. 다음 스텝에서 외부 도구 없이 지정된 강도로 심층 사고 및 분석 턴을 진행합니다.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -6820,7 +6820,8 @@ async def on_message(message: discord.Message):
                             phase_note=(
                                 f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 마일스톤 {checkpoint_num} 중간 보고서가 디스코드에 전송되었습니다. "
                                 f"기존 대화 기록은 findings.md 및 plan.md로 안전하게 이관(Flush)되었습니다. "
-                                f"위 [📌 기확정 사전 지식 및 계획] 블록을 확정된 전제로 삼고, 남은 목표를 100% 달성하기 위한 다음 분석 작업을 계속 실행하세요. "
+                                f"위 [📌 기확정 사전 지식 및 계획] 블록을 확정된 전제로 삼고, "
+                                f"이번 심층 사고(High Reasoning) 턴에서 이전 단계 발견점을 종합하여 다음 페이즈의 핵심 목표 및 구체적인 탐색/공격 전략을 수립하세요. "
                                 f"판단이 바뀐 부분은 record_state로 상태를 갱신하세요. "
                                 f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
                             ),
@@ -6834,6 +6835,12 @@ async def on_message(message: discord.Message):
                             checkpoint=checkpoint_num,
                             messages_count=len(messages_payload),
                             summary_chars=len(rolling_summary),
+                        )
+                        # 마일스톤 플러시 직후 1회성 고강도 추론(High Reasoning) 자동 강제
+                        pending_think_effort = "high"
+                        pending_think_focus = (
+                            f"마일스톤 {checkpoint_num} 완료 직후 종합 분석: 기확정된 findings.md와 plan.md의 핵심 사실을 심층 종합하고, "
+                            f"남은 미해결 목표를 달성하기 위한 다음 페이즈의 전략적 공격 및 분석 계획을 수립하세요."
                         )
                     else:
                         # 실패한 중간 보고서에 성공 마커를 남기지 않는다.
