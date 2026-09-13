@@ -318,6 +318,14 @@ class RunCatalog:
             and w.run_id != workspace.run_id
         ]
         if not candidates:
+            shared_findings = self.workspace_root / "findings.md"
+            if shared_findings.is_file() and not (workspace.root / "findings.md").exists():
+                try:
+                    status, data = read_root_regular_bytes(self.workspace_root, "findings.md")
+                    if status == "success":
+                        atomic_write(workspace.root / "findings.md", data)
+                except OSError:
+                    pass
             return
         prior = max(
             candidates,
@@ -327,9 +335,9 @@ class RunCatalog:
                 item.run_id,
             ),
         )
-        # Missing playbook.md in the newest run is a durable deletion boundary
-        # (including reset); never resurrect it from older runs.
-        for name in ("playbook.md",):
+        # Missing canonical files in the newest run are a durable deletion boundary
+        # (including reset); never resurrect them from older runs.
+        for name in ("playbook.md", "findings.md"):
             status, data = read_root_regular_bytes(prior.root, name)
             if status != "success":
                 continue

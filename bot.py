@@ -2231,10 +2231,17 @@ def _emergency_agent_context(workspace, messages, summary, ledger=None):
         ][-1:]
     tail = [_snapshot_message(message) for message in tail]
     tail = _clip_tool_result_messages(tail, 160)
+    compacted_summary = (
+        compact_resume_summary(
+            summary, tier2_limit=0, tier3_chars=200, discovery_limit=0
+        )
+        if summary
+        else ""
+    )
     rebased = [
         {
             "role": "system",
-            "content": build_system_content(workspace, ledger, summary),
+            "content": build_system_content(workspace, ledger, compacted_summary),
         },
         {
             "role": "user",
@@ -2493,6 +2500,34 @@ def is_tool_correlation_error(error) -> bool:
     """
     text = str(error).lower()
     return any(marker in text for marker in TOOL_CORRELATION_ERROR_MARKERS)
+
+
+CONTEXT_OR_OOM_ERROR_MARKERS = (
+    "context too large",
+    "prefill context too large",
+    "prefill safety cap",
+    "exceeds prefill safety cap",
+    "metal_cap ceiling",
+    "out of memory",
+    "oom",
+    "memory limit",
+    "memory exhausted",
+    "metal memory",
+    "maximum context length",
+    "prompt is too long",
+    "context_length_exceeded",
+    "token limit",
+    "tokens exceeds",
+    "exceeds model context",
+    "too many tokens",
+    "resource exhausted",
+)
+
+
+def is_context_or_oom_error(error) -> bool:
+    """업스트림 모델 서버가 컨텍스트 길이 초과 또는 GPU/시스템 메모리 부족으로 거절했는지 판정한다."""
+    text = str(error).lower()
+    return any(marker in text for marker in CONTEXT_OR_OOM_ERROR_MARKERS)
 
 
 def flatten_tool_protocol(messages: list) -> list:
@@ -3370,11 +3405,9 @@ def _find_canonical_file(workspace, filename: str) -> Optional[str]:
         return None
     try:
         run_root = Path(root_str)
-        candidates = [
-            run_root / filename,
-            run_root.parent.parent / filename,
-            run_root.parent / filename,
-        ]
+        candidates = [run_root / filename]
+        if run_root.parent and run_root.parent.name == "runs":
+            candidates.append(run_root.parent.parent / filename)
         for candidate in candidates:
             if candidate.is_file():
                 content = candidate.read_text(encoding="utf-8", errors="replace").strip()
@@ -3423,6 +3456,89 @@ def _render_established_context(workspace) -> str:
         clipped_findings = _extract_key_findings(findings_text)
         blocks.append(f"### 🔍 확정 조사 결론 (findings.md)\n{clipped_findings}")
     return "\n\n".join(blocks)
+
+
+def sync_milestone_to_disk(workspace, report_text: str, checkpoint_num: int) -> None:
+    """Sync milestone checkpoint findings and plan updates to disk."""
+    root_str = getattr(workspace, "root", None)
+    if not root_str:
+        return
+    run_root = Path(root_str)
+
+    clean_report = STATE_UPDATE_BLOCK_PATTERN.sub("", str(report_text or "")).strip()
+    if not clean_report:
+        return
+
+    milestone_header = f"## 📌 마일스톤 {checkpoint_num} 진행 보고 및 발견점"
+    new_section = f"\n\n{milestone_header}\n{clean_report}\n"
+
+    target_dirs = [run_root]
+    try:
+        if (
+            run_root.parent
+            and run_root.parent.name == "runs"
+            and run_root.parent.parent
+            and run_root.parent.parent.is_dir()
+        ):
+            target_dirs.append(run_root.parent.parent)
+    except (AttributeError, ValueError):
+        pass
+
+    for target_dir in target_dirs:
+        try:
+            findings_file = target_dir / "findings.md"
+            if findings_file.is_file():
+                existing = findings_file.read_text(encoding="utf-8", errors="replace")
+                if milestone_header not in existing:
+                    findings_file.write_text(existing.rstrip() + new_section, encoding="utf-8")
+            else:
+                findings_file.write_text(f"# 프로젝트 조사 결과 (Findings)\n{new_section}", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def flush_agent_context(
+    workspace,
+    messages: list = None,
+    ledger=None,
+    task_contract=None,
+    artifact_manifest=None,
+    checkpoint_num: int = 1,
+    phase_note: str = "",
+    keep_recent_tool_groups: int = 1,
+) -> Tuple[list, str]:
+    """Flush conversation messages to release memory while preserving canonical established context and recent progress."""
+    note = phase_note or (
+        f"[Phase {checkpoint_num + 1} 자율 연장] 마일스톤 {checkpoint_num}까지 확정된 "
+        "findings.md와 plan.md의 내용을 바탕으로 다음 조사 작업을 이어서 진행하세요."
+    )
+    compact_summary = format_tiered_summary(
+        tier3=f"마일스톤 {checkpoint_num} 완료: 이전 페이즈의 핵심 발견점은 findings.md에 기록되었습니다.",
+        tier3_through=0,
+        tier2_lines=[],
+        discoveries=[],
+    )
+    system_msg = {
+        "role": "system",
+        "content": build_system_content(
+            workspace,
+            ledger=ledger,
+            summary=compact_summary,
+            task_contract=task_contract,
+            artifact_manifest=artifact_manifest,
+        ),
+    }
+
+    recent_tail = []
+    if messages:
+        _old, recent = split_recent_agent_context(
+            messages, keep_recent_tool_groups=keep_recent_tool_groups
+        )
+        recent_tail = recent
+
+    flushed_messages = [system_msg] + recent_tail + [{"role": "user", "content": note}]
+    flushed_messages = validate_chat_payload(flushed_messages).messages
+    return flushed_messages, compact_summary
 
 
 def build_system_content(
@@ -5802,38 +5918,82 @@ async def on_message(message: discord.Message):
                     defects=list(base_verdict.defects) or None,
                     fingerprint=_payload_fingerprint(compacted_payload),
                 )
-                if not correlation:
-                    settle_stage_failure(api_err)
-                    break
-
-                # 로컬 검증을 통과한 payload에도 상관관계 오류가 나면 남는 수단은
-                # 도구 프로토콜 제거뿐이다. 이 결과도 messages_payload에 남긴다.
-                messages_payload = flatten_tool_protocol(messages_payload)
-                save_snapshot(iteration + 1, "tool_protocol_recovery")
-                retry_payload = build_agent_request_payload(
-                    workspace, messages_payload
-                )
-
-                # Never restart a stage after cancellation.
-                try:
-                    token.raise_if_cancelled()
-                    # 도구 이력을 지운 payload에 도구를 다시 제시하면 모델이 같은
-                    # 오류로 되돌아간다. 재시도는 한 번, 도구 없이 한다.
-                    resp = await run_completion_stage(
-                        token=token,
-                        stage="agent:retry",
-                        deadline=model_stage_deadline,
-                        model=MODEL_NAME,
-                        messages=retry_payload,
-                        max_tokens=prepared.output_max_tokens,
-                        temperature=0.7,
-                        **request_extra_params
+                if is_context_or_oom_error(api_err):
+                    log_session_event(
+                        workspace,
+                        "oom_recovery_triggered",
+                        step=iteration + 1,
+                        error=str(api_err)[:200],
                     )
-                except (RunCancelled, StageTimeout) as stage_error:
-                    settle_stage_failure(stage_error)
-                    break
-                except Exception as retry_error:
-                    settle_stage_failure(retry_error)
+                    current_checkpoint = (iteration + 1) // CHECKPOINT_INTERVAL
+                    messages_payload, rolling_summary = flush_agent_context(
+                        workspace,
+                        messages=messages_payload,
+                        ledger=ledger,
+                        task_contract=task_contract,
+                        artifact_manifest=artifact_manifest,
+                        checkpoint_num=current_checkpoint,
+                        phase_note=(
+                            "[긴급 메모리 보호] 모델 서버의 메모리 한계 도달로 컨텍스트를 긴급 플러시했습니다. "
+                            "findings.md와 plan.md의 내용을 참조하여 다음 단계 조사를 계속 수행하세요."
+                        ),
+                    )
+                    channel_summary[message.channel.id] = rolling_summary
+                    save_snapshot(iteration + 1, "emergency_oom_flush")
+                    retry_payload = build_agent_request_payload(
+                        workspace, messages_payload
+                    )
+                    try:
+                        token.raise_if_cancelled()
+                        resp = await run_completion_stage(
+                            token=token,
+                            stage="agent:oom_retry",
+                            deadline=model_stage_deadline,
+                            model=MODEL_NAME,
+                            messages=retry_payload,
+                            max_tokens=prepared.output_max_tokens,
+                            temperature=0.7,
+                            **step_tool_params,
+                            **request_extra_params,
+                        )
+                    except (RunCancelled, StageTimeout) as stage_error:
+                        settle_stage_failure(stage_error)
+                        break
+                    except Exception as retry_error:
+                        settle_stage_failure(retry_error)
+                        break
+                elif correlation:
+                    # 로컬 검증을 통과한 payload에도 상관관계 오류가 나면 남는 수단은
+                    # 도구 프로토콜 제거뿐이다. 이 결과도 messages_payload에 남긴다.
+                    messages_payload = flatten_tool_protocol(messages_payload)
+                    save_snapshot(iteration + 1, "tool_protocol_recovery")
+                    retry_payload = build_agent_request_payload(
+                        workspace, messages_payload
+                    )
+
+                    # Never restart a stage after cancellation.
+                    try:
+                        token.raise_if_cancelled()
+                        # 도구 이력을 지운 payload에 도구를 다시 제시하면 모델이 같은
+                        # 오류로 되돌아간다. 재시도는 한 번, 도구 없이 한다.
+                        resp = await run_completion_stage(
+                            token=token,
+                            stage="agent:retry",
+                            deadline=model_stage_deadline,
+                            model=MODEL_NAME,
+                            messages=retry_payload,
+                            max_tokens=prepared.output_max_tokens,
+                            temperature=0.7,
+                            **request_extra_params
+                        )
+                    except (RunCancelled, StageTimeout) as stage_error:
+                        settle_stage_failure(stage_error)
+                        break
+                    except Exception as retry_error:
+                        settle_stage_failure(retry_error)
+                        break
+                else:
+                    settle_stage_failure(api_err)
                     break
 
             # A response completed concurrently with !stop must not enable
@@ -6507,6 +6667,7 @@ async def on_message(message: discord.Message):
                 # [매 30스텝 도달 시 중간 진행 보고서 자동 발행 및 자율 연속 연장]
                 # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
                 # 쓰이는 것은 바로 위 save_snapshot이 남긴 durable 레코드다.
+                checkpoint_ok = False
                 if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
                     log_session_event(
@@ -6634,18 +6795,35 @@ async def on_message(message: discord.Message):
                         )
 
                     if checkpoint_ok:
-                        # 보고서 본문을 payload에 남긴다. 이것이 없으면 보고서에만 존재한
-                        # 정정이 바로 뒤 롤오버의 압축 입력에서 사라진다.
-                        messages_payload.append({
-                            "role": "assistant",
-                            "content": "[중간 보고서 제출 완료]\n" + _clip_summary_text(inter_text, 2000),
-                        })
-                        messages_payload.append({"role": "user", "content": (
-                            f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 중간 보고서가 디스코드에 전송되었습니다. "
-                            f"목표를 100% 달성할 때까지 전용 작업 공간(plan.md, findings.md)을 업데이트하며 다음 분석 작업을 계속 실행하세요. "
-                            f"판단이 바뀐 부분은 record_state로 상태를 갱신하세요. "
-                            f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
-                        )})
+                        # 1) 마일스톤 발견점 및 계획을 findings.md에 동기화
+                        sync_milestone_to_disk(workspace, inter_text, checkpoint_num)
+
+                        # 2) 컨텍스트 플러시 (Blackboard Handover: 대화 tail 정리 및 요약 리셋)
+                        messages_payload, rolling_summary = flush_agent_context(
+                            workspace=workspace,
+                            messages=messages_payload,
+                            ledger=ledger,
+                            task_contract=task_contract,
+                            artifact_manifest=artifact_manifest,
+                            checkpoint_num=checkpoint_num,
+                            phase_note=(
+                                f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 마일스톤 {checkpoint_num} 중간 보고서가 디스코드에 전송되었습니다. "
+                                f"기존 대화 기록은 findings.md 및 plan.md로 안전하게 이관(Flush)되었습니다. "
+                                f"위 [📌 기확정 사전 지식 및 계획] 블록을 확정된 전제로 삼고, 남은 목표를 100% 달성하기 위한 다음 분석 작업을 계속 실행하세요. "
+                                f"판단이 바뀐 부분은 record_state로 상태를 갱신하세요. "
+                                f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
+                            ),
+                        )
+                        channel_summary[message.channel.id] = rolling_summary
+                        save_snapshot(iteration + 2, "context_flush")
+                        log_session_event(
+                            workspace,
+                            "checkpoint_context_flush",
+                            step=iteration + 1,
+                            checkpoint=checkpoint_num,
+                            messages_count=len(messages_payload),
+                            summary_chars=len(rolling_summary),
+                        )
                     else:
                         # 실패한 중간 보고서에 성공 마커를 남기지 않는다.
                         messages_payload.append({
@@ -6668,11 +6846,12 @@ async def on_message(message: discord.Message):
                     outcome.settle(outcome_mod.EXHAUSTED, outcome_mod.DETAIL_STEP_BUDGET)
                     break
 
-                try:
-                    await maybe_roll_context(iteration + 1)
-                except (RunCancelled, StageTimeout) as stage_error:
-                    settle_stage_failure(stage_error)
-                    break
+                if not checkpoint_ok:
+                    try:
+                        await maybe_roll_context(iteration + 1)
+                    except (RunCancelled, StageTimeout) as stage_error:
+                        settle_stage_failure(stage_error)
+                        break
                 continue
 
             # [도구 호출 없는 응답 처리: 심층 사고 턴 vs 일반 텍스트 정체]
