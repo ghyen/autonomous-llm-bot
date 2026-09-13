@@ -1751,24 +1751,32 @@ def resolve_adaptive_reasoning_effort(
     messages_payload: Optional[List[Dict[str, Any]]] = None,
     reasoning_max_tokens: int = 1536,
     pending_think_effort: Optional[str] = None,
+    pending_reasoning_effort: Optional[str] = None,
 ) -> Tuple[str, Optional[int]]:
     """Determine the reasoning effort and token cap for the current agent step.
 
     Applies step-level dynamic reasoning:
     1. If the model explicitly requested a Think step via `think(effort=...)`:
        grants that requested effort and token budget (minimal: 256, low: 512, medium: 1536, high: 4096).
-    2. Step 0 (iteration == 0) or internal thought stall recovery
+    2. If a post-milestone synthesis requested high reasoning:
+       grants that requested effort with tools enabled.
+    3. Step 0 (iteration == 0) or internal thought stall recovery
        (consecutive_internal_thoughts > 0): always 'none' to avoid stalls and
        enable quick direct answers or immediate tool execution.
-    3. If configured_effort == 'none': always 'none'.
-    4. When adaptive is disabled: uses configured_effort with reasoning_max_tokens.
-    5. If recent tool execution had errors (not_found, exit code != 0):
+    4. If configured_effort == 'none': always 'none'.
+    5. When adaptive is disabled: uses configured_effort with reasoning_max_tokens.
+    6. If recent tool execution had errors (not_found, exit code != 0):
        downgrades to 'low' (capped at min(reasoning_max_tokens, 512)) for rapid diagnostic think.
-    6. Normal tool execution: defaults to 'none' so Rapid-MLX can generate tool calls
+    7. Normal tool execution: defaults to 'none' so Rapid-MLX can generate tool calls
        immediately without entering an unbudgeted 4096-token thinking loop.
     """
     if pending_think_effort:
         eff = pending_think_effort.lower().strip()
+        tokens = resolve_think_tokens(eff, reasoning_max_tokens)
+        return eff, tokens
+
+    if pending_reasoning_effort:
+        eff = pending_reasoning_effort.lower().strip()
         tokens = resolve_think_tokens(eff, reasoning_max_tokens)
         return eff, tokens
 
@@ -5710,6 +5718,7 @@ async def on_message(message: discord.Message):
     consecutive_internal_thoughts = 0
     pending_think_effort = None
     pending_think_focus = None
+    pending_reasoning_effort = None
 
     async def maybe_roll_context(step_num: int):
         nonlocal messages_payload, rolling_summary
@@ -5805,11 +5814,13 @@ async def on_message(message: discord.Message):
                 messages_payload=messages_payload,
                 reasoning_max_tokens=CONFIG.reasoning_max_tokens,
                 pending_think_effort=pending_think_effort,
+                pending_reasoning_effort=pending_reasoning_effort,
             )
             is_think_step = bool(pending_think_effort)
             active_think_focus = pending_think_focus
             pending_think_effort = None
             pending_think_focus = None
+            pending_reasoning_effort = None
 
             extra_params["reasoning_effort"] = effort
             if effort != "none" and effort_tokens is not None:
@@ -6836,12 +6847,8 @@ async def on_message(message: discord.Message):
                             messages_count=len(messages_payload),
                             summary_chars=len(rolling_summary),
                         )
-                        # 마일스톤 플러시 직후 1회성 고강도 추론(High Reasoning) 자동 강제
-                        pending_think_effort = "high"
-                        pending_think_focus = (
-                            f"마일스톤 {checkpoint_num} 완료 직후 종합 분석: 기확정된 findings.md와 plan.md의 핵심 사실을 심층 종합하고, "
-                            f"남은 미해결 목표를 달성하기 위한 다음 페이즈의 전략적 공격 및 분석 계획을 수립하세요."
-                        )
+                        # 마일스톤 플러시 직후 1회성 고강도 추론(High Reasoning) 자동 부여 (도구 사용 가능)
+                        pending_reasoning_effort = "high"
                     else:
                         # 실패한 중간 보고서에 성공 마커를 남기지 않는다.
                         messages_payload.append({

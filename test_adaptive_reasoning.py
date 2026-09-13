@@ -168,6 +168,19 @@ class ResolveAdaptiveReasoningEffortTest(unittest.TestCase):
         )
         self.assertEqual((effort, tokens), ("high", 4096))
 
+    def test_pending_reasoning_effort_enables_high_reasoning(self):
+        payload = [{"role": "tool", "name": "bash_exec", "content": "[stdout]\nok\n[exit code: 0]"}]
+        effort, tokens = resolve_adaptive_reasoning_effort(
+            iteration=1,
+            consecutive_internal_thoughts=0,
+            configured_effort="high",
+            adaptive_enabled=True,
+            messages_payload=payload,
+            reasoning_max_tokens=1536,
+            pending_reasoning_effort="high",
+        )
+        self.assertEqual((effort, tokens), ("high", 4096))
+
     def test_normal_tool_execution_defaults_to_none_to_prevent_hang(self):
         payload = [{"role": "tool", "name": "bash_exec", "content": "[stdout]\nok\n[exit code: 0]"}]
         # Normal step without pending think effort defaults to 'none' for fast tool execution
