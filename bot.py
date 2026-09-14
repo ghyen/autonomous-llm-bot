@@ -598,6 +598,14 @@ RECORD_STATE_STALE_STEPS = 25
 # 동작이라(인접 실패 테스트들이 고정), 시그니처 무관 6연속 실패를 넘어설 때만
 # 발동한다.
 THINK_DEBT_FAILURES = 6
+# 성공-루프는 실패 카운터에 잡히지 않는다(차단된 read 재읽기·ls/cat 반복·404
+# 프로빙은 전부 status:ok). loop/known-bad/artifact 가드 차단이 연속 스텝에서
+# 반복되면 다음 스텝을 강제 think로 돌려 재계획하게 한다.
+GUARD_BLOCK_THINK_STEPS = 3
+GUARD_BLOCK_THINK_FOCUS = (
+    "도구 호출이 가드에 연속 차단됨(동일 조회 반복/아티팩트 연쇄/확정 실패). "
+    "차단된 접근을 반복하지 말고 가설과 전략을 재수립할 것."
+)
 AGENT_STEP_MAX_TOKENS = CONFIG.agent_step_max_tokens
 REASONING_MAX_TOKENS = CONFIG.reasoning_max_tokens
 ADAPTIVE_REASONING = CONFIG.adaptive_reasoning
@@ -930,6 +938,20 @@ def _think_required_block(think_debt: bool, tool_name: str, arguments: dict):
     return _blocked_tool_result(
         "think_required", tool_name, THINK_DEBT_FAILURES, THINK_DEBT_FAILURES
     )
+
+
+def _update_guard_block_streak(streak: int, step_had_block: bool,
+                               think_dispatched: bool) -> int:
+    """가드 차단 연속 스텝 수를 갱신한다. think가 실행되면 리셋."""
+    if think_dispatched:
+        return 0
+    return int(streak) + 1 if step_had_block else 0
+
+
+def _should_force_guard_think(streak: int, think_pending: bool,
+                              limit: int = GUARD_BLOCK_THINK_STEPS) -> bool:
+    """차단이 limit 스텝 연속이면 강제 think. 이미 예약된 think는 덮지 않는다."""
+    return (not think_pending) and int(streak) >= int(limit)
 
 
 ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
@@ -5838,6 +5860,8 @@ async def on_message(message: discord.Message):
     consecutive_failed_tool_calls = 0
     # 시그니처 무관 연속 실패 수. think 빚의 기준이다.
     consecutive_failed_any = 0
+    # loop/known-bad/artifact 가드 차단 연속 스텝 수. 성공-루프 강제 사고 기준이다.
+    consecutive_guard_block_steps = 0
     consecutive_internal_thoughts = 0
     pending_think_effort = None
     pending_think_focus = None
@@ -6379,6 +6403,7 @@ async def on_message(message: discord.Message):
                 batch_signatures = set()
                 batch_fingerprints = set()
                 batch_artifact_reads = 0
+                step_had_guard_block = False
                 allowed_calls = []
                 allowed_indexes = []
                 allowed_failure_signatures = []
@@ -6473,6 +6498,7 @@ async def on_message(message: discord.Message):
                             fingerprint=guarded_fingerprint[:16],
                             first_step=prior_step,
                         )
+                        step_had_guard_block = True
                         continue
                     if tc["arguments"].get("force") is not True:
                         known_block = _known_bad_block(
@@ -6490,6 +6516,7 @@ async def on_message(message: discord.Message):
                                 tool=tc["name"],
                                 fingerprint=(guarded_fingerprint or "")[:16],
                             )
+                            step_had_guard_block = True
                             continue
                     is_artifact_read = _is_artifact_read(tc["name"], tc["arguments"])
                     if (
@@ -6518,6 +6545,7 @@ async def on_message(message: discord.Message):
                             + batch_artifact_reads
                             + 1,
                         )
+                        step_had_guard_block = True
                         continue
                     stale_block = _record_stale_block(
                         last_record_step, current_tool_step,
@@ -6787,6 +6815,31 @@ async def on_message(message: discord.Message):
                         else:
                             pending_think_effort = "low"
                             pending_think_focus = ""
+
+                # 성공-루프 강제 사고: 가드 차단이 연속 스텝에서 반복되면 다음
+                # 스텝을 think 전용으로 돌려 재계획하게 한다. think 스텝은 도구를
+                # 전달하지 않으므로 record_stale/think 게이트와 교착하지 않는다.
+                think_dispatched = any(
+                    tc["name"] == "think" for tc in allowed_calls
+                )
+                consecutive_guard_block_steps = _update_guard_block_streak(
+                    consecutive_guard_block_steps,
+                    step_had_guard_block,
+                    think_dispatched,
+                )
+                if _should_force_guard_think(
+                    consecutive_guard_block_steps,
+                    think_pending=pending_think_effort is not None,
+                ):
+                    pending_think_effort = "low"
+                    pending_think_focus = GUARD_BLOCK_THINK_FOCUS
+                    consecutive_guard_block_steps = 0
+                    log_session_event(
+                        workspace,
+                        "tool_guard_block_think_forced",
+                        step=iteration + 1,
+                        streak=GUARD_BLOCK_THINK_STEPS,
+                    )
 
                 trajectory_calls = [
                     {
