@@ -589,6 +589,15 @@ AVOIDANCE_BLOCK_MAX_CHARS = 1200
 # artifact 통째 읽기는 결과가 또 artifact로 저장돼서 연쇄가 된다(out_*.log
 # cat 192→197 실측). N회 연속이면 막고 grep/head를 가리킨다.
 ARTIFACT_CHAIN_LIMIT = 3
+# 지시는 있는데 강제력이 없어 모델이 record_state·think를 스킵한다(1134스텝 중
+# record_state 3건 실측). 호출 횟수가 아니라 실질 변화(revision 증가)로 게이트를
+# 건다. 요식 "기록함"은 게이트를 열지 못한다.
+RECORD_STATE_WARN_STEPS = 15
+RECORD_STATE_STALE_STEPS = 25
+# think 게이트는 서킷브레이커로만 둔다. 다양한 실패를 통한 탐색은 의도된
+# 동작이라(인접 실패 테스트들이 고정), 시그니처 무관 6연속 실패를 넘어설 때만
+# 발동한다.
+THINK_DEBT_FAILURES = 6
 AGENT_STEP_MAX_TOKENS = CONFIG.agent_step_max_tokens
 REASONING_MAX_TOKENS = CONFIG.reasoning_max_tokens
 ADAPTIVE_REASONING = CONFIG.adaptive_reasoning
@@ -693,6 +702,20 @@ def _blocked_tool_result(
             "artifact로 저장될 뿐 진전이 없습니다. grep -n '패턴'이나 "
             "head로 필요한 줄만 조회하거나, 원본 내용은 lookup_trajectory로 "
             "보세요. 정말 전체가 필요할 때만 force=true를 쓰세요."
+        )
+    if reason == "record_stale":
+        payload["directive"] = (
+            "[상태 기록 필요]: ledger 마지막 실질 갱신부터 "
+            f"{int(count)}스텝이 지났습니다. 다른 도구 전에 record_state로 "
+            "목표·증거·가설·결론을 먼저 기록하세요. 바뀐 게 정말 없으면 빈 "
+            "갱신이 아니라 새로 확인된 사실을 findings.md에 쓰고 그 증거로 "
+            "기록하세요."
+        )
+    if reason == "think_required":
+        payload["directive"] = (
+            "[심층 사고 필요]: 도구 실패가 연속되고 있습니다. 다른 도구를 "
+            "연타하기 전에 think(effort medium 이상)로 가설을 재검토하고 "
+            "전략을 세우세요."
         )
     return json.dumps(
         payload,
@@ -881,6 +904,32 @@ def _is_artifact_read(tool_name: str, arguments: dict) -> bool:
             return True
         return False
     return False
+
+
+def _record_stale_block(last_record_step: int, current_step: int,
+                        tool_name: str, arguments: dict):
+    """실질 갱신 없이 오래됐으면 record_state 외 호출을 막는다."""
+    if tool_name == "record_state":
+        return None
+    if isinstance(arguments, dict) and arguments.get("force") is True:
+        return None
+    stale = int(current_step) - int(last_record_step or 0)
+    if stale < RECORD_STATE_STALE_STEPS:
+        return None
+    return _blocked_tool_result(
+        "record_stale", tool_name, RECORD_STATE_STALE_STEPS, stale
+    )
+
+
+def _think_required_block(think_debt: bool, tool_name: str, arguments: dict):
+    """연속 실패 빚이 있으면 think 외 호출을 막는다."""
+    if not think_debt or tool_name == "think":
+        return None
+    if isinstance(arguments, dict) and arguments.get("force") is True:
+        return None
+    return _blocked_tool_result(
+        "think_required", tool_name, THINK_DEBT_FAILURES, THINK_DEBT_FAILURES
+    )
 
 
 ROLLING_COMPACTION_INTERVAL = int(os.environ.get("ROLLING_COMPACTION_INTERVAL", "5"))
@@ -3630,6 +3679,19 @@ def build_system_content(
     )
     if avoidance:
         parts.append(avoidance)
+    # 하드 게이트(25스텝) 전에 한 줄 경고. 없으면(테스트 등) 생략된다.
+    last_recorded = getattr(workspace, "last_record_step", None)
+    current_step_mark = getattr(workspace, "current_tool_step", None)
+    if (
+        isinstance(last_recorded, int)
+        and isinstance(current_step_mark, int)
+        and current_step_mark - last_recorded >= RECORD_STATE_WARN_STEPS
+    ):
+        parts.append(
+            f"[상태 기록 알림]: {current_step_mark - last_recorded}스텝 동안 "
+            "ledger 실질 갱신이 없습니다. 다음 가설·증거·결론은 record_state로 "
+            "기록하세요."
+        )
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
@@ -5392,6 +5454,15 @@ async def on_message(message: discord.Message):
         if restored is not None
         else 0
     )
+    # 실질 ledger 갱신 추적. revision 증가가 있어야 요식 호출은 게이트를 못 연다.
+    last_record_step = (
+        run_state.normalize_last_record_step(restored.get("last_record_step"))
+        if restored is not None
+        else 0
+    )
+    think_debt = False
+    workspace.last_record_step = last_record_step
+    workspace.current_tool_step = 0
     run_end_logged = False
     released = False
 
@@ -5661,6 +5732,7 @@ async def on_message(message: discord.Message):
                 artifact_manifest=artifact_manifest,
                 known_bad_calls=known_bad_calls,
                 artifact_chain=consecutive_artifact_reads,
+                last_record_step=last_record_step,
             )
         except OSError as snapshot_error:
             # 저장 실패가 런을 죽이지는 않는다. 다만 조용히 넘어가지도 않는다:
@@ -5756,6 +5828,8 @@ async def on_message(message: discord.Message):
 
     last_failed_signature = None
     consecutive_failed_tool_calls = 0
+    # 시그니처 무관 연속 실패 수. think 빚의 기준이다.
+    consecutive_failed_any = 0
     consecutive_internal_thoughts = 0
     pending_think_effort = None
     pending_think_focus = None
@@ -6288,6 +6362,7 @@ async def on_message(message: discord.Message):
                 # parallel batch may contain many calls but still represents one
                 # model step. Future/corrupt entries are dropped as well.
                 current_tool_step = iteration + 1
+                workspace.current_tool_step = current_tool_step
                 recent_tool_fingerprints[:] = [
                     [fingerprint, seen_step]
                     for fingerprint, seen_step in recent_tool_fingerprints
@@ -6436,6 +6511,38 @@ async def on_message(message: discord.Message):
                             + 1,
                         )
                         continue
+                    stale_block = _record_stale_block(
+                        last_record_step, current_tool_step,
+                        tc["name"], tc["arguments"],
+                    )
+                    if stale_block is not None:
+                        batch_signatures.add(signature)
+                        if guarded_fingerprint is not None:
+                            batch_fingerprints.add(guarded_fingerprint)
+                        merged_results[call_index] = stale_block
+                        log_session_event(
+                            workspace,
+                            "tool_record_stale_blocked",
+                            step=current_tool_step,
+                            tool=tc["name"],
+                            stale=current_tool_step - last_record_step,
+                        )
+                        continue
+                    think_block = _think_required_block(
+                        think_debt, tc["name"], tc["arguments"]
+                    )
+                    if think_block is not None:
+                        batch_signatures.add(signature)
+                        if guarded_fingerprint is not None:
+                            batch_fingerprints.add(guarded_fingerprint)
+                        merged_results[call_index] = think_block
+                        log_session_event(
+                            workspace,
+                            "tool_think_required_blocked",
+                            step=current_tool_step,
+                            tool=tc["name"],
+                        )
+                        continue
                     if (
                         total_tools_executed + len(allowed_calls)
                         >= MAX_TOOL_EXECUTIONS_PER_RUN
@@ -6506,6 +6613,9 @@ async def on_message(message: discord.Message):
                     break
 
                 total_tools_executed += len(allowed_calls)
+                revision_before_dispatch = (
+                    ledger.revision if ledger is not None else 0
+                )
                 for tc, guarded_fingerprint in zip(
                     allowed_calls, allowed_fingerprints
                 ):
@@ -6579,6 +6689,7 @@ async def on_message(message: discord.Message):
                         else:
                             last_failed_signature = failure_signature
                             consecutive_failed_tool_calls = 1
+                        consecutive_failed_any += 1
                         deterministic = _deterministic_tool_failure(
                             tc["name"], tool_result
                         )
@@ -6595,6 +6706,7 @@ async def on_message(message: discord.Message):
                     else:
                         last_failed_signature = None
                         consecutive_failed_tool_calls = 0
+                        consecutive_failed_any = 0
                         _invalidate_known_bad(
                             known_bad_calls, tc["name"], tc["arguments"]
                         )
@@ -6616,6 +6728,20 @@ async def on_message(message: discord.Message):
                         consecutive_artifact_reads = 0
                     else:
                         consecutive_artifact_reads += batch_artifact_reads
+                    # ledger revision이 실제로 올랐을 때만 실질 갱신으로 친다.
+                    # 요식 호출은 게이트를 열지 못한다.
+                    if (
+                        ledger is not None
+                        and ledger.revision != revision_before_dispatch
+                    ):
+                        last_record_step = current_tool_step
+                        workspace.last_record_step = last_record_step
+                    if any(tc["name"] == "think" for tc in allowed_calls):
+                        think_debt = False
+                    elif consecutive_failed_any >= THINK_DEBT_FAILURES:
+                        think_debt = True
+                    else:
+                        think_debt = False
 
                 for result_index, (tc, tool_result) in enumerate(
                     zip(tool_calls_to_run, merged_results)

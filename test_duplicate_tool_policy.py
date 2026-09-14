@@ -2084,6 +2084,81 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.executed_commands, ["broken-command"] * 2)
         self.assertEqual(self._last_blocked(3)["reason"], "consecutive_failure_limit")
 
+    # Stale ledger gate: revision이 오르지 않으면 record_state 외 호출이 막힌다.
+    async def test_stale_ledger_blocks_until_substantive_record(self):
+        from unittest.mock import patch
+        with patch.object(bot, "RECORD_STATE_STALE_STEPS", 3):
+            await self.run_agent([
+                _response(tool_calls=[self._bash("stale-1", "printf one")]),
+                _response(tool_calls=[self._bash("stale-2", "printf two")]),
+                _response(tool_calls=[self._bash("stale-3", "printf three")]),
+                _response(tool_calls=[
+                    _tool_call("rec-1", "record_state", {
+                        "evidence": [{"id": "E_GATE", "summary": "s", "source": "t"}],
+                    }),
+                ]),
+                _response(tool_calls=[self._bash("stale-4", "printf four")]),
+                self._finish(),
+            ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["stale-1"], ["stale-2"], ["rec-1"], ["stale-4"]],
+        )
+        blocked = self._last_blocked(3)
+        self.assertTrue(blocked.get("blocked"))
+        self.assertEqual(blocked["reason"], "record_stale")
+
+    # 요식 record_state(빈 갱신)는 revision이 안 올라 게이트를 열지 못한다.
+    async def test_empty_record_does_not_open_stale_gate(self):
+        from unittest.mock import patch
+        with patch.object(bot, "RECORD_STATE_STALE_STEPS", 2):
+            await self.run_agent([
+                _response(tool_calls=[self._bash("e-1", "printf one")]),
+                _response(tool_calls=[
+                    _tool_call("rec-empty", "record_state", {}),
+                ]),
+                _response(tool_calls=[self._bash("e-2", "printf two")]),
+                self._finish(),
+            ])
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [["e-1"], ["rec-empty"]],
+        )
+        blocked = self._last_blocked(3)
+        self.assertEqual(blocked["reason"], "record_stale")
+
+    # Think debt: 서로 다른 실패가 6연속이면 서킷브레이커로 think 외 호출이 막힌다.
+    # (4연속까지의 다양한 탐색은 의도된 동작이라 허용된다.)
+    async def test_think_debt_blocks_until_think(self):
+        def flaky(command, count):
+            if command.startswith("fail-"):
+                return "[stdout]\nfail\n[exit code: 1]"
+            return SUCCESS_RESULT
+
+        await self.run_agent(
+            [
+                *[
+                    _response(tool_calls=[self._bash(f"d-{attempt}", f"fail-{attempt}")])
+                    for attempt in range(1, 8)
+                ],
+                _response(tool_calls=[
+                    _tool_call("think-1", "think", {"focus": "왜 실패하나", "effort": "medium"}),
+                ]),
+                self._finish(),
+            ],
+            tool_result=flaky,
+        )
+
+        self.assertEqual(
+            [[call[0] for call in batch] for batch in self.dispatched_batches],
+            [[f"d-{attempt}"] for attempt in range(1, 7)] + [["think-1"]],
+        )
+        blocked = self._last_blocked(7)
+        self.assertTrue(blocked.get("blocked"))
+        self.assertEqual(blocked["reason"], "think_required")
+
 
 if __name__ == "__main__":
     unittest.main()
