@@ -77,28 +77,37 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
 
     # Mutation caught: clamping the bash payload to the context budget and
     # returning the head throws the tail away, so nothing can recover it later.
-    async def test_long_bash_output_is_persisted_in_full_and_summarized(self):
+    async def test_long_bash_output_is_folded_head_tail_and_bounded(self):
         result = await bot.tool_bash_exec(
             self.run, long_bash_command(), "bash-call-1"
         )
 
-        path = artifact_path(result)
         self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-        self.assertEqual(
-            (self.run.root / path).read_text(encoding="utf-8").count("x"), 5001
-        )
+        self.assertIn("생략됨", result)
+        self.assertRegex(result, r"\[exit code: 7\]\s*$")
+        self.assertEqual(self.artifact_files(), [])
+
+    async def test_multiline_bash_output_preserves_head_and_tail_lines(self):
+        script = 'import sys; [print(f"line-{i:03d}: " + "data "*20) for i in range(100)]'
+        cmd = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        result = await bot.tool_bash_exec(self.run, cmd, "multiline-call")
+        self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
+        self.assertIn("line-000", result)
+        self.assertIn("line-099", result)
+        self.assertIn("생략됨", result)
+        self.assertEqual(self.artifact_files(), [])
 
     async def test_stored_output_path_is_recorded_in_the_run_manifest(self):
-        result = await bot.tool_bash_exec(
-            self.run, long_bash_command(), "manifest-bash-call"
+        path = bot._store_tool_artifact(
+            self.run, "manifest-bash-call", "x" * 5001
         )
-        path = artifact_path(result)
+        self.assertIsNotNone(path)
 
         manifest = bot.update_artifact_manifest(
             {"version": 1, "items": []},
             self.run,
             [{"name": "bash_exec"}],
-            [result],
+            ["result"],
             [path],
             3,
         )
@@ -131,8 +140,8 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
     async def test_traversal_call_id_cannot_write_outside_the_run_root(self):
         before = self.files_outside_run_root()
 
-        result = await bot.tool_bash_exec(
-            self.run, long_bash_command(), "../../../../pwned"
+        path = bot._store_tool_artifact(
+            self.run, "../../../../pwned", "x" * 5001
         )
 
         self.assertEqual(self.files_outside_run_root(), before)
@@ -140,8 +149,7 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.artifact_files()[0].read_text(encoding="utf-8").count("x"), 5001
         )
-        self.assertIn("artifacts/out_", result)
-        self.assertRegex(result, r"\[exit code: 7\]\s*$")
+        self.assertIn("artifacts/out_", path)
 
     # Mutation caught: resolving only the artifact filename still lets a
     # preplanted directory symlink redirect the parent process outside the run.
@@ -153,28 +161,24 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             outside, target_is_directory=True
         )
 
-        result = await bot.tool_bash_exec(
-            self.run, long_bash_command(), "symlink-call"
+        path = bot._store_tool_artifact(
+            self.run, "symlink-call", "x" * 5001
         )
 
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(outside.stat().st_mode, original_mode)
-        self.assertNotIn("artifacts/out_", result)
-        self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-        self.assertRegex(result, r"\[exit code: 7\]\s*$")
+        self.assertIsNone(path)
 
     # Mutation caught: preserving case-sensitive IDs verbatim makes distinct
     # calls alias the same artifact on a case-insensitive filesystem.
     async def test_case_variant_call_ids_have_distinct_artifacts(self):
-        first = await bot.tool_bash_exec(
-            self.run, long_bash_command("x"), "CallA"
+        first_path = bot._store_tool_artifact(
+            self.run, "CallA", "x" * 5001
         )
-        second = await bot.tool_bash_exec(
-            self.run, long_bash_command("y"), "calla"
+        second_path = bot._store_tool_artifact(
+            self.run, "calla", "y" * 5001
         )
 
-        first_path = artifact_path(first)
-        second_path = artifact_path(second)
         self.assertNotEqual(first_path.casefold(), second_path.casefold())
         self.assertEqual(
             (self.run.root / first_path).read_text(encoding="utf-8").count("x"),
@@ -191,15 +195,13 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
         unsafe_id = "../../same-artifact"
         colliding_safe_id = hashlib.sha256(unsafe_id.encode("utf-8")).hexdigest()[:32]
 
-        first = await bot.tool_bash_exec(
-            self.run, long_bash_command("x"), unsafe_id
+        first_path = bot._store_tool_artifact(
+            self.run, unsafe_id, "x" * 5001
         )
-        second = await bot.tool_bash_exec(
-            self.run, long_bash_command("y"), colliding_safe_id
+        second_path = bot._store_tool_artifact(
+            self.run, colliding_safe_id, "y" * 5001
         )
 
-        first_path = artifact_path(first)
-        second_path = artifact_path(second)
         self.assertNotEqual(first_path, second_path)
         self.assertEqual(
             (self.run.root / first_path).read_text(encoding="utf-8").count("x"),
@@ -212,31 +214,26 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
 
     # Mutation caught: leaving web_search unbounded lets one search reply push
     # an arbitrary number of characters straight into the model context.
-    async def test_long_web_search_result_is_persisted_in_full_and_summarized(self):
+    async def test_long_web_search_result_is_folded_and_bounded(self):
         with patch.object(bot.tool_sandbox, "run_worker", search_worker(20)):
             result = await bot.tool_web_search(self.run, "질의", "search-call-1")
 
-        path = artifact_path(result)
         self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-        stored = (self.run.root / path).read_text(encoding="utf-8")
-        self.assertIn("https://example.com/19", stored)
+        self.assertIn("생략됨", result)
+        self.assertEqual(self.artifact_files(), [])
 
     # Mutation caught: writing an artifact per call with no run-level budget
     # fills the workspace until the disk monitor aborts every later bash call.
     async def test_artifacts_stop_at_the_run_budget_without_losing_the_marker(self):
-        command = long_bash_command()
         with patch.object(bot, "ARTIFACT_RUN_BYTE_BUDGET", 6000):
-            first = await bot.tool_bash_exec(self.run, command, "budget-1")
-            second = await bot.tool_bash_exec(self.run, command, "budget-2")
+            first = bot._store_tool_artifact(self.run, "budget-1", "x" * 5001)
+            second = bot._store_tool_artifact(self.run, "budget-2", "x" * 5001)
 
-        first_path = artifact_path(first)
-        self.assertNotIn("artifacts/out_", second)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
         self.assertEqual(
-            [path.name for path in self.artifact_files()], [Path(first_path).name]
+            [path.name for path in self.artifact_files()], [Path(first).name]
         )
-        for result in (first, second):
-            self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-            self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
     # Mutation caught: routing read_file through artifact encapsulation creates
     # a redundant copy even though the full source and its revision are durable.
@@ -260,8 +257,7 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
     # Mutation caught: writing the artifact somewhere the sandboxed shell cannot
     # reach makes the grep hint a lie and the stored output unreadable.
     async def test_the_next_bash_call_can_read_the_artifact_it_was_pointed_at(self):
-        stored = await bot.tool_bash_exec(self.run, long_bash_command(), "grep-me")
-        path = artifact_path(stored)
+        path = bot._store_tool_artifact(self.run, "grep-me", "x" * 5010)
 
         counted = await bot.tool_bash_exec(
             self.run, f"wc -c < {path}", "count-call"
@@ -289,9 +285,9 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
             artifact_paths=artifact_paths,
         )
 
-        self.assertEqual(
-            artifact_paths, [artifact_path(long_result), None]
-        )
+        self.assertEqual(artifact_paths, [None, None])
+        self.assertLess(len(long_result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
+        self.assertIn("생략됨", long_result)
         self.assertEqual(short_result, "[stdout]\nok\n[exit code: 0]")
 
     async def test_lookup_trajectory_response_is_aggregate_bounded(self):
@@ -324,11 +320,8 @@ class ToolArtifactTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
-        path = artifact_path(result)
-        self.assertEqual(artifact_paths, [path])
-        stored = json.loads((self.run.root / path).read_text(encoding="utf-8"))
-        self.assertEqual(stored["total"], 20)
-        self.assertEqual(len(stored["records"]), 20)
+        self.assertIn("생략됨", result)
+        self.assertEqual(artifact_paths, [None])
 
 
 if __name__ == "__main__":
