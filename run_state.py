@@ -81,6 +81,17 @@ def normalize_artifact_chain(value):
     return value
 
 
+def normalize_last_record_step(value):
+    """마지막 실질 ledger 갱신 스텝. 깨진 값·없는 값은 0."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        return 0
+    return value
+
+
 def normalize_known_bad_calls(value):
     """확정 실패 회피 목록을 관대하게 정규화한다. 깨진 값·없는 값은 {}.
 
@@ -244,6 +255,7 @@ def save(
     source_step=None,
     known_bad_calls=None,
     artifact_chain=0,
+    last_record_step=0,
 ):
     """Replace the run's record atomically.
 
@@ -287,6 +299,7 @@ def save(
             ).items()
         ],
         "artifact_chain": normalize_artifact_chain(artifact_chain),
+        "last_record_step": normalize_last_record_step(last_record_step),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     atomic_write(snapshot_path(workspace), _dump(record))
@@ -368,6 +381,9 @@ def load(workspace):
     )
     payload["artifact_chain"] = normalize_artifact_chain(
         payload.get("artifact_chain")
+    )
+    payload["last_record_step"] = normalize_last_record_step(
+        payload.get("last_record_step")
     )
     return payload
 
