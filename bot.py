@@ -1879,6 +1879,9 @@ def resolve_adaptive_reasoning_effort(
     if not adaptive_enabled:
         return configured_effort, reasoning_max_tokens
 
+    if has_recent_tool_error(messages_payload):
+        return "low", min(reasoning_max_tokens, 512)
+
     return "none", None
 
 
