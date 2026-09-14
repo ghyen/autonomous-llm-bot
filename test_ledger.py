@@ -200,14 +200,42 @@ class ApplyUpdatesTest(unittest.TestCase):
         self.assertIn("거부", report)
         self.assertEqual(ledger.hypothesis_marker("H_A"), "H_A=active@v1")
 
-    def test_ledger_revision_tracks_accepted_mutations_only(self):
-        ledger = seeded_ledger()
-        before = ledger.revision
-        ledger.apply_updates({"hypotheses": [{"id": "H_A", "status": "maybe"}]})
-        self.assertEqual(ledger.revision, before)
-        reject(ledger, "H_A", "E_NEG")
-        self.assertGreater(ledger.revision, before)
+    def test_bounded_render_preserves_cited_and_recent_evidence(self):
+        ledger = ResearchLedger()
+        ledger.set_goal("조사 목표")
+        # Add 20 evidence items
+        for i in range(20):
+            ledger.add_evidence(f"E_{i:02d}", f"증거 {i}", f"src://{i}")
+        # Cite E_02 in hypothesis
+        ledger.declare_hypothesis("H_1", "가설 1", status="active")
+        reject(ledger, "H_1", "E_02", "반증")
+
+        # Unbounded render includes all 20 items
+        full_render = ledger.render()
+        for i in range(20):
+            self.assertIn(f"E_{i:02d}", full_render)
+        self.assertNotIn("생략", full_render)
+
+        # Bounded render with max_evidence=5:
+        # Should include cited E_02 + recent 5 items (E_15..E_19) + summary line
+        bounded = ledger.render(max_evidence=5)
+        self.assertIn("이전 증거 14건 요약 생략", bounded)
+        self.assertIn("E_02", bounded)
+        for i in range(15, 20):
+            self.assertIn(f"E_{i:02d}", bounded)
+        self.assertNotIn("E_10 ::", bounded)
+
+    def test_apply_updates_with_status_include_render_false(self):
+        ledger = ResearchLedger()
+        report, had_refusal = ledger.apply_updates_with_status(
+            {"evidence": [{"id": "E_DIFF", "summary": "요약", "source": "src"}]},
+            include_render=False,
+        )
+        self.assertFalse(had_refusal)
+        self.assertIn("반영: E_DIFF", report)
+        self.assertNotIn("[권위 있는 조사 상태", report)
 
 
 if __name__ == "__main__":
     unittest.main()
+

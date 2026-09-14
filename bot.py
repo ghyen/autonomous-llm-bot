@@ -1553,7 +1553,7 @@ async def tool_record_state(ledger, updates) -> str:
         except Exception:
             return "[Error: record_state 인자를 JSON 객체로 해석할 수 없습니다]"
     try:
-        report, had_refusal = ledger.apply_updates_with_status(updates)
+        report, had_refusal = ledger.apply_updates_with_status(updates, include_render=False)
         status = "refused" if had_refusal else "success"
         return f"[record_state status: {status}]\n{report}"
     except Exception as e:
@@ -3695,7 +3695,12 @@ def build_system_content(
     summary = str(summary or "").strip()
     if summary:
         parts.append(f"[{ROLLING_SUMMARY_LABEL}]\n{summary}")
-    state_block = ledger.render() if ledger is not None else ""
+    state_block = ""
+    if ledger is not None:
+        try:
+            state_block = ledger.render(max_evidence=12)
+        except TypeError:
+            state_block = ledger.render()
     if state_block:
         parts.append(state_block)
     return "\n\n".join(parts)

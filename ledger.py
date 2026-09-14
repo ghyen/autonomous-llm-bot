@@ -33,6 +33,7 @@ STATE_RULES = (
     f"{INVALID_LABEL} 결론은 현재 사실로 제시하지 마세요. "
     "이 블록은 권위 있는 상태이며, 요약이나 보고서가 이와 다르면 이 블록이 옳습니다."
 )
+DEFAULT_MAX_RENDERED_EVIDENCE = 12
 
 _STATEMENT_CHARS = 220
 _SUMMARY_CHARS = 220
@@ -357,13 +358,12 @@ class ResearchLedger:
 
     # --- rendering ---
 
-    def render(self) -> str:
+    def render(self, max_evidence: Optional[int] = None) -> str:
         """Deterministic state block injected into every payload and report.
 
-        ponytail: length grows linearly with entry count (~300 chars each). The
-        agent is instructed to keep updates few and short; if a run ever needs
-        hundreds of hypotheses, page or archive resolved ones instead of
-        clipping this block, which must never lose a marker.
+        ponytail: length grows linearly with entry count (~300 chars each). When
+        evidence items accumulate over long runs, older items are summarized
+        while retaining cited evidence and the most recent items.
         """
         if self.is_empty():
             return ""
@@ -389,11 +389,39 @@ class ResearchLedger:
 
         if self._evidence:
             lines.append("증거:")
-            for evidence in self._evidence.values():
-                source = " (출처: {0})".format(evidence.source) if evidence.source else ""
-                lines.append(
-                    "- {0} :: {1}{2}".format(evidence.id, evidence.summary or "(요약 없음)", source)
-                )
+            all_evidence = list(self._evidence.values())
+            if max_evidence is not None and len(all_evidence) > max_evidence:
+                cited = set()
+                for h in self._hypotheses.values():
+                    for t in h.transitions:
+                        if t.evidence_id:
+                            cited.add(t.evidence_id)
+                for c in self._conclusions.values():
+                    for p in c.premises:
+                        cited.add(p)
+
+                recent_evidence = all_evidence[-max_evidence:]
+                shown_ids = {e.id for e in recent_evidence}
+                cited_evidence = [e for e in all_evidence if e.id in cited and e.id not in shown_ids]
+
+                omitted_count = len(all_evidence) - len(shown_ids) - len(cited_evidence)
+                if omitted_count > 0:
+                    lines.append(
+                        "- ... (이전 증거 {0}건 요약 생략: findings.md 및 디스크 원장에 영구 보존됨)".format(
+                            omitted_count
+                        )
+                    )
+                for evidence in cited_evidence + recent_evidence:
+                    source = " (출처: {0})".format(evidence.source) if evidence.source else ""
+                    lines.append(
+                        "- {0} :: {1}{2}".format(evidence.id, evidence.summary or "(요약 없음)", source)
+                    )
+            else:
+                for evidence in all_evidence:
+                    source = " (출처: {0})".format(evidence.source) if evidence.source else ""
+                    lines.append(
+                        "- {0} :: {1}{2}".format(evidence.id, evidence.summary or "(요약 없음)", source)
+                    )
 
         if self._conclusions:
             lines.append("결론:")
@@ -422,10 +450,12 @@ class ResearchLedger:
 
     def apply_updates(self, payload) -> str:
         """Apply a structured update batch and return its human-readable report."""
-        report, _had_refusal = self.apply_updates_with_status(payload)
+        report, _had_refusal = self.apply_updates_with_status(payload, include_render=True)
         return report
 
-    def apply_updates_with_status(self, payload) -> Tuple[str, bool]:
+    def apply_updates_with_status(
+        self, payload, include_render: bool = True
+    ) -> Tuple[str, bool]:
         """Apply updates and return the report plus producer-owned refusal status."""
         if not isinstance(payload, dict):
             return "상태 갱신을 거부했습니다: 객체 형식이 아닙니다.", True
@@ -436,7 +466,7 @@ class ResearchLedger:
         goal = payload.get("goal")
         if goal:
             self.set_goal(goal)
-            applied.append("목표 갱신")
+            applied.append("목표 갱신: " + self.goal)
 
         for item in payload.get("evidence") or []:
             if not isinstance(item, dict):
@@ -500,5 +530,6 @@ class ResearchLedger:
             report.append("거부:\n- " + "\n- ".join(refused))
         if not report:
             report.append("반영할 상태 갱신이 없습니다.")
-        report.append(self.render() or "(상태 비어 있음)")
+        if include_render:
+            report.append(self.render() or "(상태 비어 있음)")
         return "\n\n".join(report), bool(refused)
