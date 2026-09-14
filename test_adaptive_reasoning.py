@@ -194,6 +194,53 @@ class ResolveAdaptiveReasoningEffortTest(unittest.TestCase):
         )
         self.assertEqual((effort, tokens), ("none", None))
 
+    def test_recent_tool_error_downgrades_to_low(self):
+        payload = [
+            {"role": "user", "content": "run task"},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "name": "read_file", "content": '{"error":"not_found","status":"error"}'},
+        ]
+        effort, tokens = resolve_adaptive_reasoning_effort(
+            iteration=1,
+            consecutive_internal_thoughts=0,
+            configured_effort="high",
+            adaptive_enabled=True,
+            messages_payload=payload,
+            reasoning_max_tokens=1536,
+        )
+        self.assertEqual((effort, tokens), ("low", 512))
+
+    def test_recent_tool_error_respects_small_reasoning_cap(self):
+        payload = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "bash_exec", "arguments": "{}"}}]},
+            {"role": "tool", "name": "bash_exec", "content": "[stderr]\nboom\n[exit code: 1]"},
+        ]
+        effort, tokens = resolve_adaptive_reasoning_effort(
+            iteration=3,
+            consecutive_internal_thoughts=0,
+            configured_effort="high",
+            adaptive_enabled=True,
+            messages_payload=payload,
+            reasoning_max_tokens=256,
+        )
+        self.assertEqual((effort, tokens), ("low", 256))
+
+    def test_recent_tool_error_with_trailing_steering_still_downgrades(self):
+        payload = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "bash_exec", "arguments": "{}"}}]},
+            {"role": "tool", "name": "bash_exec", "content": "[stderr]\nboom\n[exit code: 1]"},
+            {"role": "user", "content": "[사용자 실시간 개입] 계속 진행해줘"},
+        ]
+        effort, tokens = resolve_adaptive_reasoning_effort(
+            iteration=3,
+            consecutive_internal_thoughts=0,
+            configured_effort="high",
+            adaptive_enabled=True,
+            messages_payload=payload,
+            reasoning_max_tokens=1536,
+        )
+        self.assertEqual((effort, tokens), ("low", 512))
+
 
 class ThinkToolSchemaAndExecutionTest(unittest.IsolatedAsyncioTestCase):
     def test_think_tool_in_tools_schema(self):
