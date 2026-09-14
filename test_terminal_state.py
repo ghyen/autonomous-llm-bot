@@ -747,8 +747,8 @@ class DeliveryFailureLabelTest(TerminalStateTestCase):
         # Step 3: "none"
         self.assertEqual(captured_kwargs[2].get("reasoning_effort"), "none")
 
-    async def test_2h_adaptive_reasoning_tool_error_stays_fast_action_turn(self):
-        """When a tool returns an error, action steps remain effort='none' so the agent responds immediately with tools."""
+    async def test_2h_adaptive_reasoning_tool_error_downgrades_to_low(self):
+        """When a tool returns an error, the next step gets effort='low' for rapid diagnostic think (issue #77)."""
         captured_kwargs = []
         original_run = bot.run_completion_stage
 
@@ -770,9 +770,11 @@ class DeliveryFailureLabelTest(TerminalStateTestCase):
         self.assertEqual(self.recorder.reason, outcome_mod.COMPLETED)
         # Step 1 (iteration 0): always "none"
         self.assertEqual(captured_kwargs[0].get("reasoning_effort"), "none")
-        # Step 2 (iteration 1): normal tool execution remains "none" unless 'think' tool is requested
-        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "none")
-        self.assertIsNone(captured_kwargs[1].get("extra_body"))
+        # Step 2 (iteration 1): recent tool error downgrades to capped "low"
+        self.assertEqual(captured_kwargs[1].get("reasoning_effort"), "low")
+        self.assertEqual(
+            captured_kwargs[1].get("extra_body", {}).get("reasoning_max_tokens"), 512
+        )
 
     def test_2g_unclosed_xml_tool_call_extraction(self):
         """extract_tool_calls_from_text handles unclosed tags or xml tags without error."""
