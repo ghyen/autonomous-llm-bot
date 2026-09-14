@@ -326,10 +326,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [record["artifact_path"] for record in captured],
-            [
-                None,
-                "artifacts/out_.7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451.log",
-            ],
+            [None, None],
         )
 
     # Mutation caught: hashing rejected raw list/dict IDs during execution-token
@@ -391,11 +388,7 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [record["artifact_path"] for record in captured],
-            [
-                None,
-                None,
-                "artifacts/out_.7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451.log",
-            ],
+            [None, None, None],
         )
 
     # Mutation caught: validating IDs only in the next model payload lets calls
@@ -987,7 +980,8 @@ class DuplicateToolPolicyTest(unittest.IsolatedAsyncioTestCase):
             run = bot.RUN_CATALOG.acquire(TEST_USER_ID, CHANNEL_ID)
             result = await bot.tool_bash_exec(run, command, "long-nonzero")
 
-        self.assertIn("artifacts/out_", result)
+        self.assertIn("생략됨", result)
+        self.assertLess(len(result), bot.DEFAULT_TOOL_OUTPUT_MAX_CHARS)
         self.assertRegex(result, r"\[exit code: 7\]\s*$")
 
     # Mutation caught: hiding a real noisy subprocess's nonzero status from the

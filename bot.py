@@ -153,7 +153,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 - 대량의 데이터/소스코드/로그를 수집한 후 핵심 결론을 도출하거나, 3단계 이상의 복잡한 공격/우회 경로를 설계할 때, 또는 가설 검증이 2회 이상 연속 실패했을 때는 무작정 쉘 도구를 연타하지 말고 반드시 `think(focus="분석 주제", effort="medium"|"high")`를 호출하여 심층 가설 재검토 및 전략 수립을 수행하세요.
 - 도구 실행 중 긴 독백, 강의식 설명, 가상 시뮬레이션을 작성하지 마세요. 필요한 도구가 결정되면 즉시 생각을 마치고 도구를 호출하세요.
 - 도구 출력 필터링 및 산출물 조회 규칙:
-  - 긴 출력이 `artifacts/out_*.log`로 저장된 경우, `cat`이나 `sed`로 처음부터 끝까지 조금씩 이어 읽으려 하지 마세요 (컨텍스트 낭비 및 반복 루프 유발). 찾고자 하는 키워드로 `grep -n '패턴' <파일>`을 실행하거나 필요한 특정 라인 구간만 조회하세요.
+  - 긴 출력이 발생하면 중간 내용이 생략되고 앞/뒤 일부만 표시됩니다. 전체 출력을 파일로 저장하지 않으므로, 필요한 경우 처음부터 파이프(`grep`, `head`, `tail`, `jq` 등)를 연결하여 필요한 범위만 좁혀서 조회하세요.
   - 웹페이지나 API 응답의 전체 HTML/JSON을 무작정 출력하지 말고, 관심 있는 특정 태그나 키워드(`grep -i`, `jq`, `xmllint` 등)만 좁혀서 확인하세요.
 """
 
@@ -1143,32 +1143,73 @@ def _store_tool_artifact(workspace, call_id, text: str) -> Optional[str]:
     return f"{ARTIFACT_DIR_NAME}/{name}"
 
 
-def _encapsulate_tool_output(workspace, call_id, text: str) -> str:
-    """긴 출력을 잘라 버리는 대신 파일 경로와 앞부분 미리보기로 바꾼다.
+def fold_tool_output(
+    text: str,
+    max_chars: int = DEFAULT_TOOL_OUTPUT_MAX_CHARS,
+    head_lines: int = 25,
+    tail_lines: int = 25,
+    max_half_chars: int = 1100,
+) -> str:
+    """긴 출력을 앞부분(Head)과 뒷부분(Tail)만 남기고 중간을 접어 반환한다.
 
-    결과 문자열 끝에 무엇이 와야 하는지는 호출자가 안다. 그래서 이 함수는 자체로
-    완결된 블록만 돌려주고 종료 표시 같은 꼬리를 붙이지 않는다.
+    과도한 출력으로 인한 메모리 OOM과 임시 아티팩트 로그 무한 재참조 루프를 방지한다.
     """
-    if len(text) <= DEFAULT_TOOL_OUTPUT_MAX_CHARS:
+    if len(text) <= max_chars:
         return text
-    preview = "\n".join(text.split("\n")[:ARTIFACT_PREVIEW_LINES])
-    preview = preview[:ARTIFACT_PREVIEW_MAX_CHARS]
-    stored = _store_tool_artifact(workspace, call_id, text)
-    if stored is None:
-        return (
-            f"[출력 {len(text)}자: 이 런의 산출물 예산을 넘어 파일로 남기지 못했습니다."
-            f" 아래 미리보기가 남은 전부이므로 필요한 범위를 좁혀 다시 실행하세요.]\n"
-            f"{preview}"
-        )
-    sink = _ARTIFACT_PATH_SINK.get()
-    if sink is not None:
-        sink(stored)
-    return (
-        f"[출력 {len(text)}자 전문을 {stored}에 저장했습니다. 아래는 앞"
-        f" {ARTIFACT_PREVIEW_LINES}줄 미리보기입니다. 전체를 조금씩 이어 읽지 마시고,"
-        f" grep -n '패턴' {stored} 또는 sed -n '시작,끝p' {stored} 등으로 필요한 핵심 구간만 좁혀 조회하세요.]\n"
-        f"{preview}"
-    )
+
+    lines = text.split("\n")
+    total_lines = len(lines)
+
+    if total_lines > 1:
+        head_subset = []
+        head_len = 0
+        for line in lines[:head_lines]:
+            added = len(line) + (1 if head_subset else 0)
+            if head_len + added > max_half_chars and head_subset:
+                break
+            head_subset.append(line)
+            head_len += added
+        head_text = "\n".join(head_subset)
+
+        tail_subset = []
+        tail_len = 0
+        for line in reversed(lines[len(head_subset):][-tail_lines:]):
+            added = len(line) + (1 if tail_subset else 0)
+            if tail_len + added > max_half_chars and tail_subset:
+                break
+            tail_subset.append(line)
+            tail_len += added
+        tail_subset.reverse()
+        tail_text = "\n".join(tail_subset)
+
+        if not tail_text and len(text) > len(head_text):
+            tail_text = text[-min(max_half_chars, len(text) - len(head_text)):]
+
+        if len(head_text) + len(tail_text) + 150 > max_chars:
+            head_text = text[:max_half_chars]
+            tail_text = text[-max_half_chars:]
+            omitted_chars = len(text) - len(head_text) - len(tail_text)
+            notice = f"\n\n[... {omitted_chars}자 생략됨. 전체 출력을 파일로 저장하지 않으므로, 필요시 grep/tail/head 등으로 필터링하여 재실행하세요 ...]\n\n"
+            return f"{head_text}{notice}{tail_text}"
+
+        omitted_lines = max(0, total_lines - len(head_subset) - len(tail_subset))
+        omitted_chars = max(0, len(text) - len(head_text) - len(tail_text))
+        if omitted_lines > 0:
+            notice = f"\n\n[... {omitted_chars}자({omitted_lines}줄) 생략됨. 전체 출력을 파일로 저장하지 않으므로, 필요시 grep/tail/head 등으로 필터링하여 재실행하세요 ...]\n\n"
+        else:
+            notice = f"\n\n[... {omitted_chars}자 생략됨. 전체 출력을 파일로 저장하지 않으므로, 필요시 grep/tail/head 등으로 필터링하여 재실행하세요 ...]\n\n"
+        return f"{head_text}{notice}{tail_text}"
+    else:
+        head_text = text[:max_half_chars]
+        tail_text = text[-max_half_chars:]
+        omitted_chars = len(text) - len(head_text) - len(tail_text)
+        notice = f"\n\n[... {omitted_chars}자 생략됨. 전체 출력을 파일로 저장하지 않으므로, 필요시 grep/tail/head 등으로 필터링하여 재실행하세요 ...]\n\n"
+        return f"{head_text}{notice}{tail_text}"
+
+
+def _encapsulate_tool_output(workspace, call_id, text: str) -> str:
+    """긴 출력을 파일로 저장하는 대신 앞부분(Head)과 뒷부분(Tail)만 남기고 접는다."""
+    return fold_tool_output(text)
 
 
 async def tool_bash_exec(workspace, command: str, call_id: str) -> str:
