@@ -239,3 +239,80 @@ class ApplyUpdatesTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class EvidenceRetractionTest(unittest.TestCase):
+    """반증된 증거는 지우지 않고 철회한다 (live run 결함)."""
+
+    def test_retract_keeps_item_and_bumps_revision(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "avatars 경로가 200", "curl")
+        before = ledger.revision
+        item = ledger.add_evidence("E_X", retracted=True, note="전부 404 확인")
+        self.assertTrue(item.retracted)
+        self.assertEqual(item.note, "전부 404 확인")
+        self.assertEqual(item.summary, "avatars 경로가 200")
+        self.assertEqual(ledger.revision, before + 1)
+
+    def test_plain_reregistration_does_not_resurrect(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "틀린 주장", "curl", retracted=True, note="왜")
+        again = ledger.add_evidence("E_X", "틀린 주장", "curl")
+        self.assertTrue(again.retracted)
+
+    def test_explicit_false_reopens(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "주장", "curl", retracted=True)
+        revived = ledger.add_evidence("E_X", retracted=False)
+        self.assertFalse(revived.retracted)
+
+    def test_retracted_evidence_cannot_ground_a_transition(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "주장", "curl", retracted=True, note="반증됨")
+        with self.assertRaises(LedgerRefusal):
+            ledger.declare_hypothesis("H_A", "가설", status=ACTIVE, evidence_id="E_X")
+
+    def test_retracted_evidence_cannot_reopen_a_rejected_hypothesis(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_GOOD", "반증 근거", "curl")
+        ledger.declare_hypothesis(
+            "H_A", "가설", status=ACTIVE, evidence_id="E_GOOD"
+        )
+        ledger.declare_hypothesis(
+            "H_A", status=REJECTED, evidence_id="E_GOOD"
+        )
+        ledger.add_evidence("E_BAD", "되살릴 근거라고 주장", "curl", retracted=True)
+        with self.assertRaises(LedgerRefusal):
+            ledger.reopen_hypothesis("H_A", "E_BAD")
+
+    def test_render_marks_retracted_evidence(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "avatars 경로가 200", "curl", retracted=True, note="전부 404")
+        block = ledger.render()
+        self.assertIn("E_X [철회된 증거 - 사실로 인용 금지]", block)
+        self.assertIn("사유: 전부 404", block)
+
+    def test_report_labels_retraction(self):
+        ledger = ResearchLedger()
+        report = ledger.apply_updates(
+            {"evidence": [{"id": "E_X", "summary": "틀린 주장", "retracted": True}]}
+        )
+        self.assertIn("E_X(철회)", report)
+
+    def test_round_trip_preserves_retraction(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "주장", "curl", retracted=True, note="이유")
+        restored = ResearchLedger.from_dict(ledger.to_dict())
+        self.assertTrue(restored._evidence["E_X"].retracted)
+        self.assertEqual(restored._evidence["E_X"].note, "이유")
+
+    def test_legacy_snapshot_without_retraction_fields_loads(self):
+        payload = {
+            "goal": "g",
+            "revision": 3,
+            "evidence": [{"id": "E_X", "summary": "s", "source": "src"}],
+            "hypotheses": [],
+            "conclusions": [],
+        }
+        restored = ResearchLedger.from_dict(payload)
+        self.assertFalse(restored._evidence["E_X"].retracted)
