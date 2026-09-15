@@ -3471,6 +3471,12 @@ def rebuild_legacy_resume_state(workspace, restored, persist=True):
             artifact_manifest=restored.get("artifact_manifest"),
             source_run_id=restored.get("source_run_id"),
             source_step=restored.get("source_step"),
+            # 재개가 가드 상태를 잃으면 안 된다. 빠진 필드는 기본값으로
+            # 덮어써지므로, 다음 스텝은 확정 실패를 다시 시도하고 ledger가
+            # 방금 갱신된 것처럼 보인다.
+            known_bad_calls=restored.get("known_bad_calls"),
+            artifact_chain=restored.get("artifact_chain"),
+            last_record_step=restored.get("last_record_step"),
         )
     except OSError:
         log_session_event(
@@ -4749,6 +4755,13 @@ def rewind_run(owner_id, channel_id, run_id, step):
     gap = record.get("trajectory_gap_step")
     if not isinstance(gap, int) or isinstance(gap, bool) or gap > step:
         gap = None
+    # 되감기는 지정한 스텝 이후의 흔적을 지운다. 갱신 스텝도 같은 경계로
+    # 자른다. 미래 스텝을 그대로 두면 재개한 런이 아직 하지 않은 갱신을
+    # 근거로 "최근에 기록했다"고 판단한다.
+    record_step = record.get("last_record_step")
+    if not isinstance(record_step, int) or isinstance(record_step, bool):
+        record_step = 0
+    record_step = min(record_step, step)
     run_state.save(
         old_workspace,
         message_id=record.get("message_id"),
@@ -4765,6 +4778,7 @@ def rewind_run(owner_id, channel_id, run_id, step):
         artifact_manifest=manifest,
         known_bad_calls=known,
         artifact_chain=0,
+        last_record_step=record_step,
     )
     workspace = RUN_CATALOG.resume(owner_id, channel_id, old_workspace.run_id)
     stats = {

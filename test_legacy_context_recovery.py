@@ -108,6 +108,85 @@ class LegacyContextRecoveryTest(unittest.IsolatedAsyncioTestCase):
             "trajectory에서 복구한 원래 목표",
         )
 
+    def test_recovery_preserves_guard_state(self):
+        """재개 rebuild가 가드 상태를 기본값으로 덮어쓰면 안 된다.
+
+        live run 실측: 재개한 첫 스텝에 record_stale이 stale=1213/1423으로
+        오탐했고, 확정 실패 목록도 함께 사라졌다.
+        """
+        self._seed_legacy_trajectory()
+        fingerprint = "a" * 64
+        run_state.save(
+            self.workspace,
+            message_id=101,
+            next_step=1,
+            summary="",
+            tail=[],
+            ledger=ResearchLedger(),
+            interrupt={},
+            announced_call_ids=[],
+            tool_fingerprints=[[fingerprint, 2]],
+            trajectory_gap_step=None,
+            task_contract=None,
+            known_bad_calls={
+                fingerprint: {
+                    "tool": "read_file",
+                    "error": "not_found",
+                    "target": "/nope",
+                    "first_step": 2,
+                }
+            },
+            artifact_chain=2,
+            last_record_step=2,
+        )
+
+        recovered = bot.rebuild_legacy_resume_state(
+            self.workspace, run_state.load(self.workspace)
+        )
+
+        self.assertEqual(recovered["last_record_step"], 2)
+        self.assertEqual(recovered["artifact_chain"], 2)
+        self.assertIn(fingerprint, recovered["known_bad_calls"])
+
+        persisted = run_state.load(self.workspace)
+        self.assertEqual(persisted["last_record_step"], 2)
+        self.assertEqual(persisted["artifact_chain"], 2)
+        self.assertIn(fingerprint, persisted["known_bad_calls"])
+
+    def test_no_op_recovery_keeps_guard_state(self):
+        fingerprint = "b" * 64
+        run_state.save(
+            self.workspace,
+            message_id=101,
+            next_step=5,
+            summary="이미 요약됨",
+            tail=[],
+            ledger=ResearchLedger(),
+            interrupt={},
+            announced_call_ids=[],
+            tool_fingerprints=[],
+            trajectory_gap_step=None,
+            task_contract=None,
+            known_bad_calls={
+                fingerprint: {
+                    "tool": "read_file",
+                    "error": "not_found",
+                    "target": "/nope",
+                    "first_step": 1,
+                }
+            },
+            artifact_chain=1,
+            last_record_step=4,
+        )
+
+        recovered = bot.rebuild_legacy_resume_state(
+            self.workspace, run_state.load(self.workspace), persist=False
+        )
+
+        self.assertEqual(recovered["last_record_step"], 4)
+        self.assertEqual(recovered["artifact_chain"], 1)
+        self.assertIn(fingerprint, recovered["known_bad_calls"])
+
     def test_fork_imports_only_a_bounded_brief(self):
         self._seed_legacy_trajectory()
         self._legacy_state(next_step=1)
