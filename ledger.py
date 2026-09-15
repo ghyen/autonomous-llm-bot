@@ -31,6 +31,7 @@ STATE_BLOCK_TITLE = "권위 있는 조사 상태"
 STATE_RULES = (
     "규칙: rejected 가설은 새 증거를 인용한 reopen 없이 다시 active로 만들 수 없습니다. "
     f"{INVALID_LABEL} 결론은 현재 사실로 제시하지 마세요. "
+    "철회된 증거는 새 전이의 근거로 쓸 수 없습니다. "
     "이 블록은 권위 있는 상태이며, 요약이나 보고서가 이와 다르면 이 블록이 옳습니다."
 )
 DEFAULT_MAX_RENDERED_EVIDENCE = 12
@@ -51,6 +52,23 @@ def _required_list(payload, key):
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise TypeError("{0} is not a list of objects".format(key))
     return value
+
+
+def _evidence_line(evidence: "Evidence") -> str:
+    """One rendered evidence item.
+
+    A retracted item stays visible but cannot be mistaken for a fact: the
+    marker and the reason travel with it into every payload.
+    """
+    source = " (출처: {0})".format(evidence.source) if evidence.source else ""
+    if not evidence.retracted:
+        return "- {0} :: {1}{2}".format(
+            evidence.id, evidence.summary or "(요약 없음)", source
+        )
+    reason = " 사유: {0}".format(evidence.note) if evidence.note else ""
+    return "- {0} [철회된 증거 - 사실로 인용 금지]{1} :: {2}{3}".format(
+        evidence.id, reason, evidence.summary or "(요약 없음)", source
+    )
 
 
 def _clip(text, max_chars: int) -> str:
@@ -86,6 +104,11 @@ class Evidence:
     id: str
     summary: str = ""
     source: str = ""
+    # 반증된 증거는 지우지 않고 철회로 표시한다. 지우면 그 증거를 인용한
+    # 전이가 남은 채 근거만 사라져 이력이 거짓말을 하고, 남겨두면 다음 스텝이
+    # 여전히 사실로 인용한다. 철회만이 둘 다 막는다.
+    retracted: bool = False
+    note: str = ""
 
 
 @dataclass
@@ -113,7 +136,22 @@ class ResearchLedger:
             self.goal = goal
             self.revision += 1
 
-    def add_evidence(self, evidence_id, summary="", source="") -> Evidence:
+    def add_evidence(
+        self,
+        evidence_id,
+        summary="",
+        source="",
+        retracted=None,
+        note="",
+    ) -> Evidence:
+        """Register or correct one evidence item.
+
+        ``retracted`` is tri-state on purpose: ``None`` preserves the current
+        flag so an ordinary re-registration cannot silently un-retract a
+        disproven finding, ``True`` retracts it, and an explicit ``False`` is the
+        deliberate act of putting it back. Retraction keeps summary and source,
+        because the record of what was believed is as useful as the correction.
+        """
         evidence_id = str(evidence_id or "").strip()
         if not evidence_id:
             raise LedgerRefusal("증거 id가 비어 있어 등록을 거부했습니다.")
@@ -122,6 +160,10 @@ class ResearchLedger:
             id=evidence_id,
             summary=_clip(summary, _SUMMARY_CHARS) or (existing.summary if existing else ""),
             source=_clip(source, _SOURCE_CHARS) or (existing.source if existing else ""),
+            retracted=(
+                existing.retracted if retracted is None and existing else bool(retracted)
+            ),
+            note=_clip(note, _NOTE_CHARS) or (existing.note if existing else ""),
         )
         if existing != record:
             self._evidence[evidence_id] = record
@@ -246,9 +288,17 @@ class ResearchLedger:
             if optional:
                 return
             raise LedgerRefusal("상태 전이는 반드시 근거 증거 id를 인용해야 합니다.")
-        if evidence_id not in self._evidence:
+        evidence = self._evidence.get(evidence_id)
+        if evidence is None:
             raise LedgerRefusal(
                 "증거 {0}가 등록되어 있지 않습니다. evidence에 먼저 요약과 출처를 등록하세요.".format(
+                    evidence_id
+                )
+            )
+        if evidence.retracted:
+            raise LedgerRefusal(
+                "증거 {0}는 철회되었습니다. 새 전이의 근거로 쓸 수 없습니다. "
+                "다시 쓰려면 evidence에 retracted=false로 명시해 되살릴 수 있는지 먼저 판단하세요.".format(
                     evidence_id
                 )
             )
@@ -412,16 +462,10 @@ class ResearchLedger:
                         )
                     )
                 for evidence in cited_evidence + recent_evidence:
-                    source = " (출처: {0})".format(evidence.source) if evidence.source else ""
-                    lines.append(
-                        "- {0} :: {1}{2}".format(evidence.id, evidence.summary or "(요약 없음)", source)
-                    )
+                    lines.append(_evidence_line(evidence))
             else:
                 for evidence in all_evidence:
-                    source = " (출처: {0})".format(evidence.source) if evidence.source else ""
-                    lines.append(
-                        "- {0} :: {1}{2}".format(evidence.id, evidence.summary or "(요약 없음)", source)
-                    )
+                    lines.append(_evidence_line(evidence))
 
         if self._conclusions:
             lines.append("결론:")
@@ -474,12 +518,18 @@ class ResearchLedger:
                 continue
             try:
                 evidence = self.add_evidence(
-                    item.get("id"), item.get("summary", ""), item.get("source", "")
+                    item.get("id"),
+                    item.get("summary", ""),
+                    item.get("source", ""),
+                    retracted=item.get("retracted"),
+                    note=item.get("note", ""),
                 )
             except LedgerRefusal as refusal:
                 refused.append(str(refusal))
             else:
-                applied.append(evidence.id)
+                applied.append(
+                    "{0}(철회)".format(evidence.id) if evidence.retracted else evidence.id
+                )
 
         for item in payload.get("hypotheses") or []:
             if not isinstance(item, dict):

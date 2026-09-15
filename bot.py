@@ -127,6 +127,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 `[권위 있는 조사 상태]` 블록이 이번 조사에서 무엇이 사실인지에 대한 유일한 권위입니다.
 - 판단을 추론(생각)에만 남기지 마세요. 추론은 다음 스텝에 남지 않습니다. 가설을 세우거나 반증하거나 결론을 내릴 때마다 즉시 `record_state`로 짧은 구조화된 갱신을 기록하세요.
 - 증거는 먼저 `evidence`에 id·요약·출처로 등록하고, 가설 전이는 그 증거 id를 인용하세요.
+- 이전에 기록한 증거가 틀렸다고 판명되면 지우거나 다른 id로 복사하지 말고 같은 id에 `retracted=true`와 `note`(철회 사유)를 붙여 철회하세요. 철회된 증거는 이력으로 남고 상태 블록에 철회 표시와 함께 렌더되며, 이후 가설 전이의 근거로 인용할 수 없습니다.
 - 반증된 가설(`rejected`)을 다시 유망한 후보로 되살리려면, 이전에 인용하지 않은 새 증거를 등록하고 `status="reopen"`으로 요청해야 합니다. 그냥 다시 `active`로 쓰는 요청은 거부됩니다.
 - 결론은 `premises`에 근거 가설 id를 명시하세요. 전제가 교체되면 그 결론은 자동으로 무효가 되며, 무효 결론을 현재 사실처럼 보고하지 마세요.
 - 요약이나 보고서가 상태 블록과 다르면 상태 블록이 옳습니다.
@@ -340,7 +341,18 @@ TOOLS_SCHEMA = [
                             "properties": {
                                 "id": {"type": "string", "description": "짧은 증거 식별자 (예: E_NEG)"},
                                 "summary": {"type": "string", "description": "증거 요약 한두 문장"},
-                                "source": {"type": "string", "description": "출처 URL, 파일 경로 또는 명령어"}
+                                "source": {"type": "string", "description": "출처 URL, 파일 경로 또는 명령어"},
+                                "retracted": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "이 증거가 틀렸다고 판명되면 true로 철회하세요. 항목은 이력으로 남고 "
+                                        "철회 표시와 함께 렌더되며, 이후 전이의 근거로 쓸 수 없습니다."
+                                    )
+                                },
+                                "note": {
+                                    "type": "string",
+                                    "description": "철회 사유 또는 부가 설명"
+                                }
                             },
                             "required": ["id", "summary"]
                         }
