@@ -99,29 +99,65 @@ def _normalize_id(eid: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "", str(eid or "")).lower()
 
 
+def _is_near_duplicate_text(left, right, threshold=0.85) -> bool:
+    """정규화한 두 문장이 사실상 같은 내용인지 본다.
+
+    같은 사실을 어순만 바꾸거나 표현을 다듬어 다시 등록하는 기록을 중복으로
+    잡기 위한 판정이다. 한쪽이 비어 있으면 중복으로 보지 않는다.
+    """
+    norm_left = _normalize_text(left)
+    norm_right = _normalize_text(right)
+    if not norm_left or not norm_right:
+        return False
+    if norm_left == norm_right:
+        return True
+    return difflib.SequenceMatcher(None, norm_left, norm_right).ratio() >= threshold
+
+
+def _token_containment(left, right) -> float:
+    """짧은 쪽 어휘가 긴 쪽 어휘에 얼마나 포함되는지 본다.
+
+    요약이 짧으면 문자열 유사도가 낮게 나와 같은 사실을 놓친다. 어휘 집합으로
+    보면 "컨텍스트 플러시 후 재개"처럼 긴 설명의 일부만 다시 쓴 경우를 잡는다.
+    """
+    left_tokens = set(_normalize_text(left).split())
+    right_tokens = set(_normalize_text(right).split())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / float(min(len(left_tokens), len(right_tokens)))
+
+
+_ID_PREFIX_CHARS = 8
+# 라이브 런(2e2190c5) 원장 105건으로 실측한 값이다. 0.5에서 중복으로 묶이는
+# 쌍은 3건이고 전부 같은 사실을 다른 id로 다시 등록한 기록이었다.
+_ID_TOKEN_CONTAINMENT = 0.5
+# 같은 계획을 재배열하거나 항목만 덧붙인 goal 변경을 걸러내는 기준이다.
+_GOAL_CONTAINMENT = 0.8
+
+
 def _is_duplicate_evidence(
     new_id: str, new_summary: str, existing_id: str, existing_summary: str
 ) -> bool:
-    norm_new_s = _normalize_text(new_summary)
-    norm_ext_s = _normalize_text(existing_summary)
-    if not norm_new_s and not norm_ext_s:
-        return False
-    if norm_new_s and norm_ext_s:
-        if norm_new_s == norm_ext_s:
-            return True
-        matcher = difflib.SequenceMatcher(None, norm_new_s, norm_ext_s)
-        if matcher.ratio() >= 0.85:
-            return True
+    """같은 사실을 다른 이름으로 다시 등록한 기록인지 판정한다."""
+    if _is_near_duplicate_text(new_summary, existing_summary):
+        return True
     norm_new_id = _normalize_id(new_id)
     norm_ext_id = _normalize_id(existing_id)
-    if norm_new_id and norm_ext_id:
-        if norm_new_id == norm_ext_id:
-            return True
-        if (norm_new_id in norm_ext_id or norm_ext_id in norm_new_id):
-            if norm_new_s and norm_ext_s:
-                matcher = difflib.SequenceMatcher(None, norm_new_s, norm_ext_s)
-                if matcher.ratio() >= 0.70:
-                    return True
+    if not norm_new_id or not norm_ext_id:
+        return False
+    if norm_new_id == norm_ext_id:
+        return True
+    if norm_new_id in norm_ext_id or norm_ext_id in norm_new_id:
+        return _is_near_duplicate_text(new_summary, existing_summary, threshold=0.70)
+    # 같은 주제를 다른 이름으로 반복 등록하는 경우(E_CONTEXT_FLUSH /
+    # E_CONTEXT_RESTART)는 id 앞머리가 같다. 앞머리가 같고 어휘마저
+    # 겹치면 같은 사실의 재등록으로 본다.
+    if (
+        len(norm_new_id) >= _ID_PREFIX_CHARS
+        and len(norm_ext_id) >= _ID_PREFIX_CHARS
+        and norm_new_id[:_ID_PREFIX_CHARS] == norm_ext_id[:_ID_PREFIX_CHARS]
+    ):
+        return _token_containment(new_summary, existing_summary) >= _ID_TOKEN_CONTAINMENT
     return False
 
 
@@ -593,7 +629,13 @@ class ResearchLedger:
             old_goal = self.goal
             self.set_goal(goal)
             if self.goal != old_goal:
-                delta.goal_changed = True
+                # 같은 목표를 어순만 바꾸거나 항목을 덧붙여 다시 쓰는 것은
+                # 실질 갱신이 아니다. 그대로 인정하면 문구만 손봐서 게이트를
+                # 계속 열 수 있다.
+                delta.goal_changed = not (
+                    _is_near_duplicate_text(old_goal, self.goal)
+                    or _token_containment(old_goal, self.goal) >= _GOAL_CONTAINMENT
+                )
                 applied.append("목표 갱신: " + self.goal)
 
         for item in payload.get("evidence") or []:
@@ -679,10 +721,18 @@ class ResearchLedger:
             except LedgerRefusal as refusal:
                 refused.append(str(refusal))
             else:
+                # 가설 문장을 다듬은 것만으로는 실질 갱신이 아니다. 상태 전이,
+                # 새 가설, 내용이 실제로 달라진 재정의만 인정한다.
+                statement_changed = old_statement != hypothesis.statement
                 if (
                     not old_hypo
                     or old_status != hypothesis.status
-                    or old_statement != hypothesis.statement
+                    or (
+                        statement_changed
+                        and not _is_near_duplicate_text(
+                            old_statement, hypothesis.statement
+                        )
+                    )
                 ):
                     delta.hypotheses_changed.append(hypothesis.id)
                 applied.append(hypothesis.marker)
@@ -702,10 +752,18 @@ class ResearchLedger:
             except LedgerRefusal as refusal:
                 refused.append(str(refusal))
             else:
+                # 결론 문장 다듬기도 실질 갱신이 아니다. 전제 교체는 근거가
+                # 바뀐 것이므로 그대로 인정한다.
+                statement_changed = old_statement != conclusion.statement
                 if (
                     not old_conc
-                    or old_statement != conclusion.statement
                     or old_premises != conclusion.premises
+                    or (
+                        statement_changed
+                        and not _is_near_duplicate_text(
+                            old_statement, conclusion.statement
+                        )
+                    )
                 ):
                     delta.conclusions_changed.append(conclusion.id)
                 applied.append(self.conclusion_marker(conclusion.id))
