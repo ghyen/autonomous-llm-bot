@@ -36,12 +36,17 @@ STATE_RULES = (
     "철회된 증거는 새 전이의 근거로 쓸 수 없습니다. "
     "이 블록은 권위 있는 상태이며, 요약이나 보고서가 이와 다르면 이 블록이 옳습니다."
 )
-DEFAULT_MAX_RENDERED_EVIDENCE = 12
+DEFAULT_MAX_RENDERED_EVIDENCE = 8
 
 _STATEMENT_CHARS = 220
 _SUMMARY_CHARS = 220
 _SOURCE_CHARS = 160
 _NOTE_CHARS = 120
+# 상태 블록은 매 요청마다 다시 들어가는 고정 비용이다. 저장은 길게 하되
+# 렌더는 짧게 하고, 상세는 원장과 findings.md에 남긴다.
+_RENDERED_SUMMARY_CHARS = 120
+_RENDERED_STATEMENT_CHARS = 110
+_RENDERED_NOTE_CHARS = 60
 
 
 class LedgerRefusal(Exception):
@@ -169,20 +174,31 @@ def _required_list(payload, key):
     return value
 
 
+def _render_clip(text, limit: int) -> str:
+    """상태 블록에 들어갈 자유 서술을 렌더 상한까지 줄인다."""
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)].rstrip() + "…"
+
+
 def _evidence_line(evidence: "Evidence") -> str:
     """One rendered evidence item.
 
     A retracted item stays visible but cannot be mistaken for a fact: the
     marker and the reason travel with it into every payload.
     """
-    source = " (출처: {0})".format(evidence.source) if evidence.source else ""
+    source = " (출처: {0})".format(_render_clip(evidence.source, _RENDERED_NOTE_CHARS)) if evidence.source else ""
+    summary = _render_clip(evidence.summary, _RENDERED_SUMMARY_CHARS) or "(요약 없음)"
     if not evidence.retracted:
-        return "- {0} :: {1}{2}".format(
-            evidence.id, evidence.summary or "(요약 없음)", source
-        )
-    reason = " 사유: {0}".format(evidence.note) if evidence.note else ""
+        return "- {0} :: {1}{2}".format(evidence.id, summary, source)
+    reason = (
+        " 사유: {0}".format(_render_clip(evidence.note, _RENDERED_NOTE_CHARS))
+        if evidence.note
+        else ""
+    )
     return "- {0} [철회된 증거 - 사실로 인용 금지]{1} :: {2}{3}".format(
-        evidence.id, reason, evidence.summary or "(요약 없음)", source
+        evidence.id, reason, summary, source
     )
 
 
@@ -540,16 +556,25 @@ class ResearchLedger:
 
         if self._hypotheses:
             lines.append("가설:")
+            # 전이 이력 전체는 길어지기만 한다. 반증·확정 이유를 담은 마지막
+            # 전이만 남긴다. 문장은 유지하되 렌더 상한까지 줄인다.
             for hypothesis in self._hypotheses.values():
-                trail = " / ".join(
+                latest = hypothesis.transitions[-1] if hypothesis.transitions else None
+                trail = (
                     "v{0} {1}{2}".format(
-                        t.revision, t.status, "←" + t.evidence_id if t.evidence_id else ""
+                        latest.revision,
+                        latest.status,
+                        "←" + latest.evidence_id if latest.evidence_id else "",
                     )
-                    for t in hypothesis.transitions
+                    if latest is not None
+                    else "전이 없음"
+                )
+                statement = _render_clip(
+                    hypothesis.statement, _RENDERED_STATEMENT_CHARS
                 )
                 lines.append(
                     "- {0} :: {1} (전이: {2})".format(
-                        hypothesis.marker, hypothesis.statement or "(진술 없음)", trail
+                        hypothesis.marker, statement or "(진술 없음)", trail
                     )
                 )
 
@@ -566,18 +591,46 @@ class ResearchLedger:
                     for p in c.premises:
                         cited.add(p)
 
-                recent_evidence = all_evidence[-max_evidence:]
-                shown_ids = {e.id for e in recent_evidence}
-                cited_evidence = [e for e in all_evidence if e.id in cited and e.id not in shown_ids]
+                # 지금 목표와 겹치는 증거를 먼저 남기고, 그다음 최근 순으로
+                # 채운다. 인용된 증거는 항상 남긴다. 목표가 바뀌면 관련 없는
+                # 옛 증거는 자동으로 빠지고 개수만 남는다.
+                goal_tokens = set(_normalize_text(self.goal).split())
+                ranked = []
+                for index, evidence in enumerate(all_evidence):
+                    tokens = set(
+                        _normalize_text(
+                            "{0} {1} {2}".format(
+                                evidence.id, evidence.summary, evidence.source
+                            )
+                        ).split()
+                    )
+                    overlap = len(goal_tokens & tokens) if goal_tokens else 0
+                    # 하네스가 자동 승격한 도구 출력은 같은 관련도면 뒤로 둔다.
+                    harness = 0 if str(evidence.id).startswith("TRAJ_") else 1
+                    ranked.append((overlap, harness, index, evidence))
+                ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
 
-                omitted_count = len(all_evidence) - len(shown_ids) - len(cited_evidence)
+                selected = [e for e in all_evidence if e.id in cited]
+                selected_ids = {e.id for e in selected}
+                picked = 0
+                for _overlap, _harness, _index, evidence in ranked:
+                    if picked >= max_evidence:
+                        break
+                    if evidence.id in selected_ids:
+                        continue
+                    selected.append(evidence)
+                    selected_ids.add(evidence.id)
+                    picked += 1
+
+                omitted_count = len(all_evidence) - len(selected_ids)
                 if omitted_count > 0:
                     lines.append(
-                        "- ... (이전 증거 {0}건 요약 생략: findings.md 및 디스크 원장에 영구 보존됨)".format(
+                        "- ... (이전 증거 {0}건 생략: 목표 무관·오래된 항목. 원문은 findings.md와 원장에 보존됨)".format(
                             omitted_count
                         )
                     )
-                for evidence in cited_evidence + recent_evidence:
+                order = {evidence.id: index for index, evidence in enumerate(all_evidence)}
+                for evidence in sorted(selected, key=lambda e: order[e.id]):
                     lines.append(_evidence_line(evidence))
             else:
                 for evidence in all_evidence:
@@ -592,7 +645,8 @@ class ResearchLedger:
                 )
                 line = "- {0} :: {1}".format(
                     self.conclusion_marker(conclusion.id),
-                    conclusion.statement or "(진술 없음)",
+                    _render_clip(conclusion.statement, _RENDERED_STATEMENT_CHARS)
+                    or "(진술 없음)",
                 )
                 if premises:
                     line += " | 전제: {0}".format(premises)
