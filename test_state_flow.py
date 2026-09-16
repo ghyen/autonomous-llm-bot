@@ -431,5 +431,74 @@ class CheckpointFailureTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("중간 보고서 제출 완료", last_agent_payload)
 
 
+class CheckpointCadenceTest(unittest.IsolatedAsyncioTestCase):
+    """flush 주기와 Discord 보고 주기를 나눈 뒤의 체크포인트 동작."""
+
+    CHANNEL_ID = 987654411
+
+    def tearDown(self):
+        bot.FREE_RESPONSE_CHANNEL_IDS.discard(self.CHANNEL_ID)
+        for state in (
+            bot.channel_history,
+            bot.channel_summary,
+            bot.channel_reasoning,
+            bot.channel_cancel_token,
+            bot.channel_active_runs,
+            bot.channel_ledger,
+        ):
+            state.pop(self.CHANNEL_ID, None)
+
+    async def test_flush_only_checkpoints_skip_the_report(self):
+        bot.FREE_RESPONSE_CHANNEL_IDS.add(self.CHANNEL_ID)
+        agent_responses = [
+            _response(tool_calls=[_tool_call(f"c{i}", "bash_exec", {"command": f"probe{i}"})])
+            for i in range(1, 5)
+        ] + [
+            _response(tool_calls=[_tool_call("c9", "finish_task", {
+                "report": "정리했습니다. " + ("확인됨. " * 60),
+            })])
+        ]
+        stub = ModelStub(agent_responses)
+        message = FakeMessage("장애 원인을 조사해줘", self.CHANNEL_ID)
+
+        with tempfile.TemporaryDirectory() as log_dir, \
+                run_catalog_patch(bot, log_dir), \
+                patch.object(bot, "MAX_AGENT_LOOPS", 5), \
+                patch.object(bot, "CHECKPOINT_INTERVAL", 1), \
+                patch.object(bot, "REPORT_EVERY_CHECKPOINTS", 2), \
+                patch.object(bot, "ROLLING_COMPACTION_INTERVAL", 99), \
+                patch.object(bot, "tool_bash_exec", AsyncMock(return_value=BASH_RESULT)), \
+                patch.object(bot, "create_streaming_completion", stub), \
+                patch.object(bot, "log_session_event", wraps=bot.log_session_event) as events:
+            await bot.on_message(message)
+
+        reports = [c for c in events.call_args_list if c.args[1] == "checkpoint_report"]
+        flushes = [c for c in events.call_args_list if c.args[1] == "checkpoint_context_flush"]
+        flush_only = [c for c in events.call_args_list if c.args[1] == "checkpoint_flush_only"]
+
+        # 체크포인트는 매 스텝(1~4) 돌고, 보고는 두 번째 체크포인트마다(2, 4)만 나간다.
+        self.assertEqual(len(flushes), 4, [c.args[1] for c in events.call_args_list])
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(len(flush_only), 2)
+        self.assertEqual([c.kwargs["step"] for c in flush_only], [1, 3])
+        self.assertEqual(
+            [c.kwargs["report"] for c in flushes if "report" in c.kwargs],
+            [False, False],
+        )
+        # Discord 중간 보고서는 보고 체크포인트에서만 전송된다.
+        sent = "\n".join(list(message.replies) + list(message.channel.sent))
+        self.assertEqual(sent.count("중간 진행 보고서"), 2)
+
+    def test_report_interval_converts_to_checkpoint_count(self):
+        # 기본값: 보고 주기 = flush 주기 → 매 체크포인트마다 보고
+        self.assertEqual(bot._report_every_checkpoints(50, 50), 1)
+        self.assertEqual(bot._report_every_checkpoints(25, 25), 1)
+        # 25스텝마다 flush, 100스텝마다 보고
+        self.assertEqual(bot._report_every_checkpoints(25, 100), 4)
+        # flush 주기의 배수가 아니면 체크포인트 격자에서 도달할 수 없으므로 매번 보고
+        self.assertEqual(bot._report_every_checkpoints(25, 30), 1)
+        self.assertEqual(bot._report_every_checkpoints(25, 0), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

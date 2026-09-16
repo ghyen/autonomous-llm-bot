@@ -597,6 +597,27 @@ def steering_receipt_notice(receipt, text: str) -> str:
 
 MAX_RECENT_TURNS = 8
 CHECKPOINT_INTERVAL = CONFIG.checkpoint_interval
+# 컨텍스트 flush 주기와 Discord 보고 주기를 나눈다. flush는 결정적 압축이라
+# 싸고, 보고서 생성 + 고심도 종합 턴은 비싸므로 더 드물게 돌린다.
+REPORT_INTERVAL = CONFIG.report_interval
+
+
+def _report_every_checkpoints(checkpoint_interval: int, report_interval: int) -> int:
+    """보고 주기를 체크포인트 개수로 환산한다.
+
+    체크포인트는 flush 주기의 격자에서만 돌기 때문에, 보고 주기가 그 배수가
+    아니면 도달할 수 있는 지점이 없다. 그때는 매 체크포인트마다 보고한다.
+    """
+    if checkpoint_interval <= 0 or report_interval <= 0:
+        return 1
+    if report_interval % checkpoint_interval != 0:
+        return 1
+    return max(1, report_interval // checkpoint_interval)
+
+
+REPORT_EVERY_CHECKPOINTS = _report_every_checkpoints(
+    CHECKPOINT_INTERVAL, REPORT_INTERVAL
+)
 MAX_AGENT_LOOPS = CONFIG.max_agent_loops
 MAX_CONSECUTIVE_FAILED_TOOL_CALLS = 2
 MAX_TOOL_EXECUTIONS_PER_RUN = CONFIG.max_tool_executions_per_run
@@ -7120,7 +7141,62 @@ async def on_message(message: discord.Message):
                 # 이 보고서는 사용자용 진행 브리핑이며 복구 지점이 아니다. 복구에
                 # 쓰이는 것은 바로 위 save_snapshot이 남긴 durable 레코드다.
                 checkpoint_ok = False
-                if (iteration + 1) % CHECKPOINT_INTERVAL == 0 and (iteration + 1) < MAX_AGENT_LOOPS and not token.cancelled:
+                # flush 전용 체크포인트: 보고서와 고심도 종합 턴 없이 컨텍스트만
+                # 정리한다. 결정적 압축이라 싸고, 프롬프트가 상한까지 차오르는
+                # 구간을 줄여 prefill 메모리 거부를 낮춘다.
+                if (
+                    (iteration + 1) % CHECKPOINT_INTERVAL == 0
+                    and REPORT_EVERY_CHECKPOINTS > 1
+                    and ((iteration + 1) // CHECKPOINT_INTERVAL) % REPORT_EVERY_CHECKPOINTS != 0
+                    and (iteration + 1) < MAX_AGENT_LOOPS
+                    and not token.cancelled
+                ):
+                    flush_only_num = (iteration + 1) // CHECKPOINT_INTERVAL
+                    log_session_event(
+                        workspace,
+                        "checkpoint_flush_only",
+                        step=iteration + 1,
+                        checkpoint=flush_only_num,
+                    )
+                    messages_payload, rolling_summary = flush_agent_context(
+                        workspace=workspace,
+                        messages=messages_payload,
+                        ledger=ledger,
+                        task_contract=task_contract,
+                        artifact_manifest=artifact_manifest,
+                        checkpoint_num=flush_only_num,
+                        phase_note=(
+                            f"[🤖 컨텍스트 정리 안내: Step {iteration+1}에서 대화 tail을 정리(Flush)했습니다. "
+                            f"중간 보고서는 {REPORT_INTERVAL}스텝마다 전송됩니다. "
+                            f"핵심 결론은 매 요청마다 [📌 기확정 사전 지식 및 계획] 블록으로 계속 제공되므로 "
+                            f"도구로 다시 전체를 읽을 필요가 없습니다. "
+                            f"원문 일부가 필요하면 grep -n/sed -n 또는 read_file(offset=..., limit=...)을 쓰고, "
+                            f"과거 대화 복원은 lookup_trajectory를 사용하세요. "
+                            f"위 사전 지식을 확정된 전제로 삼아 현재 목표 작업을 이어가고, "
+                            f"판단이 바뀐 부분은 record_state로 갱신하세요. "
+                            f"모든 조사가 끝났으면 finish_task를 호출하세요.]"
+                        ),
+                    )
+                    channel_summary[message.channel.id] = rolling_summary
+                    save_snapshot(iteration + 2, "context_flush")
+                    log_session_event(
+                        workspace,
+                        "checkpoint_context_flush",
+                        step=iteration + 1,
+                        checkpoint=flush_only_num,
+                        messages_count=len(messages_payload),
+                        summary_chars=len(rolling_summary),
+                        report=False,
+                    )
+
+                checkpoint_ok = False
+                # 보고 체크포인트: REPORT_INTERVAL마다 보고서 전송 + flush + 고심도 턴.
+                if (
+                    (iteration + 1) % CHECKPOINT_INTERVAL == 0
+                    and ((iteration + 1) // CHECKPOINT_INTERVAL) % REPORT_EVERY_CHECKPOINTS == 0
+                    and (iteration + 1) < MAX_AGENT_LOOPS
+                    and not token.cancelled
+                ):
                     checkpoint_num = (iteration + 1) // CHECKPOINT_INTERVAL
                     log_session_event(
                         workspace,
