@@ -91,6 +91,7 @@ class BotConfig:
     bash_timeout: float
     max_agent_loops: int
     checkpoint_interval: int
+    report_interval: int
     max_tool_executions_per_run: int
     agent_step_max_tokens: int
     reasoning_max_tokens: int
@@ -327,6 +328,12 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         )
 
     llm_base_url = get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
+    # 보고 주기의 기본값이 flush 주기를 따라가므로 먼저 풀어둔다.
+    checkpoint_interval = parse_positive_int(
+        get("CHECKPOINT_INTERVAL"),
+        "CHECKPOINT_INTERVAL",
+        DEFAULT_CHECKPOINT_INTERVAL,
+    )
     config = BotConfig(
         discord_token=discord_token,
         llm_base_url=llm_base_url,
@@ -359,10 +366,13 @@ def load_config(env: Optional[Mapping[str, str]] = None, env_file: Optional[str]
         max_agent_loops=parse_positive_int(
             get("MAX_AGENT_LOOPS"), "MAX_AGENT_LOOPS", DEFAULT_MAX_AGENT_LOOPS
         ),
-        checkpoint_interval=parse_positive_int(
-            get("CHECKPOINT_INTERVAL"),
-            "CHECKPOINT_INTERVAL",
-            DEFAULT_CHECKPOINT_INTERVAL,
+        checkpoint_interval=checkpoint_interval,
+        # 보고 주기는 컨텍스트 flush 주기와 분리한다. flush는 매번 짧게 돌리고
+        # Discord 보고서와 고심도 종합 턴은 더 드물게 가져간다.
+        report_interval=parse_positive_int(
+            get("REPORT_INTERVAL"),
+            "REPORT_INTERVAL",
+            checkpoint_interval,
         ),
         max_tool_executions_per_run=parse_positive_int(
             get("MAX_TOOL_EXECUTIONS_PER_RUN"),
@@ -480,9 +490,10 @@ def startup_diagnostics(config: BotConfig) -> List[str]:
             config.tool_stage_timeout,
             config.bash_timeout,
         ),
-        "agent limits: loops={0} checkpoint={1} tools={2} step_tokens={3} reasoning_tokens={4} context_tokens={5} effort={6} adaptive={7}".format(
+        "agent limits: loops={0} checkpoint={1} report={2} tools={3} step_tokens={4} reasoning_tokens={5} context_tokens={6} effort={7} adaptive={8}".format(
             config.max_agent_loops,
             config.checkpoint_interval,
+            config.report_interval,
             config.max_tool_executions_per_run,
             config.agent_step_max_tokens,
             config.reasoning_max_tokens,

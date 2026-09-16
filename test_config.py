@@ -355,7 +355,7 @@ class AgentLimitConfigTest(unittest.TestCase):
     def test_diagnostics_report_effective_agent_limits(self):
         text = "\n".join(startup_diagnostics(load_config(env=env(), env_file=None)))
         self.assertIn(
-            "agent limits: loops=2000 checkpoint=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 context_tokens=10240 effort=high adaptive=true",
+            "agent limits: loops=2000 checkpoint=50 report=50 tools=2000 step_tokens=4096 reasoning_tokens=1536 context_tokens=10240 effort=high adaptive=true",
             text,
         )
 
