@@ -1098,6 +1098,9 @@ ARTIFACT_DIR_NAME = "artifacts"
 ARTIFACT_PREVIEW_LINES = 50
 ARTIFACT_PREVIEW_MAX_CHARS = 2000
 ARTIFACT_MANIFEST_MAX_ITEMS = run_state.ARTIFACT_MANIFEST_MAX_ITEMS
+# 저장은 24건까지 하되 프롬프트에는 최근 것만 넣는다. 매니페스트는 매 요청
+# 들어가는 고정 비용이고, 전체 목록은 artifacts/ 디렉터리에 있다.
+ARTIFACT_MANIFEST_RENDER_ITEMS = 8
 # ponytail: 런당 산출물 예산을 디스크 한도의 1/8로 고정한다. 산출물은 런 루트
 # 안에 쌓이므로 bash 워커의 workspace_disk_limit 감시에 함께 잡히고, 예산이 없으면
 # 긴 출력이 이어질 때 뒤쪽 bash 호출이 굶는다. 실행별 조정이 필요해지면 설정
@@ -3614,7 +3617,8 @@ def _render_artifact_manifest(artifact_manifest):
     if not items:
         lines.append("- 호스트가 관측한 산출물이 아직 없습니다.")
     else:
-        for item in items[:run_state.ARTIFACT_MANIFEST_MAX_ITEMS]:
+        rendered = []
+        for item in items:
             if not isinstance(item, dict):
                 continue
             path = str(item.get("path") or "").strip()
@@ -3623,6 +3627,14 @@ def _render_artifact_manifest(artifact_manifest):
             revision = item.get("revision")
             if not path or not kind or not isinstance(step, int):
                 continue
+            rendered.append((path, kind, step, revision))
+        shown = rendered[-ARTIFACT_MANIFEST_RENDER_ITEMS:]
+        omitted = len(rendered) - len(shown)
+        if omitted > 0:
+            lines.append(
+                f"- ... (이전 산출물 {omitted}건 생략 — `ls -t artifacts/ | head` 또는 `grep -rl`로 확인)"
+            )
+        for path, kind, step, revision in shown:
             suffix = f", revision={revision}" if revision else ""
             lines.append(f"- {path} ({kind}, Step {step}{suffix})")
         if len(lines) == 1:
@@ -3632,8 +3644,8 @@ def _render_artifact_manifest(artifact_manifest):
 
 # 사전 지식 블록은 매 요청마다 다시 들어가는 고정 비용이다. 상세는 파일에
 # 남기고, 프롬프트에는 결론 중심만 남긴다.
-ESTABLISHED_FINDINGS_MAX_CHARS = 2000
-ESTABLISHED_PLAN_MAX_CHARS = 1200
+ESTABLISHED_FINDINGS_MAX_CHARS = 1600
+ESTABLISHED_PLAN_MAX_CHARS = 1000
 
 
 def _find_canonical_file(workspace, filename: str) -> Optional[str]:

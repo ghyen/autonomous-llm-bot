@@ -36,7 +36,7 @@ STATE_RULES = (
     "철회된 증거는 새 전이의 근거로 쓸 수 없습니다. "
     "이 블록은 권위 있는 상태이며, 요약이나 보고서가 이와 다르면 이 블록이 옳습니다."
 )
-DEFAULT_MAX_RENDERED_EVIDENCE = 8
+DEFAULT_MAX_RENDERED_EVIDENCE = 6
 
 _STATEMENT_CHARS = 220
 _SUMMARY_CHARS = 220
@@ -44,8 +44,10 @@ _SOURCE_CHARS = 160
 _NOTE_CHARS = 120
 # 상태 블록은 매 요청마다 다시 들어가는 고정 비용이다. 저장은 길게 하되
 # 렌더는 짧게 하고, 상세는 원장과 findings.md에 남긴다.
-_RENDERED_SUMMARY_CHARS = 120
-_RENDERED_STATEMENT_CHARS = 110
+_RENDERED_SUMMARY_CHARS = 100
+_RENDERED_STATEMENT_CHARS = 96
+# 반증·확정된 가설은 판단 대상이 아니라 이력이다. 마커와 짧은 진술만 남긴다.
+_RENDERED_STATEMENT_CHARS_INACTIVE = 64
 _RENDERED_NOTE_CHARS = 60
 
 
@@ -570,7 +572,12 @@ class ResearchLedger:
                     else "전이 없음"
                 )
                 statement = _render_clip(
-                    hypothesis.statement, _RENDERED_STATEMENT_CHARS
+                    hypothesis.statement,
+                    (
+                        _RENDERED_STATEMENT_CHARS
+                        if hypothesis.status == ACTIVE
+                        else _RENDERED_STATEMENT_CHARS_INACTIVE
+                    ),
                 )
                 lines.append(
                     "- {0} :: {1} (전이: {2})".format(
