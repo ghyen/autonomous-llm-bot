@@ -217,13 +217,30 @@ class ApplyUpdatesTest(unittest.TestCase):
         self.assertNotIn("생략", full_render)
 
         # Bounded render with max_evidence=5:
-        # Should include cited E_02 + recent 5 items (E_15..E_19) + summary line
+        # Should include cited E_02 + the 5 most relevant/recent items (E_15..E_19)
+        # + an omission line whose count covers everything dropped.
         bounded = ledger.render(max_evidence=5)
-        self.assertIn("이전 증거 14건 요약 생략", bounded)
+        self.assertIn("이전 증거 14건 생략", bounded)
         self.assertIn("E_02", bounded)
         for i in range(15, 20):
             self.assertIn(f"E_{i:02d}", bounded)
         self.assertNotIn("E_10 ::", bounded)
+
+    def test_bounded_render_prefers_goal_relevant_evidence(self):
+        ledger = ResearchLedger()
+        ledger.set_goal("전화번호 CI DI 노출 경로 조사")
+        ledger.add_evidence("E_RELEVANT", "전화번호 CI DI가 저장되는 경로", "src://a")
+        for i in range(6):
+            ledger.add_evidence(f"E_OLD_{i}", f"무관한 과거 관측 {i}", f"src://old/{i}")
+        ledger.add_evidence("E_NEWEST", "최근 무관한 관측", "src://z")
+
+        bounded = ledger.render(max_evidence=2)
+
+        # 오래된 항목이라도 지금 목표와 겹치면 남고, 남은 자리는 최근 항목이 차지한다.
+        self.assertIn("E_RELEVANT", bounded)
+        self.assertIn("E_NEWEST", bounded)
+        self.assertNotIn("E_OLD_5 ::", bounded)
+        self.assertIn("6건 생략", bounded)
 
     def test_apply_updates_with_status_include_render_false(self):
         ledger = ResearchLedger()

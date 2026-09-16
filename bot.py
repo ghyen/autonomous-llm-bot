@@ -47,7 +47,7 @@ from deadlines import (
     with_deadline,
 )
 from outcome import RunOutcome
-from ledger import LedgerRefusal, ResearchLedger
+from ledger import DEFAULT_MAX_RENDERED_EVIDENCE, LedgerRefusal, ResearchLedger
 from run_workspace import RunActiveError, RunCatalog, RunNotFoundError, atomic_write
 from session_log import log_content_debug, log_session_event
 from config import ConfigError, load_config, startup_diagnostics
@@ -3630,8 +3630,10 @@ def _render_artifact_manifest(artifact_manifest):
     return "\n".join(lines)
 
 
-ESTABLISHED_FINDINGS_MAX_CHARS = 3200
-ESTABLISHED_PLAN_MAX_CHARS = 2000
+# 사전 지식 블록은 매 요청마다 다시 들어가는 고정 비용이다. 상세는 파일에
+# 남기고, 프롬프트에는 결론 중심만 남긴다.
+ESTABLISHED_FINDINGS_MAX_CHARS = 2000
+ESTABLISHED_PLAN_MAX_CHARS = 1200
 
 
 def _find_canonical_file(workspace, filename: str) -> Optional[str]:
@@ -3833,7 +3835,9 @@ def build_system_content(
     state_block = ""
     if ledger is not None:
         try:
-            state_block = ledger.render(max_evidence=12)
+            state_block = ledger.render(
+                max_evidence=DEFAULT_MAX_RENDERED_EVIDENCE
+            )
         except TypeError:
             state_block = ledger.render()
     if state_block:
@@ -4535,12 +4539,8 @@ def split_markdown_chunks(text: str, max_chars: int = DISCORD_CHUNK_MAX_CHARS) -
     return chunks if chunks else [text]
 
 
-def bound_local_fallback_output(text: str) -> str:
-    """Bound user-facing fallback without mutating its authoritative sources."""
-    text = str(text or "")
-    if len(text) <= LOCAL_FALLBACK_MAX_CHARS:
-        return text
-    available = LOCAL_FALLBACK_MAX_CHARS - len(LOCAL_FALLBACK_OMISSION_MARKER) - 64
+def _cut_local_fallback(text: str, available: int) -> str:
+    """머리와 꼬리를 남기고 중간을 생략 표시로 대체한다."""
     head_chars = available // 2
     tail_chars = available - head_chars
 
@@ -4569,11 +4569,24 @@ def bound_local_fallback_output(text: str) -> str:
     if tail_fence:
         tail += "\n" + tail_fence[:3]
 
-    return (
-        head
-        + LOCAL_FALLBACK_OMISSION_MARKER
-        + tail
-    )
+    return head + LOCAL_FALLBACK_OMISSION_MARKER + tail
+
+
+def bound_local_fallback_output(text: str) -> str:
+    """Bound user-facing fallback without mutating its authoritative sources."""
+    text = str(text or "")
+    if len(text) <= LOCAL_FALLBACK_MAX_CHARS:
+        return text
+    available = LOCAL_FALLBACK_MAX_CHARS - len(LOCAL_FALLBACK_OMISSION_MARKER) - 64
+    # 청크 분할은 코드 펜스와 긴 줄을 지키느라 요청한 길이보다 잘게 나뉜다.
+    # 잘라 놓고 실제 덩어리 수를 세어 상한을 넘으면 여유를 줄여 다시 자른다.
+    bounded = _cut_local_fallback(text, available)
+    for _ in range(4):
+        if len(split_markdown_chunks(bounded)) <= LOCAL_FALLBACK_MAX_CHUNKS:
+            break
+        available = int(available * 0.85)
+        bounded = _cut_local_fallback(text, available)
+    return bounded
 
 
 RUN_ID_MARKER_TEMPLATE = "> 🧾 **run ID**: `{run_id}`"
