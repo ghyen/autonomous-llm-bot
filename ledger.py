@@ -15,6 +15,8 @@ Two rules are enforced structurally rather than by prompt:
 """
 
 from dataclasses import asdict, dataclass, field
+import difflib
+import re
 from typing import Dict, Iterable, List, Optional, Tuple
 
 ACTIVE = "active"
@@ -44,6 +46,83 @@ _NOTE_CHARS = 120
 
 class LedgerRefusal(Exception):
     """Raised when an update would violate the state transition rules."""
+
+
+@dataclass
+class LedgerDelta:
+    """Classified changes produced by a batch update."""
+    new_evidence: List[str] = field(default_factory=list)
+    duplicate_evidence: List[str] = field(default_factory=list)
+    retracted_evidence: List[str] = field(default_factory=list)
+    hypotheses_changed: List[str] = field(default_factory=list)
+    conclusions_changed: List[str] = field(default_factory=list)
+    goal_changed: bool = False
+
+    @property
+    def substantive(self) -> bool:
+        """True if the update introduced meaningful progress, refutation, or goal shift."""
+        return bool(
+            self.new_evidence
+            or self.retracted_evidence
+            or self.hypotheses_changed
+            or self.conclusions_changed
+            or self.goal_changed
+        )
+
+
+class ApplyStatusResult(tuple):
+    """Result of apply_updates_with_status.
+
+    Unpacks as (report, had_refusal) for 100% backward compatibility,
+    while exposing .delta as an attribute.
+    """
+    report: str
+    had_refusal: bool
+    delta: LedgerDelta
+
+    def __new__(cls, report: str, had_refusal: bool, delta: Optional[LedgerDelta] = None):
+        return super().__new__(cls, (report, had_refusal))
+
+    def __init__(self, report: str, had_refusal: bool, delta: Optional[LedgerDelta] = None):
+        self.report = report
+        self.had_refusal = had_refusal
+        self.delta = delta if delta is not None else LedgerDelta()
+
+
+def _normalize_text(text: str) -> str:
+    s = str(text or "").lower()
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _normalize_id(eid: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "", str(eid or "")).lower()
+
+
+def _is_duplicate_evidence(
+    new_id: str, new_summary: str, existing_id: str, existing_summary: str
+) -> bool:
+    norm_new_s = _normalize_text(new_summary)
+    norm_ext_s = _normalize_text(existing_summary)
+    if not norm_new_s and not norm_ext_s:
+        return False
+    if norm_new_s and norm_ext_s:
+        if norm_new_s == norm_ext_s:
+            return True
+        matcher = difflib.SequenceMatcher(None, norm_new_s, norm_ext_s)
+        if matcher.ratio() >= 0.85:
+            return True
+    norm_new_id = _normalize_id(new_id)
+    norm_ext_id = _normalize_id(existing_id)
+    if norm_new_id and norm_ext_id:
+        if norm_new_id == norm_ext_id:
+            return True
+        if (norm_new_id in norm_ext_id or norm_ext_id in norm_new_id):
+            if norm_new_s and norm_ext_s:
+                matcher = difflib.SequenceMatcher(None, norm_new_s, norm_ext_s)
+                if matcher.ratio() >= 0.70:
+                    return True
+    return False
 
 
 def _required_list(payload, key):
@@ -127,6 +206,7 @@ class ResearchLedger:
         self._evidence: Dict[str, Evidence] = {}
         self._hypotheses: Dict[str, Hypothesis] = {}
         self._conclusions: Dict[str, Conclusion] = {}
+        self.last_delta: Optional[LedgerDelta] = None
 
     # --- mutation ---
 
@@ -500,22 +580,49 @@ class ResearchLedger:
     def apply_updates_with_status(
         self, payload, include_render: bool = True
     ) -> Tuple[str, bool]:
-        """Apply updates and return the report plus producer-owned refusal status."""
+        """Apply updates and return the report plus producer-owned refusal status and delta."""
+        delta = LedgerDelta()
         if not isinstance(payload, dict):
-            return "상태 갱신을 거부했습니다: 객체 형식이 아닙니다.", True
+            return ApplyStatusResult("상태 갱신을 거부했습니다: 객체 형식이 아닙니다.", True, delta)
 
         applied: List[str] = []
         refused: List[str] = []
 
         goal = payload.get("goal")
         if goal:
+            old_goal = self.goal
             self.set_goal(goal)
-            applied.append("목표 갱신: " + self.goal)
+            if self.goal != old_goal:
+                delta.goal_changed = True
+                applied.append("목표 갱신: " + self.goal)
 
         for item in payload.get("evidence") or []:
             if not isinstance(item, dict):
                 refused.append("증거 항목 형식 오류: {0!r}".format(item))
                 continue
+            eid = str(item.get("id") or "").strip()
+            summary = item.get("summary", "")
+            is_retract = bool(item.get("retracted"))
+            existing = self._evidence.get(eid)
+            is_existing_identical = (
+                existing is not None
+                and existing.summary == summary
+                and existing.source == item.get("source", "")
+                and bool(existing.retracted) == is_retract
+                and existing.note == item.get("note", "")
+            )
+
+            is_dup = False
+            if not is_retract and not (existing and existing.retracted):
+                for ext_id, ext_record in self._evidence.items():
+                    if ext_record.retracted or ext_id == eid:
+                        continue
+                    if _is_duplicate_evidence(
+                        eid, summary, ext_id, ext_record.summary
+                    ):
+                        is_dup = True
+                        break
+
             try:
                 evidence = self.add_evidence(
                     item.get("id"),
@@ -527,14 +634,28 @@ class ResearchLedger:
             except LedgerRefusal as refusal:
                 refused.append(str(refusal))
             else:
-                applied.append(
-                    "{0}(철회)".format(evidence.id) if evidence.retracted else evidence.id
-                )
+                if evidence.retracted:
+                    delta.retracted_evidence.append(evidence.id)
+                    applied.append(
+                        "{0}(철회)".format(evidence.id)
+                    )
+                elif is_dup:
+                    delta.duplicate_evidence.append(evidence.id)
+                    applied.append("{0}(중복)".format(evidence.id))
+                elif is_existing_identical:
+                    applied.append(evidence.id)
+                else:
+                    delta.new_evidence.append(evidence.id)
+                    applied.append(evidence.id)
 
         for item in payload.get("hypotheses") or []:
             if not isinstance(item, dict):
                 refused.append("가설 항목 형식 오류: {0!r}".format(item))
                 continue
+            hid = str(item.get("id") or "").strip()
+            old_hypo = self._hypotheses.get(hid)
+            old_status = old_hypo.status if old_hypo else None
+            old_statement = old_hypo.statement if old_hypo else None
             status = str(item.get("status") or ACTIVE).strip().lower()
             try:
                 if status == REOPEN:
@@ -558,12 +679,22 @@ class ResearchLedger:
             except LedgerRefusal as refusal:
                 refused.append(str(refusal))
             else:
+                if (
+                    not old_hypo
+                    or old_status != hypothesis.status
+                    or old_statement != hypothesis.statement
+                ):
+                    delta.hypotheses_changed.append(hypothesis.id)
                 applied.append(hypothesis.marker)
 
         for item in payload.get("conclusions") or []:
             if not isinstance(item, dict):
                 refused.append("결론 항목 형식 오류: {0!r}".format(item))
                 continue
+            cid = str(item.get("id") or "").strip()
+            old_conc = self._conclusions.get(cid)
+            old_statement = old_conc.statement if old_conc else None
+            old_premises = old_conc.premises if old_conc else None
             try:
                 conclusion = self.add_conclusion(
                     item.get("id"), item.get("statement", ""), item.get("premises") or ()
@@ -571,6 +702,12 @@ class ResearchLedger:
             except LedgerRefusal as refusal:
                 refused.append(str(refusal))
             else:
+                if (
+                    not old_conc
+                    or old_statement != conclusion.statement
+                    or old_premises != conclusion.premises
+                ):
+                    delta.conclusions_changed.append(conclusion.id)
                 applied.append(self.conclusion_marker(conclusion.id))
 
         report = []
@@ -578,8 +715,14 @@ class ResearchLedger:
             report.append("반영: " + ", ".join(applied))
         if refused:
             report.append("거부:\n- " + "\n- ".join(refused))
+        if delta.duplicate_evidence and not delta.substantive:
+            report.append(
+                "[중복 증거 감지]: 새로 관측된 실질적 사실이 없어 게이트가 유지됩니다. "
+                "새로운 명령 결과나 외부 사실을 기록하세요."
+            )
         if not report:
             report.append("반영할 상태 갱신이 없습니다.")
         if include_render:
             report.append(self.render() or "(상태 비어 있음)")
-        return "\n\n".join(report), bool(refused)
+        self.last_delta = delta
+        return ApplyStatusResult("\n\n".join(report), bool(refused), delta)

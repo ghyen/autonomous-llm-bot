@@ -149,7 +149,7 @@ def read_bytes(root, path, max_bytes=None):
         return type(error).__name__, None
 
 
-def read_file(root, path, max_bytes=None):
+def read_file(root, path, max_bytes=None, offset=None, limit=None):
     """Return the parent-compatible read envelope without a cache."""
     display_path = os.fspath(path)
     try:
@@ -169,6 +169,41 @@ def read_file(root, path, max_bytes=None):
     file_revision = revision(data)
     content = data.decode("utf-8", errors="replace")
     truncated = False
+
+    is_slice = offset is not None or limit is not None
+    if is_slice:
+        lines = content.splitlines(keepends=True)
+        total_lines = len(lines)
+        start_idx = 0
+        if offset is not None:
+            try:
+                off_int = int(offset)
+                start_idx = max(0, off_int - 1) if off_int > 0 else 0
+            except (ValueError, TypeError):
+                start_idx = 0
+
+        end_idx = total_lines
+        if limit is not None:
+            try:
+                lim_int = int(limit)
+                if lim_int >= 0:
+                    end_idx = min(total_lines, start_idx + lim_int)
+            except (ValueError, TypeError):
+                pass
+
+        selected_lines = lines[start_idx:end_idx]
+        content = "".join(selected_lines)
+        return {
+            "status": "success",
+            "path": display_path,
+            "revision": file_revision,
+            "content": content,
+            "truncated": False,
+            "offset": max(1, int(offset)) if offset is not None else 1,
+            "limit": int(limit) if limit is not None else len(selected_lines),
+            "total_lines": total_lines,
+        }
+
     if not is_canonical(root, target) and len(content) > DEFAULT_TOOL_OUTPUT_MAX_CHARS:
         content = content[:DEFAULT_TOOL_OUTPUT_MAX_CHARS]
         truncated = True
