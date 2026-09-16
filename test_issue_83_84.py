@@ -179,6 +179,120 @@ class Issue83LedgerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[명시적 변경 없음(no_change)]", no_change_res)
 
 
+class Issue83GateLoopholeTest(unittest.IsolatedAsyncioTestCase):
+    """라이브 런(2e2190c5)에서 실제로 게이트가 열렸던 두 가지 우회 경로의 회귀 테스트."""
+
+    def setUp(self):
+        self.ledger = ledger.ResearchLedger()
+
+    def test_short_summary_variant_id_is_duplicate(self):
+        # step 1546: 긴 컨텍스트 플러시 서술을 E_CONTEXT_FLUSH로 등록
+        self.ledger.apply_updates_with_status({
+            "evidence": [{
+                "id": "E_CONTEXT_FLUSH",
+                "summary": (
+                    "컨텍스트 긴급 플러시 후 재개. Phase 1 완료, Phase 2 진행 중. "
+                    "기존 증거 86건은 findings.md에 영구 보존됨."
+                ),
+                "source": "context flush event",
+            }]
+        })
+        # step 1579: 같은 사실을 짧게 다시 쓰고 id만 바꿔 재등록
+        res = self.ledger.apply_updates_with_status({
+            "evidence": [{
+                "id": "E_CONTEXT_RESTART",
+                "summary": (
+                    "컨텍스트 플러시 후 재개. Phase 1 완료, Phase 2 초기 진행 중. "
+                    "shit.brownfeed.com 오라클(200/404/400) 확인됨, "
+                    "uuid↔닉네임 매핑 구조 확인됨, /up 200 확인됨"
+                ),
+                "source": "context flush + findings.md",
+            }]
+        })
+        self.assertEqual(res.delta.duplicate_evidence, ["E_CONTEXT_RESTART"])
+        self.assertEqual(res.delta.new_evidence, [])
+        # goal까지 함께 바뀌지 않으면 실질 갱신이 아니다.
+        self.assertFalse(res.delta.substantive)
+
+    def test_goal_rewording_is_not_substantive(self):
+        first = "Phase 2 재개: (1) 서브도메인 브루팅 (2) 포트 스캔 (3) shit.brownfeed.com uuid 열거"
+        reordered = "Phase 2 재개: (1) 포트 스캔 (2) 서브도메인 브루팅 (3) shit.brownfeed.com uuid 열거"
+        self.ledger.apply_updates_with_status({"goal": first})
+
+        res_reorder = self.ledger.apply_updates_with_status({"goal": reordered})
+        self.assertFalse(res_reorder.delta.goal_changed)
+        self.assertFalse(res_reorder.delta.substantive)
+
+        # 실제로 범위가 달라지면 실질 갱신으로 본다.
+        res_other = self.ledger.apply_updates_with_status({
+            "goal": "비인증 /api/v1 열거로 user id↔닉네임↔avatar uuid 매핑 수집"
+        })
+        self.assertTrue(res_other.delta.goal_changed)
+        self.assertTrue(res_other.delta.substantive)
+
+    def test_hypothesis_and_conclusion_rewording_is_not_substantive(self):
+        self.ledger.apply_updates_with_status({
+            "evidence": [{"id": "E1", "summary": "최초 관측 사실"}],
+            "hypotheses": [{
+                "id": "H1",
+                "statement": "카카오 ID는 users 테이블에 저장되어 있을 수 있다",
+                "status": "active",
+            }],
+        })
+        self.ledger.apply_updates_with_status({
+            "conclusions": [{
+                "id": "C1",
+                "statement": "카카오 계정 닉네임과 BrownFeed 닉네임이 일치한다",
+                "premises": ["H1"],
+            }]
+        })
+
+        # 문장만 다듬은 재등록은 실질 갱신이 아니다.
+        res_hypo = self.ledger.apply_updates_with_status({
+            "hypotheses": [{
+                "id": "H1",
+                "statement": "카카오 ID는 users 테이블에 저장되어 있을 수 있는 것 같다",
+            }]
+        })
+        self.assertEqual(res_hypo.delta.hypotheses_changed, [])
+        self.assertFalse(res_hypo.delta.substantive)
+
+        res_conc = self.ledger.apply_updates_with_status({
+            "conclusions": [{
+                "id": "C1",
+                "statement": "카카오 계정 닉네임과 BrownFeed 닉네임이 일치하는 것 같다",
+                "premises": ["H1"],
+            }]
+        })
+        self.assertEqual(res_conc.delta.conclusions_changed, [])
+        self.assertFalse(res_conc.delta.substantive)
+
+        # 상태 전이는 그대로 실질 갱신이다.
+        self.ledger.add_evidence("E2", summary="카카오 로그인 미사용 확인")
+        res_transition = self.ledger.apply_updates_with_status({
+            "hypotheses": [{"id": "H1", "status": "rejected", "evidence_id": "E2"}]
+        })
+        self.assertEqual(res_transition.delta.hypotheses_changed, ["H1"])
+        self.assertTrue(res_transition.delta.substantive)
+
+    async def test_record_state_reports_duplicate_for_variant_id(self):
+        await bot.tool_record_state(self.ledger, {
+            "evidence": [{
+                "id": "E_CONTEXT_FLUSH",
+                "summary": "컨텍스트 플러시 후 재개. Phase 1 완료",
+                "source": "context flush event",
+            }]
+        })
+        response = await bot.tool_record_state(self.ledger, {
+            "evidence": [{
+                "id": "E_CTX_RESTART",
+                "summary": "컨텍스트 플러시 후 재개. Phase 1 완료",
+                "source": "context flush event",
+            }]
+        })
+        self.assertTrue(response.startswith("[record_state status: duplicate]"))
+
+
 class Issue84WorkspaceTest(unittest.TestCase):
     """Issue #84 line-based slicing and cache separation unit tests."""
 
