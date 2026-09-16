@@ -130,6 +130,8 @@ class RunWorkspace:
         """Merge a worker read into the parent cache without touching the file."""
         if result.get("status") != "success":
             return result
+        if result.get("offset") is not None or result.get("limit") is not None:
+            return result
         target = self.resolve(result["path"])
         file_revision = result["revision"]
         if self._read_hashes.get(str(target)) == file_revision:

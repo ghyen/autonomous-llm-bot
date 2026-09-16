@@ -495,7 +495,11 @@ def handle_request(request):
             max_bytes = limits.get("file_bytes", DEFAULT_FILE_BYTES)
             if not isinstance(max_bytes, (int, float)) or isinstance(max_bytes, bool) or max_bytes <= 0:
                 return _resource_limit("invalid_file_bytes")
-            return workspace_io.read_file(workspace, path, max_bytes=max_bytes)
+            offset = request.get("offset")
+            limit = request.get("limit")
+            return workspace_io.read_file(
+                workspace, path, max_bytes=max_bytes, offset=offset, limit=limit
+            )
 
         if operation == "write_file":
             path = request.get("path")

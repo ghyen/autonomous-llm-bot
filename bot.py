@@ -243,6 +243,14 @@ TOOLS_SCHEMA = [
                     "force": {
                         "type": "boolean",
                         "description": "최근 8스텝 안에 읽은 동일 경로를 의도적으로 다시 확인할 때만 true"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "읽기 시작할 줄 번호 (1-based line number, 선택 사항)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "읽을 최대 줄 수 (선택 사항)"
                     }
                 },
                 "required": ["path"]
@@ -392,6 +400,12 @@ TOOLS_SCHEMA = [
                             },
                             "required": ["id", "statement"]
                         }
+                    },
+                    "no_change": {
+                        "type": "boolean",
+                        "description": (
+                            "바뀐 사실이나 새로운 외부 증거가 전혀 없을 때 명시적으로 게이트를 1회 임시 연장하려면 true"
+                        )
                     }
                 }
             }
@@ -664,14 +678,27 @@ def _tool_fingerprint(tool_name: str, arguments: dict) -> str:
     Dispatch consumes one action field per guarded tool. Policy metadata and
     unknown fields must not create a new identity for the same side effect.
     """
-    effective_key = {
-        "bash_exec": "command",
-        "read_file": "path",
-        "web_search": "query",
-    }[tool_name]
-    normalized = {
-        effective_key: dict(arguments or {}).get(effective_key, "")
-    }
+    args = dict(arguments or {})
+    if tool_name == "read_file":
+        normalized = {"path": args.get("path", "")}
+        if args.get("offset") is not None:
+            try:
+                normalized["offset"] = int(args["offset"])
+            except (ValueError, TypeError):
+                normalized["offset"] = args["offset"]
+        if args.get("limit") is not None:
+            try:
+                normalized["limit"] = int(args["limit"])
+            except (ValueError, TypeError):
+                normalized["limit"] = args["limit"]
+    else:
+        effective_key = {
+            "bash_exec": "command",
+            "web_search": "query",
+        }[tool_name]
+        normalized = {
+            effective_key: args.get(effective_key, "")
+        }
     canonical = json.dumps(
         normalized,
         sort_keys=True,
@@ -688,6 +715,8 @@ def _blocked_tool_result(
     limit: int,
     count: int,
     first_step=None,
+    target_path: Optional[str] = None,
+    workspace=None,
 ) -> str:
     payload = {
         "blocked": True,
@@ -701,12 +730,37 @@ def _blocked_tool_result(
     }
     if reason == "loop_guard_repeat" and first_step is not None:
         payload["first_step"] = int(first_step)
-        payload["directive"] = (
+        directive = (
             f"[Loop Guard 차단]: 이 호출은 Step {int(first_step)}에서 이미 "
             "성공하여 결과가 확보되어 있습니다. 동일한 조회를 반복하지 말고 "
             "확보된 데이터를 가공하거나 새로운 가설을 시도하세요. 의도적인 "
             "재시도라면 force=true를 사용하세요."
         )
+        if tool_name == "read_file" and target_path:
+            norm_name = Path(target_path).name.lower()
+            if norm_name in ("findings.md", "plan.md"):
+                clip_limit = (
+                    ESTABLISHED_FINDINGS_MAX_CHARS
+                    if "findings" in norm_name
+                    else ESTABLISHED_PLAN_MAX_CHARS
+                )
+                rev = None
+                if workspace is not None:
+                    try:
+                        resolved = workspace.resolve(target_path)
+                        rev = getattr(workspace, "_read_hashes", {}).get(str(resolved))
+                    except Exception:
+                        pass
+                rev_str = f" (현재 revision: {rev})" if rev else ""
+                directive += (
+                    f"\n[안내]: {target_path}의 핵심 내용은 이미 매 요청마다 "
+                    f"[📌 기확정 사전 지식] 블록(최대 {clip_limit}자 클립)으로 제공되고 있습니다.{rev_str}\n"
+                    "전체 또는 특정 구간이 필요한 경우 통째 재읽기 대신 아래 경로를 사용하세요:\n"
+                    f"- 특정 줄 구간 읽기: read_file(path='{target_path}', offset=..., limit=...)\n"
+                    f"- 특정 키워드/섹션 검색: bash_exec로 grep -n '패턴' {target_path} 또는 sed -n '시작,끝p' {target_path}\n"
+                    "- 플러시 전 원본 컨텍스트 복원: lookup_trajectory(step=...)"
+                )
+        payload["directive"] = directive
     if reason == "known_failure" and first_step is not None:
         payload["first_step"] = int(first_step)
         payload["directive"] = (
@@ -727,9 +781,10 @@ def _blocked_tool_result(
         payload["directive"] = (
             "[상태 기록 필요]: ledger 마지막 실질 갱신부터 "
             f"{int(count)}스텝이 지났습니다. 다른 도구 전에 record_state로 "
-            "목표·증거·가설·결론을 먼저 기록하세요. 바뀐 게 정말 없으면 빈 "
-            "갱신이 아니라 새로 확인된 사실을 findings.md에 쓰고 그 증거로 "
-            "기록하세요."
+            "목표·증거·가설·결론을 먼저 기록하세요. 컨텍스트 플러시/재개/압축 같은 "
+            "자기 상태 서술은 증거가 아닙니다. 바뀐 게 정말 없으면 빈 갱신이나 "
+            "자기 서술이 아니라 새로 확인된 외부 사실(명령 결과, HTTP 응답 등)을 findings.md에 쓰고 "
+            "그 증거로 기록하거나 no_change=true를 사용하세요."
         )
     if reason == "think_required":
         payload["directive"] = (
@@ -1338,19 +1393,45 @@ def _workspace_result(payload) -> str:
     )
 
 
-async def tool_read_file(workspace, path: str) -> str:
+async def tool_read_file(
+    workspace, path: str, offset: Optional[int] = None, limit: Optional[int] = None
+) -> str:
     try:
+        request = {
+            "operation": "read_file",
+            "workspace": str(workspace.root),
+            "path": path,
+            "limits": TOOL_LIMITS,
+        }
+        if offset is not None:
+            request["offset"] = offset
+        if limit is not None:
+            request["limit"] = limit
         result = await tool_sandbox.run_worker(
             workspace,
-            {
-                "operation": "read_file",
-                "workspace": str(workspace.root),
-                "path": path,
-                "limits": TOOL_LIMITS,
-            },
+            request,
             CONFIG.tool_stage_timeout,
         )
-        return _workspace_result(workspace.remember_worker_read(result))
+        envelope = workspace.remember_worker_read(result)
+        if isinstance(envelope, dict) and envelope.get("status") == "unchanged":
+            target_name = Path(str(envelope.get("path", ""))).name.lower()
+            if target_name in ("findings.md", "plan.md"):
+                clip_limit = (
+                    ESTABLISHED_FINDINGS_MAX_CHARS
+                    if "findings" in target_name
+                    else ESTABLISHED_PLAN_MAX_CHARS
+                )
+                rev = envelope.get("revision") or "unknown"
+                envelope["directive"] = (
+                    f"[내용 변경 없음 (unchanged)]: {envelope.get('path')}의 내용은 이전 조회 시점과 완전히 동일합니다 "
+                    f"(현재 revision: {rev}).\n"
+                    f"이 파일의 핵심 내용은 이미 매 요청마다 [📌 기확정 사전 지식] 블록(최대 {clip_limit}자)에 주입되어 제공되고 있습니다.\n"
+                    f"전체 또는 특정 구간이 필요한 경우 통째 재읽기 대신 아래 대안을 사용하세요:\n"
+                    f"- 특정 줄 구간 읽기: read_file(path='{envelope.get('path')}', offset=..., limit=...)\n"
+                    f"- 특정 키워드/섹션 검색: bash_exec로 grep -n '패턴' {envelope.get('path')} 또는 sed -n '시작,끝p' {envelope.get('path')}\n"
+                    f"- 플러시 전 원본 대화/결과 복원: lookup_trajectory(step=...)"
+                )
+        return _workspace_result(envelope)
     except Exception as e:
         return _workspace_result({
             "status": "error",
@@ -1586,9 +1667,18 @@ async def tool_record_state(ledger, updates) -> str:
             updates = json.loads(updates)
         except Exception:
             return "[Error: record_state 인자를 JSON 객체로 해석할 수 없습니다]"
+    if not isinstance(updates, dict):
+        return "[Error: record_state 인자는 JSON 객체여야 합니다]"
     try:
-        report, had_refusal = ledger.apply_updates_with_status(updates, include_render=False)
+        apply_res = ledger.apply_updates_with_status(updates, include_render=False)
+        report, had_refusal = apply_res
+        delta = getattr(apply_res, "delta", None)
+        no_change = bool(updates.get("no_change"))
         status = "refused" if had_refusal else "success"
+        if delta and delta.duplicate_evidence and not delta.substantive and not no_change:
+            status = "duplicate"
+        if no_change:
+            report += "\n[명시적 변경 없음(no_change)]: 게이트를 1회 연장합니다."
         return f"[record_state status: {status}]\n{report}"
     except Exception as e:
         return f"[Error applying state update: {e}]"
@@ -1635,7 +1725,9 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
             return await tool_bash_exec(workspace, cmd, tc["id"])
         elif name == "read_file":
             path = args.get("path", "")
-            return await tool_read_file(workspace, path)
+            offset = args.get("offset")
+            limit = args.get("limit")
+            return await tool_read_file(workspace, path, offset=offset, limit=limit)
         elif name == "write_file":
             path = args.get("path", "")
             content = args.get("content", "")
@@ -5517,6 +5609,7 @@ async def on_message(message: discord.Message):
         else 0
     )
     think_debt = False
+    consecutive_duplicate_records = 0
     workspace.last_record_step = last_record_step
     workspace.current_tool_step = 0
     run_end_logged = False
@@ -6509,12 +6602,15 @@ async def on_message(message: discord.Message):
                     ):
                         batch_signatures.add(signature)
                         batch_fingerprints.add(guarded_fingerprint)
+                        target_path = tc["arguments"].get("path") if tc["name"] == "read_file" and isinstance(tc.get("arguments"), dict) else None
                         merged_results[call_index] = _blocked_tool_result(
                             "loop_guard_repeat",
                             tc["name"],
                             TOOL_LOOP_GUARD_WINDOW,
                             1,
                             first_step=prior_step,
+                            target_path=target_path,
+                            workspace=workspace,
                         )
                         log_session_event(
                             workspace,
@@ -6791,8 +6887,63 @@ async def on_message(message: discord.Message):
                     else:
                         consecutive_artifact_reads += batch_artifact_reads
                     # ledger revision이 실제로 올랐을 때만 실질 갱신으로 친다.
-                    # 요식 호출은 게이트를 열지 못한다.
-                    if (
+                    # 요식 호출이나 중복 증거 등록은 게이트를 열지 못한다.
+                    has_record_state = any(tc["name"] == "record_state" for tc in allowed_calls)
+                    if has_record_state:
+                        for tc in allowed_calls:
+                            if tc["name"] != "record_state":
+                                continue
+                            delta = getattr(ledger, "last_delta", None) if ledger is not None else None
+                            tc_args = tc.get("arguments") or {}
+                            is_no_change = bool(tc_args.get("no_change")) if isinstance(tc_args, dict) else False
+                            if delta is not None:
+                                if delta.substantive:
+                                    last_record_step = current_tool_step
+                                    workspace.last_record_step = last_record_step
+                                    consecutive_duplicate_records = 0
+                                elif is_no_change:
+                                    last_record_step = current_tool_step
+                                    workspace.last_record_step = last_record_step
+                                    consecutive_duplicate_records = 0
+                                    log_session_event(
+                                        workspace,
+                                        "tool_record_state_duplicate_escape",
+                                        step=current_tool_step,
+                                        reason="explicit_no_change",
+                                    )
+                                elif delta.duplicate_evidence:
+                                    consecutive_duplicate_records += 1
+                                    log_session_event(
+                                        workspace,
+                                        "tool_record_state_duplicate",
+                                        step=current_tool_step,
+                                        count=consecutive_duplicate_records,
+                                    )
+                                    if consecutive_duplicate_records >= 3:
+                                        last_record_step = current_tool_step
+                                        workspace.last_record_step = last_record_step
+                                        consecutive_duplicate_records = 0
+                                        log_session_event(
+                                            workspace,
+                                            "tool_record_state_duplicate_escape",
+                                            step=current_tool_step,
+                                            reason="consecutive_duplicate_limit",
+                                            count=3,
+                                        )
+                            elif is_no_change:
+                                last_record_step = current_tool_step
+                                workspace.last_record_step = last_record_step
+                                consecutive_duplicate_records = 0
+                                log_session_event(
+                                    workspace,
+                                    "tool_record_state_duplicate_escape",
+                                    step=current_tool_step,
+                                    reason="explicit_no_change",
+                                )
+                            elif ledger is not None and ledger.revision != revision_before_dispatch:
+                                last_record_step = current_tool_step
+                                workspace.last_record_step = last_record_step
+                    elif (
                         ledger is not None
                         and ledger.revision != revision_before_dispatch
                     ):
@@ -7085,7 +7236,10 @@ async def on_message(message: discord.Message):
                             phase_note=(
                                 f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 마일스톤 {checkpoint_num} 중간 보고서가 디스코드에 전송되었습니다. "
                                 f"기존 대화 기록은 findings.md 및 plan.md로 안전하게 이관(Flush)되었습니다. "
-                                f"위 [📌 기확정 사전 지식 및 계획] 블록을 확정된 전제로 삼고, "
+                                f"핵심 결론은 매 요청마다 [📌 기확정 사전 지식 및 계획] 블록으로 계속 제공되므로 도구로 다시 전체를 읽을 필요가 없습니다. "
+                                f"원문 전체나 특정 섹션이 필요하면 grep -n/sed -n 또는 read_file(offset=..., limit=...)을 사용하고, "
+                                f"과거 대화 전체 복원이 필요하면 lookup_trajectory를 사용하세요. "
+                                f"위 사전 지식을 확정된 전제로 삼고, "
                                 f"이번 심층 사고(High Reasoning) 턴에서 이전 단계 발견점을 종합하여 다음 페이즈의 핵심 목표 및 구체적인 탐색/공격 전략을 수립하세요. "
                                 f"판단이 바뀐 부분은 record_state로 상태를 갱신하세요. "
                                 f"모든 조사가 완전히 끝나면 finish_task를 호출하세요.]"
