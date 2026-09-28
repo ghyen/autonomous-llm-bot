@@ -415,6 +415,40 @@ class TrajectoryTest(unittest.TestCase):
         self.assertNotIn("Step 5", source)
         self.assertNotIn("Step 6", source)
 
+    def test_procedural_source_keeps_a_bounded_result_preview_on_success(self):
+        # Production mutation caught: compressing a successful call to bare
+        # "completed" hides the negative evidence the compactor needs. A 404
+        # page or an empty grep exits 0, so the procedure record claimed the
+        # step was fine and the agent re-opened endpoints it had already
+        # proved dead.
+        trajectory.append_tool_group(
+            self.workspace,
+            1,
+            [_call(
+                "dead",
+                "bash_exec",
+                {"command": "curl https://example.com/api/v1/profile/55142"},
+            )],
+            ["[stdout]\n404 page not found\n[exit code: 0]"],
+            {"dead"},
+        )
+        trajectory.append_tool_group(
+            self.workspace,
+            2,
+            [_call("noisy", "bash_exec", {"command": "cat big.log"})],
+            ["[stdout]\n" + ("y" * 4000) + "\n[exit code: 0]"],
+            {"noisy"},
+        )
+
+        source, through = trajectory.procedural_source(
+            self.workspace, 2, max_chars=10000
+        )
+
+        self.assertEqual(through, 2)
+        self.assertIn("404 page not found", source)
+        self.assertNotIn("y" * 200, source)
+        self.assertLess(len(source), 600)
+
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is unavailable")
     def test_trajectory_path_cannot_be_a_symlink_outside_the_run(self):
         # Mutation caught: following a pre-planted traj.jsonl symlink lets model-

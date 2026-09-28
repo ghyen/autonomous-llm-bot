@@ -395,7 +395,11 @@ def procedural_source(workspace, end_step, max_chars, start_step=1):
         elif record.get("failed"):
             outcome = "failed:" + _result_preview(record, _SOURCE_RESULT_CHARS)
         else:
-            outcome = "completed"
+            # 성공한 호출도 결과 미리보기를 남긴다. 실패 플래그만 보면 "404를
+            # 반환한 curl"이나 "아무것도 못 찾은 grep"이 그냥 completed로
+            # 압축되어, 다음 구간을 요약하는 쪽이 이미 죽은 경로를 다시 열게
+            # 된다. Tier 2 인덱스는 같은 이유로 결과를 이미 보여준다.
+            outcome = "completed:" + _result_preview(record, _SOURCE_RESULT_CHARS)
         grouped.setdefault(step, []).append(
             f"[Step {step}] {record.get('tool') or 'unknown'} "
             f"args={_arguments_preview(record, _SOURCE_ARGUMENT_CHARS)} -> "

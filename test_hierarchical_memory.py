@@ -811,6 +811,93 @@ class RolloverTieredIntegrationTest(unittest.IsolatedAsyncioTestCase):
             bot._msg_content(rolled[0]).rstrip().endswith(ledger.render().rstrip())
         )
 
+    async def test_tier3_retention_drops_the_oldest_lines_not_the_newest(self):
+        # Production mutation caught: prefix-clipping a full Tier 3 pins its
+        # budget on the run's opening steps. The agent then re-reads procedure
+        # it already exhausted while every recent increment is clipped away,
+        # which is how a long run keeps re-testing dead endpoints.
+        marker = "NEW-INCREMENT-11-20"
+        old_lines = [f"- OLD-{index:03d} " + ("x" * 40) for index in range(60)]
+        self.assertGreater(len("\n".join(old_lines)), bot._TIER3_MAX_CHARS)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(root=temp_dir)
+            ledger, payload = self._make_payload(workspace)
+            self._seed_trajectory(workspace, through=50)
+            existing = bot.format_tiered_summary(
+                tier3="\n".join(old_lines),
+                tier3_through=10,
+                tier2_lines=[],
+                discoveries=[],
+            )
+            completion = AsyncMock(return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=f"- {marker}: 새 구간의 시도와 차단 원인."
+                ))]
+            ))
+            with patch.object(bot, "run_completion_stage", completion):
+                _rolled, summary = await bot.rollover_agent_context(
+                    workspace,
+                    payload,
+                    existing_summary=existing,
+                    step_num=50,
+                    ledger=ledger,
+                )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertIn(marker, parsed["tier3"])
+        self.assertIn("- OLD-059", parsed["tier3"])
+        self.assertNotIn("- OLD-000", parsed["tier3"])
+        self.assertLessEqual(len(parsed["tier3"]), bot._TIER3_MAX_CHARS)
+
+    async def test_rollover_records_a_stall_when_one_step_exceeds_the_source_budget(self):
+        # procedural_source deliberately stops instead of clipping a partially
+        # rendered group, so one oversized step parks the watermark forever.
+        # That is an accepted contract, but it must not be silent.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = SimpleNamespace(root=temp_dir)
+            ledger, payload = self._make_payload(workspace)
+            calls = [
+                {
+                    "id": f"wide-{index}",
+                    "name": "bash_exec",
+                    "arguments": {"command": f"probe-{index}-" + ("x" * 80)},
+                }
+                for index in range(20)
+            ]
+            trajectory.append_tool_group(
+                workspace,
+                1,
+                calls,
+                [f"result-{index}" for index in range(20)],
+                {call["id"] for call in calls},
+            )
+            events = []
+
+            def record(_workspace, kind, **kwargs):
+                events.append((kind, kwargs))
+
+            with patch.object(bot, "ROLLING_SUMMARY_MAX_CHARS", 400), \
+                    patch.object(bot, "log_session_event", record), \
+                    patch.object(
+                        bot,
+                        "run_completion_stage",
+                        AsyncMock(side_effect=StageTimeout("rollover", 0.1)),
+                    ):
+                _rolled, summary = await bot.rollover_agent_context(
+                    workspace,
+                    payload,
+                    existing_summary="",
+                    step_num=40,
+                    ledger=ledger,
+                )
+
+        stalls = [item for item in events if item[0] == "rollover_source_stalled"]
+        self.assertEqual(len(stalls), 1, events)
+        self.assertEqual(stalls[0][1]["start_step"], 1)
+        self.assertGreaterEqual(stalls[0][1]["end_step"], 1)
+        # The stall must not advance the watermark past the unrendered group.
+        self.assertEqual(bot.parse_tiered_summary(summary)["tier3_through"], 0)
+
     async def test_successful_compactor_receives_no_ledger_facts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = SimpleNamespace(root=temp_dir)

@@ -98,6 +98,118 @@ class ContextFlushTest(unittest.TestCase):
             self.assertIn("마일스톤 1 완료", summary)
             self.assertIn("findings.md", messages[1]["content"])
 
+    def test_flush_preserves_the_tier3_watermark_and_procedure(self):
+        # Production mutation caught: resetting the tiered watermark to 0 on
+        # every checkpoint flush. Each flush made the next rollover re-derive
+        # Tier 3 from step 1, so a 1,200-step run kept circling the first ~130
+        # steps and re-read its own oldest procedures every 25 steps.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=str(Path(tmp)), run_id="r1")
+            previous = bot.format_tiered_summary(
+                tier3="- Step 900-910: profile 경로 전수 404를 확인함.",
+                tier3_through=910,
+                tier2_lines=[],
+                discoveries=["- 참조/산출물: https://example.com/feed"],
+            )
+
+            _messages, summary = bot.flush_agent_context(
+                workspace=workspace,
+                ledger=ResearchLedger(),
+                checkpoint_num=37,
+                previous_summary=previous,
+            )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(parsed["tier3_through"], 910)
+        self.assertIn("profile 경로 전수 404", parsed["tier3"])
+        self.assertIn("마일스톤 37 완료", parsed["tier3"])
+        self.assertIn(
+            "- 참조/산출물: https://example.com/feed", parsed["discoveries"]
+        )
+
+    def test_repeated_flush_keeps_only_the_latest_milestone_marker(self):        # The milestone note marks the phase boundary, so it replaces the
+        # previous marker instead of accumulating one per checkpoint.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=str(Path(tmp)), run_id="r1")
+            summary = ""
+            for checkpoint in (1, 2, 3):
+                _messages, summary = bot.flush_agent_context(
+                    workspace=workspace,
+                    ledger=ResearchLedger(),
+                    checkpoint_num=checkpoint,
+                    previous_summary=summary,
+                )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertIn("마일스톤 3 완료", parsed["tier3"])
+        self.assertNotIn("마일스톤 1 완료", parsed["tier3"])
+        self.assertNotIn("마일스톤 2 완료", parsed["tier3"])
+        self.assertLessEqual(len(parsed["tier3"]), bot._TIER3_MAX_CHARS)
+
+    def test_flush_keeps_a_single_line_procedure_that_fills_the_budget(self):
+        # Production mutation caught: appending the milestone before clipping.
+        # A one-line Tier 3 exactly at the cap then loses the whole procedure to
+        # the tail clip while the watermark still claims that range is covered,
+        # so the dropped steps are never re-derived. The same ordering left the
+        # marker mid-line, which made the next flush append a second one.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=str(Path(tmp)), run_id="r1")
+            previous = bot.format_tiered_summary(
+                tier3="P" * bot._TIER3_MAX_CHARS,
+                tier3_through=1000,
+                tier2_lines=[],
+                discoveries=[],
+            )
+            _messages, summary = bot.flush_agent_context(
+                workspace=workspace,
+                ledger=ResearchLedger(),
+                checkpoint_num=37,
+                previous_summary=previous,
+            )
+            _messages, summary = bot.flush_agent_context(
+                workspace=workspace,
+                ledger=ResearchLedger(),
+                checkpoint_num=38,
+                previous_summary=summary,
+            )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(parsed["tier3_through"], 1000)
+        self.assertGreater(parsed["tier3"].count("P"), 1900)
+        self.assertEqual(parsed["tier3"].count("마일스톤"), 1)
+        self.assertIn("마일스톤 38 완료", parsed["tier3"])
+        self.assertLessEqual(len(parsed["tier3"]), bot._TIER3_MAX_CHARS)
+
+    def test_flush_tier3_budget_bounds_the_emergency_retention(self):
+        # The OOM retry path rebuilds a payload without the prepare() token
+        # preflight, so retaining a full Tier 3 there can reproduce the very
+        # prefill overflow that triggered the flush. The watermark and the
+        # newest lines still have to survive the smaller budget.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = SimpleNamespace(root=str(Path(tmp)), run_id="r1")
+            previous = bot.format_tiered_summary(
+                tier3="\n".join(
+                    f"- Step {step}: 절차 {step} " + ("x" * 40)
+                    for step in range(800, 900)
+                ),
+                tier3_through=900,
+                tier2_lines=[],
+                discoveries=[],
+            )
+            _messages, summary = bot.flush_agent_context(
+                workspace=workspace,
+                ledger=ResearchLedger(),
+                checkpoint_num=9,
+                previous_summary=previous,
+                tier3_chars=bot.OOM_RETRY_TIER3_CHARS,
+            )
+
+        parsed = bot.parse_tiered_summary(summary)
+        self.assertEqual(parsed["tier3_through"], 900)
+        self.assertLessEqual(len(parsed["tier3"]), bot.OOM_RETRY_TIER3_CHARS)
+        self.assertIn("Step 899", parsed["tier3"])
+        self.assertNotIn("Step 800", parsed["tier3"])
+
 
 if __name__ == "__main__":
     unittest.main()
