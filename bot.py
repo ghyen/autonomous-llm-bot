@@ -32,6 +32,7 @@ from openai import AsyncOpenAI
 from types import SimpleNamespace
 
 import authz
+import observation
 import outcome as outcome_mod
 import run_state
 import session_log
@@ -628,6 +629,11 @@ TOOL_LOOP_GUARD_WINDOW = 8
 # 권위 있는 상태 갱신이라 막으면 상태 기록이 멈추고, write_file은 CAS가 이미
 # 두 번째 동일 쓰기를 conflict로 돌려세운다.
 TOOL_LOOP_GUARD_TOOLS = ("bash_exec", "read_file", "web_search")
+# 같은 대상을 이미 확인한 횟수. 이 횟수를 넘기면 관측 반복 가드가 재실행을
+# 막는다. exact-command loop guard와 달리 명령 문자열이 달라도 대상이 같으면
+# 걸린다. 결과 종류는 따지지 않는다: 옛 답이 유효한지 판단하려면 다시
+# 가져와야 해서 그 자체가 낭비다. 진짜 새 확인은 force=true로 명시한다.
+OBSERVATION_REPEAT_LIMIT = 3
 # 루프 가드는 윈도우(최근 N스텝)만 기억해서 윈도우가 밀리면 같은 결정적 실패를
 # 무한히 재시도한다(read_file not_found 75회 실측). 확정 실패는 만료 없이
 # 기억하고, 시스템 프롬프트에도 누적해서 모델이 계획 단계에서 우회하게 한다.
@@ -782,6 +788,14 @@ def _blocked_tool_result(
                     "- 플러시 전 원본 컨텍스트 복원: lookup_trajectory(step=...)"
                 )
         payload["directive"] = directive
+    if reason == "observation_repeat" and first_step is not None:
+        payload["first_step"] = int(first_step)
+        payload["directive"] = (
+            f"[관측 반복 차단]: 이 대상은 Step {int(first_step)}부터 이미 "
+            f"{int(count)}회 관측되었습니다. 같은 관측을 반복해도 새 정보가 "
+            "나오지 않습니다. 대상을 바꾸거나 다른 접근을 시도하세요. "
+            "실제 상태가 바뀌었거나 의도적인 재확인이라면 force=true를 사용하세요."
+        )
     if reason == "known_failure" and first_step is not None:
         payload["first_step"] = int(first_step)
         payload["directive"] = (
@@ -6668,6 +6682,50 @@ async def on_message(message: discord.Message):
                         )
                         step_had_guard_block = True
                         continue
+                    if (
+                        tc["name"] == "bash_exec"
+                        and tc["arguments"].get("force") is not True
+                    ):
+                        # exact-command loop guard는 문자열이 조금만 달라도 통과한다.
+                        # 같은 대상을 같은 데드엔드로 이미 확인했다면 재실행을 막는다.
+                        stale_targets = observation.check_observation_repeat(
+                            workspace,
+                            tc["arguments"],
+                            OBSERVATION_REPEAT_LIMIT,
+                        )
+                        if stale_targets is not None:
+                            batch_signatures.add(signature)
+                            if guarded_fingerprint is not None:
+                                batch_fingerprints.add(guarded_fingerprint)
+                            prior_observations = sum(
+                                len(info["steps"])
+                                for info in stale_targets.values()
+                            )
+                            first_observed = min(
+                                step
+                                for info in stale_targets.values()
+                                for step in info["steps"]
+                            )
+                            merged_results[call_index] = _blocked_tool_result(
+                                "observation_repeat",
+                                tc["name"],
+                                OBSERVATION_REPEAT_LIMIT,
+                                prior_observations,
+                                first_step=first_observed,
+                            )
+                            log_session_event(
+                                workspace,
+                                "tool_observation_repeat_blocked",
+                                step=current_tool_step,
+                                tool=tc["name"],
+                                targets=[
+                                    target[:80] for target in stale_targets
+                                ],
+                                first_step=first_observed,
+                                count=prior_observations,
+                            )
+                            step_had_guard_block = True
+                            continue
                     if tc["arguments"].get("force") is not True:
                         known_block = _known_bad_block(
                             known_bad_calls, tc["name"], tc["arguments"]
