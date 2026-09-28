@@ -32,6 +32,7 @@ from openai import AsyncOpenAI
 from types import SimpleNamespace
 
 import authz
+import grounding
 import observation
 import outcome as outcome_mod
 import stagnation
@@ -129,7 +130,7 @@ SYSTEM_PROMPT_TEMPLATE = """당신은 터미널 환경과 현재 실행 전용 �
 `[권위 있는 조사 상태]` 블록이 이번 조사에서 무엇이 사실인지에 대한 유일한 권위입니다.
 - 판단을 추론(생각)에만 남기지 마세요. 추론은 다음 스텝에 남지 않습니다. 가설을 세우거나 반증하거나 결론을 내릴 때마다 즉시 `record_state`로 짧은 구조화된 갱신을 기록하세요.
 - 증거는 먼저 `evidence`에 id·요약·출처로 등록하고, 가설 전이는 그 증거 id를 인용하세요.
-- 이전에 기록한 증거가 틀렸다고 판명되면 지우거나 다른 id로 복사하지 말고 같은 id에 `retracted=true`와 `note`(철회 사유)를 붙여 철회하세요. 철회된 증거는 이력으로 남고 상태 블록에 철회 표시와 함께 렌더되며, 이후 가설 전이의 근거로 인용할 수 없습니다.
+- 이전에 기록한 증거가 틀렸다고 판명되면 지우거나 다른 id로 복사하지 말고 같은 id에 `retracted=true`와 `note`(철회 사유)를 붙여 철회하세요. 철회된 증거는 이력으로 남고 상태 블록에 철회 표시와 함께 렌더되며, 이후 가설 전이의 근거로 인용할 수 없습니다. 새 증거로 대체하면서 철회하려면 새 항목에 `retracts: <기존id>`를 쓰세요(새 항목은 유효하게 등록되고 대상이 철회됩니다). 새 id에 `retracted=true`를 붙이면 그 항목 자체가 무효가 되니 쓰지 마세요.
 - 반증된 가설(`rejected`)을 다시 유망한 후보로 되살리려면, 이전에 인용하지 않은 새 증거를 등록하고 `status="reopen"`으로 요청해야 합니다. 그냥 다시 `active`로 쓰는 요청은 거부됩니다.
 - 결론은 `premises`에 근거 가설 id를 명시하세요. 전제가 교체되면 그 결론은 자동으로 무효가 되며, 무효 결론을 현재 사실처럼 보고하지 마세요.
 - 요약이나 보고서가 상태 블록과 다르면 상태 블록이 옳습니다.
@@ -355,8 +356,19 @@ TOOLS_SCHEMA = [
                                 "retracted": {
                                     "type": "boolean",
                                     "description": (
-                                        "이 증거가 틀렸다고 판명되면 true로 철회하세요. 항목은 이력으로 남고 "
-                                        "철회 표시와 함께 렌더되며, 이후 전이의 근거로 쓸 수 없습니다."
+                                        "이미 등록된 바로 이 id의 내용이 틀렸다고 판명됐을 "
+                                        "때만 true로 철회하세요. 새 id를 쓰면서 여기에 "
+                                        "true를 붙이면 새 항목이 무효가 됩니다. 다른 id를 "
+                                        "철회하려면 새 항목에 retracts로 대상 id를 가리키세요."
+                                    )
+                                },
+                                "retracts": {
+                                    "type": "string",
+                                    "description": (
+                                        "틀렸다고 판명된 기존 증거 id. 이 항목(정정 내용)은 "
+                                        "유효하게 등록되고, 가리킨 대상이 철회 표시됩니다. "
+                                        "예: {\"id\": \"E_PROF_404B\", \"retracts\": "
+                                        "\"E_PROF_404A\", \"summary\": \"재측정 결과 200\"}"
                                     )
                                 },
                                 "note": {
@@ -1698,7 +1710,7 @@ async def tool_lookup_trajectory(
     )
 
 
-async def tool_record_state(ledger, updates) -> str:
+async def tool_record_state(ledger, updates, workspace=None) -> str:
     if ledger is None:
         return "[Error: 이 실행에는 상태 원장이 연결되어 있지 않습니다]"
     if isinstance(updates, str):
@@ -1718,9 +1730,51 @@ async def tool_record_state(ledger, updates) -> str:
             status = "duplicate"
         if no_change:
             report += "\n[명시적 변경 없음(no_change)]: 게이트를 1회 연장합니다."
+        if workspace is not None and delta is not None:
+            report = _append_grounding_warnings(
+                workspace, updates, delta, report
+            )
         return f"[record_state status: {status}]\n{report}"
     except Exception as e:
         return f"[Error applying state update: {e}]"
+
+
+def _append_grounding_warnings(workspace, updates, delta, report: str) -> str:
+    """새 증거가 직전 측정과 모순되면 경고를 덧붙인다. 막지는 않는다.
+
+    경고는 참고용이다: 오탐 비용은 한 줄이고, 미탐은 status quo다.
+    """
+    try:
+        accepted = set(getattr(delta, "new_evidence", None) or [])
+        if not accepted:
+            return report
+        items = [
+            item for item in (updates.get("evidence") or [])
+            if isinstance(item, dict)
+            and str(item.get("id") or "").strip() in accepted
+            and grounding.may_need_check(item)
+        ]
+        if not items:
+            return report
+        records, complete = trajectory.read_records(workspace)
+        if not complete:
+            return report
+        warnings = grounding.check_evidence_grounding(
+            records,
+            items,
+            current_step=getattr(workspace, "current_tool_step", None),
+        )
+        for warning in warnings:
+            report += "\n" + warning
+            log_session_event(
+                workspace,
+                "record_grounding_warning",
+                step=getattr(workspace, "current_tool_step", None),
+                evidence=[item.get("id") for item in items],
+            )
+        return report
+    except Exception:
+        return report
 
 async def tool_think(workspace, focus: str, effort: str = "low", step_num: int = 0) -> str:
     eff = (effort or "low").lower().strip()
@@ -1789,7 +1843,7 @@ async def execute_tools_in_parallel(workspace, tool_calls: list, step_num: int =
                 workspace, args.get("rule_type", ""), args.get("rule_content", "")
             )
         elif name == "record_state":
-            return await tool_record_state(ledger, args)
+            return await tool_record_state(ledger, args, workspace)
         elif name == "think":
             f = args.get("focus", "")
             eff = args.get("effort", "low")
