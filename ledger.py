@@ -706,7 +706,69 @@ class ResearchLedger:
             eid = str(item.get("id") or "").strip()
             summary = item.get("summary", "")
             is_retract = bool(item.get("retracted"))
+            retracts = str(item.get("retracts") or "").strip()
             existing = self._evidence.get(eid)
+            # 검증은 변경보다 먼저. 한 항목의 선행 side effect가 해당 항목
+            # 검증을 앞지르면, 거부된 호출이 상태를 바꾸고 revision까지
+            # 올린다.
+            if retracts and is_retract:
+                refused.append(
+                    "증거 항목 형식 오류: '{0}'에 retracted=true와 "
+                    "retracts={1}가 함께 있습니다. 새 정정 항목에는 "
+                    "retracted를 쓰지 말고 retracts로 철회 대상만 "
+                    "가리키세요.".format(eid or "?", retracts)
+                )
+                continue
+            if retracts and retracts == eid:
+                refused.append(
+                    "증거 항목 형식 오류: '{0}'이 자기 자신을 retracts로 "
+                    "가리킬 수 없습니다.".format(eid or "?")
+                )
+                continue
+            if retracts and existing is not None and existing.retracted:
+                refused.append(
+                    "증거 항목 형식 오류: 이미 철회된 '{0}'을 정정에 재사용할 "
+                    "수 없습니다. 새 id를 쓰세요.".format(eid or "?")
+                )
+                continue
+            if is_retract and existing is None:
+                refused.append(
+                    "증거 항목 형식 오류: '{0}'은 새 id라 철회할 것이 "
+                    "없습니다. retracted=true는 이미 등록된 id에만 쓰세요. "
+                    "다른 항목을 철회하려면 새 항목에 retracts로 대상 id를 "
+                    "가리키세요.".format(eid or "?")
+                )
+                continue
+            if retracts and not eid:
+                refused.append(
+                    "증거 항목 형식 오류: retracts={0}의 정정 항목에 id가 "
+                    "없습니다.".format(retracts)
+                )
+                continue
+            if retracts:
+                # 새 정정 항목은 살리고, 가리킨 대상을 철회한다. 불리언을 새
+                # 항목에 붙이는 오독(참인 정정을 무효로 만들고 거짓 원본을
+                # 살리는 패턴)을 구조적으로 막는다.
+                target_record = self._evidence.get(retracts)
+                if target_record is None:
+                    applied.append(
+                        "{0}(철회 대상 없음: {1})".format(eid, retracts)
+                    )
+                else:
+                    was_live = not target_record.retracted
+                    reason = str(
+                        item.get("note") or summary or ""
+                    ).strip()
+                    self.add_evidence(
+                        retracts,
+                        summary=target_record.summary,
+                        source=target_record.source,
+                        retracted=True,
+                        note=reason or target_record.note,
+                    )
+                    if was_live:
+                        delta.retracted_evidence.append(retracts)
+                    applied.append("{0}(철회)".format(retracts))
             is_existing_identical = (
                 existing is not None
                 and existing.summary == summary
@@ -738,7 +800,10 @@ class ResearchLedger:
                 refused.append(str(refusal))
             else:
                 if evidence.retracted:
-                    delta.retracted_evidence.append(evidence.id)
+                    # 실제 False->True 전이일 때만 센다. 이미 철회된 항목의
+                    # 재등록이 게이트를 갱신하면 안 된다.
+                    if existing is None or not existing.retracted:
+                        delta.retracted_evidence.append(evidence.id)
                     applied.append(
                         "{0}(철회)".format(evidence.id)
                     )

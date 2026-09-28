@@ -311,10 +311,50 @@ class EvidenceRetractionTest(unittest.TestCase):
 
     def test_report_labels_retraction(self):
         ledger = ResearchLedger()
+        ledger.apply_updates(
+            {"evidence": [{"id": "E_X", "summary": "틀린 주장"}]}
+        )
         report = ledger.apply_updates(
             {"evidence": [{"id": "E_X", "summary": "틀린 주장", "retracted": True}]}
         )
         self.assertIn("E_X(철회)", report)
+
+    def test_retracted_true_on_new_id_is_refused(self):
+        # Production mutation caught: 새 id에 retracted=true를 붙이면 참인
+        # 정정이 무효가 되고 거짓 원본이 살아남는다. 철회할 것이 없으면 거부한다.
+        ledger = ResearchLedger()
+        report = ledger.apply_updates(
+            {"evidence": [{"id": "E_NEW", "summary": "정정", "retracted": True}]}
+        )
+        self.assertIn("형식 오류", report)
+        self.assertNotIn("E_NEW", ledger._evidence)
+
+    def test_self_retract_is_refused(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "주장", "curl")
+        report = ledger.apply_updates(
+            {"evidence": [{"id": "E_X", "retracts": "E_X", "summary": "정정"}]}
+        )
+        self.assertIn("형식 오류", report)
+        self.assertFalse(ledger._evidence["E_X"].retracted)
+
+    def test_reuse_of_dead_id_for_correction_is_refused(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_OLD", "틀린 주장", "curl", retracted=True)
+        report = ledger.apply_updates(
+            {"evidence": [{"id": "E_OLD", "retracts": "E_OLD2", "summary": "정정"}]}
+        )
+        self.assertIn("형식 오류", report)
+
+    def test_reregistering_retracted_does_not_reset_the_gate(self):
+        # 이미 철회된 항목의 재등록은 실질 갱신이 아니다.
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "틀린 주장", "curl", retracted=True)
+        res = ledger.apply_updates_with_status(
+            {"evidence": [{"id": "E_X", "summary": "틀린 주장", "retracted": True}]}
+        )
+        self.assertEqual(res.delta.retracted_evidence, [])
+        self.assertFalse(res.delta.substantive)
 
     def test_round_trip_preserves_retraction(self):
         ledger = ResearchLedger()
@@ -333,3 +373,50 @@ class EvidenceRetractionTest(unittest.TestCase):
         }
         restored = ResearchLedger.from_dict(payload)
         self.assertFalse(restored._evidence["E_X"].retracted)
+
+    def test_retracts_marks_target_and_keeps_correction_live(self):
+        # Production mutation caught: a new entry carrying both the
+        # correction and retracted=true invalidates the correction itself
+        # while the false original stays live. Pointing at the target with
+        # retracts keeps the two roles apart.
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_PHONE_55142", "010-3183-3933 발견", "curl")
+        report = ledger.apply_updates({
+            "evidence": [{
+                "id": "E_PHONE_55142B",
+                "retracts": "E_PHONE_55142",
+                "summary": "재측정 결과 404 페이지에 010 패턴 0건",
+                "source": "curl",
+            }]
+        })
+        self.assertTrue(ledger._evidence["E_PHONE_55142"].retracted)
+        self.assertFalse(ledger._evidence["E_PHONE_55142B"].retracted)
+        self.assertIn("E_PHONE_55142(철회)", report)
+
+    def test_retracts_and_retracted_true_together_is_refused(self):
+        ledger = ResearchLedger()
+        ledger.add_evidence("E_X", "틀린 주장", "curl")
+        report = ledger.apply_updates({
+            "evidence": [{
+                "id": "E_Y",
+                "retracts": "E_X",
+                "retracted": True,
+                "summary": "정정",
+            }]
+        })
+        self.assertIn("형식 오류", report)
+        # 둘 다 건드리지 않는다: 원본도 살고 정정도 등록되지 않는다.
+        self.assertFalse(ledger._evidence["E_X"].retracted)
+        self.assertNotIn("E_Y", ledger._evidence)
+
+    def test_retracts_missing_target_registers_correction_with_note(self):
+        ledger = ResearchLedger()
+        report = ledger.apply_updates({
+            "evidence": [{
+                "id": "E_NEW",
+                "retracts": "E_GHOST",
+                "summary": "정정 내용",
+            }]
+        })
+        self.assertFalse(ledger._evidence["E_NEW"].retracted)
+        self.assertIn("철회 대상 없음: E_GHOST", report)
