@@ -1947,6 +1947,36 @@ def _clip_summary_text(text: str, max_chars: int) -> str:
         return text[:max_chars]
     return text[:max_chars - len(omission)].rstrip() + omission
 
+
+def _tail_clip_summary_text(text: str, max_chars: int) -> str:
+    """Keep the newest whole lines of a rolling procedure within max_chars.
+
+    Tier 3 is consumed by an agent trying not to repeat its recent work, so its
+    retention direction is the opposite of _clip_summary_text: the oldest lines
+    are the ones that must fall off. Keeping the head instead pins the budget on
+    the run's opening steps and hides every recent increment behind it.
+
+    The marker is prefixed without a newline so a retained fragment can never be
+    mistaken for a reserved section line (a coverage line, for example).
+    """
+    text = str(text or "").strip()
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = "…[생략] "
+    budget = max_chars - len(marker)
+    if budget <= 0:
+        return text[-max_chars:]
+    tail = text[-budget:]
+    newline = tail.find("\n")
+    if newline != -1:
+        tail = tail[newline + 1:]
+    if not tail.strip():
+        return text[-max_chars:]
+    return f"{marker}{tail}".strip()
+
+
 def _tool_call_summary(call) -> str:
     if isinstance(call, dict):
         function = call.get("function") or {}
@@ -3095,7 +3125,7 @@ def format_tiered_summary(
             line = "[절차 본문] " + line
         safe_tier3_lines.append(line)
     tier3_text = (
-        _clip_summary_text("\n".join(safe_tier3_lines), _TIER3_MAX_CHARS)
+        _tail_clip_summary_text("\n".join(safe_tier3_lines), _TIER3_MAX_CHARS)
         or _TIER3_EMPTY
     )
     tier2 = [
@@ -3791,6 +3821,14 @@ def sync_milestone_to_disk(workspace, report_text: str, checkpoint_num: int) -> 
             pass
 
 
+_MILESTONE_MARKER = re.compile(r"^-\s*마일스톤 \d+ 완료:")
+
+# OOM 재시도는 prepare의 토큰 프리플라이트를 다시 타지 않는다. 플러시가 만든
+# 요약을 그대로 보내면 같은 prefill 초과로 즉시 다시 죽으므로, 수위(watermark)만
+# 지키고 절차 본문은 작게 잘라 보낸다.
+OOM_RETRY_TIER3_CHARS = 400
+
+
 def flush_agent_context(
     workspace,
     messages: list = None,
@@ -3800,17 +3838,42 @@ def flush_agent_context(
     checkpoint_num: int = 1,
     phase_note: str = "",
     keep_recent_tool_groups: int = 1,
+    previous_summary: str = "",
+    tier3_chars: int = _TIER3_MAX_CHARS,
 ) -> Tuple[list, str]:
     """Flush conversation messages to release memory while preserving canonical established context and recent progress."""
     note = phase_note or (
         f"[Phase {checkpoint_num + 1} 자율 연장] 마일스톤 {checkpoint_num}까지 확정된 "
         "findings.md와 plan.md의 내용을 바탕으로 다음 조사 작업을 이어서 진행하세요."
     )
+    # 플러시는 대화 tail만 버리는 단계다. Tier 3 절차 기억까지 버리면
+    # 티어드 요약의 수위(watermark)가 0으로 돌아가고, 다음 롤오버가 1스텝부터
+    # 다시 파생하느라 매 체크포인트마다 같은 옛 구간을 재압축한다. 실제로
+    # 25스텝마다 플러시하는 런에서 1200스텝대에 Tier 3가 100~300스텝대에
+    # 머무는 원인이었다. bounded(2,000자)라 유지 비용은 작다.
+    retained = parse_tiered_summary(previous_summary)
+    procedure = "\n".join(
+        line
+        for line in str(retained["tier3"] or "").splitlines()
+        if not _MILESTONE_MARKER.match(line.strip())
+    ).strip()
+    milestone = (
+        f"- 마일스톤 {checkpoint_num} 완료: "
+        "이전 페이즈의 핵심 발견점은 findings.md에 기록되었습니다."
+    )
+    # 마일스톤 자리를 먼저 떼고 자른다. 순서를 뒤집으면 한 줄짜리 Tier 3에서
+    # tail 클립이 절차 전체를 버리고 마커만 남긴다. 그런데 수위는 그대로라
+    # 사라진 구간은 다시 파생되지도 않는다. 예약분을 빼둔 덕분에 마커는 항상
+    # 자기 줄에 남아 다음 플러시가 이전 마커를 찾아낼 수 있다.
+    budget = min(_TIER3_MAX_CHARS, max(0, int(tier3_chars)))
+    room = budget - len(milestone) - 1
+    procedure = _tail_clip_summary_text(procedure, room) if room > 0 else ""
+    tier3 = f"{procedure}\n{milestone}".strip() if procedure else milestone
     compact_summary = format_tiered_summary(
-        tier3=f"마일스톤 {checkpoint_num} 완료: 이전 페이즈의 핵심 발견점은 findings.md에 기록되었습니다.",
-        tier3_through=0,
+        tier3=tier3,
+        tier3_through=retained["tier3_through"],
         tier2_lines=[],
-        discoveries=[],
+        discoveries=retained["discoveries"],
     )
     system_msg = {
         "role": "system",
@@ -4189,6 +4252,24 @@ async def rollover_agent_context(
             max_chars=ROLLING_SUMMARY_MAX_CHARS,
             start_step=source_start,
         )
+        if covered_through <= previous_through and any(
+            # 기록이 아예 없는 구간은 멈춘 게 아니다. 수위가 못 나아갔는데
+            # 그 앞쪽에 렌더링할 기록이 남아 있을 때만 막힌 것이다.
+            isinstance(record.get("step"), int)
+            and record["step"] >= source_start
+            and record.get("tool") not in ("record_state", "finish_task")
+            for record in trusted_records
+        ):
+            # 소스 예산보다 큰 스텝 그룹 하나가 구간 전체를 막으면 워터마크가
+            # 그 자리에 영구히 멈춘다(procedural_source는 잘라서 건너뛰지 않고
+            # 멈추는 쪽을 택한다). 조용히 멈추지 않게 남긴다.
+            log_session_event(
+                workspace,
+                "rollover_source_stalled",
+                step=step_num,
+                start_step=source_start,
+                end_step=tier3_end,
+            )
 
     generic_discoveries = extract_discovered_artifacts(
         "\n".join(part for part in (source, *tier2_lines) if part), workspace
@@ -4262,7 +4343,7 @@ async def rollover_agent_context(
         remaining = _TIER3_MAX_CHARS - len(new_procedure)
         if tier3 and remaining > 1:
             tier3 = "\n".join(
-                (_clip_summary_text(tier3, remaining - 1), new_procedure)
+                (_tail_clip_summary_text(tier3, remaining - 1), new_procedure)
             )
         else:
             tier3 = new_procedure
@@ -6310,6 +6391,8 @@ async def on_message(message: discord.Message):
                         task_contract=task_contract,
                         artifact_manifest=artifact_manifest,
                         checkpoint_num=current_checkpoint,
+                        previous_summary=rolling_summary,
+                        tier3_chars=OOM_RETRY_TIER3_CHARS,
                         phase_note=(
                             "[긴급 메모리 보호] 모델 서버의 메모리 한계 도달로 컨텍스트를 긴급 플러시했습니다. "
                             "findings.md와 plan.md의 내용을 참조하여 다음 단계 조사를 계속 수행하세요."
@@ -7252,6 +7335,7 @@ async def on_message(message: discord.Message):
                         task_contract=task_contract,
                         artifact_manifest=artifact_manifest,
                         checkpoint_num=flush_only_num,
+                        previous_summary=rolling_summary,
                         phase_note=(
                             f"[🤖 컨텍스트 정리 안내: Step {iteration+1}에서 대화 tail을 정리(Flush)했습니다. "
                             f"중간 보고서는 {REPORT_INTERVAL}스텝마다 전송됩니다. "
@@ -7425,6 +7509,7 @@ async def on_message(message: discord.Message):
                             task_contract=task_contract,
                             artifact_manifest=artifact_manifest,
                             checkpoint_num=checkpoint_num,
+                            previous_summary=rolling_summary,
                             phase_note=(
                                 f"[🤖 시스템 자율 연장 안내: Step {iteration+1} 마일스톤 {checkpoint_num} 중간 보고서가 디스코드에 전송되었습니다. "
                                 f"기존 대화 기록은 findings.md 및 plan.md로 안전하게 이관(Flush)되었습니다. "
