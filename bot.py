@@ -34,6 +34,7 @@ from types import SimpleNamespace
 import authz
 import observation
 import outcome as outcome_mod
+import stagnation
 import run_state
 import session_log
 import steering as steering_mod
@@ -3834,6 +3835,34 @@ def flush_agent_context(
     return flushed_messages, compact_summary
 
 
+def _emit_stagnation_index(workspace, step: int) -> list:
+    """Compute the repetition index, log it, and return report lines.
+
+    Fail-open: any error means no lines. The index never blocks anything;
+    it only makes repetition visible in the session log and the report.
+    """
+    try:
+        records, _complete = trajectory.read_records(workspace)
+        index = stagnation.compute_stagnation_index(records, step)
+        log_session_event(
+            workspace,
+            "stagnation_index",
+            step=step,
+            window_steps=index["window_steps"],
+            observations=index["observations"],
+            novel_pairs=index["novel_pairs"],
+            dead_repeat_over=index["dead_repeat_over"],
+            reobserve_pct=index["reobserve_pct"],
+            top=[
+                [item["target"][:80], item["outcome"], item["count"]]
+                for item in index["top_repeats"]
+            ],
+        )
+        return stagnation.format_stagnation_lines(index)
+    except Exception:
+        return []
+
+
 def build_system_content(
     workspace,
     ledger=None,
@@ -7336,6 +7365,10 @@ async def on_message(message: discord.Message):
                             f"> ⏱️ **경과 시간**: {elapsed_cp_str} (총 {total_tools_executed}개 도구 실행 완료)\n"
                             f"> ⚡ **[자율 연장]** 목표 달성을 위해 다음 구간(Step {iteration+2} ~ {iteration+1+CHECKPOINT_INTERVAL})으로 계속 진행합니다... *(중단: `!stop`)*"
                         )
+                        for stagnation_line in _emit_stagnation_index(
+                            workspace, iteration + 1
+                        ):
+                            cp_message += f"\n{stagnation_line}"
                         cp_message = ensure_run_id_marker(cp_message, workspace)
 
                         chunks_cp = []
